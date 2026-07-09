@@ -70,6 +70,8 @@ def get_metadata_int(reader: GGUFReader, key: str) -> Optional[int]:
         return None
     if isinstance(val, np.ndarray):
         return int(val.flat[0]) if val.size > 0 else None
+    if isinstance(val, (list, tuple)):
+        return int(val[0]) if len(val) > 0 else None
     return int(val)
 
 
@@ -83,6 +85,8 @@ def get_metadata_float(reader: GGUFReader, key: str) -> Optional[float]:
         return None
     if isinstance(val, np.ndarray):
         return float(val.flat[0]) if val.size > 0 else None
+    if isinstance(val, (list, tuple)):
+        return float(val[0]) if len(val) > 0 else None
     return float(val)
 
 
