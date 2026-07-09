@@ -10,6 +10,7 @@ Phase 1: Real weight extraction, safetensors output, architecture detection,
 import argparse
 import gc
 import json
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -146,6 +147,7 @@ ARCH_MAP: dict[str, str] = {
     "deepseek2": "deepseek_v2",
     "deepseek3": "deepseek_v3",
     "chatglm": "chatglm",
+    "glm-dsa": "glm_moe_dsa",  # GLM-5.2: MLA + DSA + MoE + MTP (experimental)
     "baichuan": "baichuan",
     "xverse": "xverse",
     "orion": "orion",
@@ -183,6 +185,93 @@ def detect_architecture(reader: GGUFReader) -> str:
             if gguf_arch in name_lower:
                 return gguf_arch
     return "llama"  # Safe default
+
+
+def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[str, Any]:
+    """Add GLM-5.2 (glm-dsa) specific fields: MLA + DSA indexer + MoE + MTP + IndexShare.
+
+    Values default to the published zai-org/GLM-5.2 config when a metadata key is
+    absent (the canonical GGUF producer does not exist yet, so keys may be partial).
+    """
+    arch = "glm-dsa"
+
+    hidden = (get_metadata_int(reader, f"{arch}.embedding_length")
+              or get_metadata_int(reader, "llama.embedding_length") or config["hidden_size"])
+    n_heads = (get_metadata_int(reader, f"{arch}.attention.head_count")
+               or get_metadata_int(reader, "llama.attention.head_count") or config["num_attention_heads"])
+    config["hidden_size"] = hidden
+    config["num_attention_heads"] = n_heads
+
+    # --- Block-count arithmetic: GGUF block_count includes the MTP/NextN block(s) ---
+    total_blocks = (get_metadata_int(reader, f"{arch}.block_count")
+                    or get_metadata_int(reader, "llama.block_count") or config["num_hidden_layers"])
+    num_nextn = (get_metadata_int(reader, f"{arch}.nextn_predict_layers")
+                 or get_metadata_int(reader, f"{arch}.num_nextn_predict_layers") or 1)
+    num_hidden = total_blocks - num_nextn
+    if num_hidden < 1:  # be defensive if GGUF reports the transformer count directly
+        num_hidden = total_blocks
+        num_nextn = 0
+    config["num_hidden_layers"] = num_hidden
+    config["num_nextn_predict_layers"] = num_nextn
+
+    # --- MLA (Multi-head Latent Attention, DeepSeek-V2/V3 family) ---
+    qk_nope = get_metadata_int(reader, f"{arch}.attention.qk_nope_head_dim") or 192
+    qk_rope = get_metadata_int(reader, f"{arch}.attention.qk_rope_head_dim") or 64
+    v_head = (get_metadata_int(reader, f"{arch}.attention.value_length")
+              or get_metadata_int(reader, f"{arch}.attention.v_head_dim") or qk_nope)
+    config["q_lora_rank"] = get_metadata_int(reader, f"{arch}.attention.q_lora_rank") or 2048
+    config["kv_lora_rank"] = get_metadata_int(reader, f"{arch}.attention.kv_lora_rank") or 512
+    config["qk_nope_head_dim"] = qk_nope
+    config["qk_rope_head_dim"] = qk_rope
+    config["qk_head_dim"] = qk_nope + qk_rope
+    config["v_head_dim"] = v_head
+    config["head_dim"] = qk_nope  # GLM-5.2 sets head_dim = qk_nope_head_dim
+    config["rope_interleave"] = True
+    config["partial_rotary_factor"] = qk_rope / (qk_nope + qk_rope)
+
+    # --- MoE: 3 dense + 75 sparse layers, 256 routed + 1 shared expert ---
+    n_experts = get_metadata_int(reader, f"{arch}.expert_count") or 256
+    n_shared = get_metadata_int(reader, f"{arch}.expert_shared_count") or 1
+    n_per_tok = get_metadata_int(reader, f"{arch}.expert_used_count") or 8
+    moe_ffn = (get_metadata_int(reader, f"{arch}.expert_feed_forward_length")
+               or get_metadata_int(reader, f"{arch}.moe_intermediate_size") or 2048)
+    dense_ffn = (get_metadata_int(reader, f"{arch}.feed_forward_length") or (hidden * 4))
+    config["num_experts"] = n_experts
+    config["num_experts_per_tok"] = n_per_tok
+    config["n_shared_experts"] = n_shared
+    config["moe_intermediate_size"] = moe_ffn
+    config["intermediate_size"] = dense_ffn
+    config["first_k_dense_replace"] = get_metadata_int(reader, f"{arch}.first_k_dense_replace") or 3
+    config["topk_method"] = "noaux_tc"
+    config["scoring_func"] = "sigmoid"
+    config["norm_topk_prob"] = True
+    config["routed_scaling_factor"] = get_metadata_float(reader, f"{arch}.routed_scaling_factor") or 2.5
+    config["n_group"] = get_metadata_int(reader, f"{arch}.n_group") or 1
+    config["topk_group"] = get_metadata_int(reader, f"{arch}.topk_group") or 1
+    config["moe_layer_freq"] = 1
+    config["decoder_sparse_step"] = 1
+    config["mlp_only_layers"] = []
+
+    # --- DSA lightning indexer + IndexShare (1-in-4 F/S pattern) ---
+    config["index_head_dim"] = (get_metadata_int(reader, f"{arch}.attention.index_head_dim") or 128)
+    config["index_n_heads"] = (get_metadata_int(reader, f"{arch}.attention.index_head_count")
+                               or get_metadata_int(reader, f"{arch}.attention.index_n_heads") or 32)
+    config["index_topk"] = (get_metadata_int(reader, f"{arch}.attention.index_top_k")
+                            or get_metadata_int(reader, f"{arch}.attention.index_topk") or 2048)
+    indexer_types = get_metadata_array_str(reader, f"{arch}.attention.indexer_types")
+    if indexer_types:
+        config["indexer_types"] = indexer_types
+    mlp_layer_types = get_metadata_array_str(reader, f"{arch}.mlp_layer_types")
+    if mlp_layer_types:
+        config["mlp_layer_types"] = mlp_layer_types
+    config["index_share_for_mtp_iteration"] = bool(
+        get_metadata_int(reader, f"{arch}.index_share_for_mtp_iteration") or 0)
+
+    config["tie_word_embeddings"] = False
+    config["attention_bias"] = False
+    config["model_type"] = "glm_moe_dsa"
+    config["architectures"] = ["GlmMoeDsaForCausalLM"]
+    return config
 
 
 def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
@@ -253,10 +342,6 @@ def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
     if ctx_length is None:
         ctx_length = 4096
         _warn("context_length", 4096)
-
-    rope_dim = get_metadata_int(reader, "llama.rope.dimension_count") or get_metadata_int(
-        reader, f"{arch}.rope.dimension_count"
-    ) or get_metadata_int(reader, f"{arch}.attention.key_length") or (hidden_size // num_heads)
 
     rope_theta = get_metadata_float(reader, "llama.rope.freq_base") or get_metadata_float(
         reader, f"{arch}.rope.freq_base"
@@ -352,6 +437,10 @@ def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
             config["output_router_logits"] = False
             config["router_aux_loss_coef"] = 0.001
 
+    # --- GLM-5.2 (glm-dsa): MLA + DSA + MoE + MTP + IndexShare ---
+    if arch == "glm-dsa":
+        _build_glm_dsa_config(reader, config)
+
     return config
 
 
@@ -444,9 +533,101 @@ def _map_llama_tensor_name(gguf_name: str) -> str:
     return gguf_name
 
 
+# MLA-family tensor fragments shared by DeepSeek-V2/V3 and GLM-DSA.
+# Maps the GGUF block-relative fragment -> HF self_attn.* suffix.
+# NOTE: split attn_k_b / attn_v_b are NOT here — they require concatenation and
+# are handled in the convert loop (_plan_tensor_emit / _reconstruct_kv_b).
+_MLA_ATTN_MAP = {
+    "attn_q_a": "q_a_proj",
+    "attn_q_a_norm": "q_a_layernorm",
+    "attn_q_b": "q_b_proj",
+    "attn_kv_a_mqa": "kv_a_proj_with_mqa",
+    "attn_kv_a_norm": "kv_a_layernorm",
+    "attn_kv_b": "kv_b_proj",  # combined MLA kv_b (GLM-DSA primary form)
+    "attn_out": "o_proj",
+}
+# Indexer submodule: GGUF blk.N.indexer.<frag> -> self_attn.indexer.<dst>
+_INDEXER_FRAG_MAP = {
+    "attn_q_b": "wq_b",
+    "attn_k": "wk",
+    "proj": "weights_proj",
+}
+# Archetypes that use the MLA tensor family.
+_MLA_ARCHES = ("glm-dsa", "deepseek2", "deepseek3", "glm4moe")
+
+
+def _map_mla_tensor_name(gguf_name: str) -> Optional[str]:
+    """Map MLA-family tensor names (DeepSeek-V2/V3, GLM-DSA) to HF format.
+
+    Returns None for anything it does not specifically own, so the caller can
+    fall back to the llama mapper for shared concepts (norms, dense FFN,
+    ffn_gate_inp router, embeddings, output).
+    """
+    # Root tensors (own them so MLA arches don't depend on llama for these)
+    if gguf_name == "token_embd.weight":
+        return "model.embed_tokens.weight"
+    if gguf_name == "output.weight":
+        return "lm_head.weight"
+    if gguf_name == "output_norm.weight":
+        return "model.norm.weight"
+
+    if not gguf_name.startswith("blk."):
+        return None
+    parts = gguf_name.split(".", 2)
+    if len(parts) < 3:
+        return None
+    layer_idx, rest = parts[1], parts[2]
+
+    # MLA attention projections (combined kv_b form)
+    for src, dst in _MLA_ATTN_MAP.items():
+        if rest == f"{src}.weight":
+            return f"model.layers.{layer_idx}.self_attn.{dst}.weight"
+
+    # DSA lightning indexer submodule: blk.N.indexer.<frag>.[weight|bias]
+    if rest.startswith("indexer."):
+        sub = rest[len("indexer."):]
+        suffix = None
+        for sfx in (".weight", ".bias"):
+            if sub.endswith(sfx):
+                frag, suffix = sub[: -len(sfx)], sfx[1:]
+                break
+        if suffix is None:
+            return None
+        if frag == "k_norm":
+            return f"model.layers.{layer_idx}.self_attn.indexer.k_norm.{suffix}"
+        if frag in _INDEXER_FRAG_MAP:
+            return (f"model.layers.{layer_idx}.self_attn.indexer."
+                    f"{_INDEXER_FRAG_MAP[frag]}.{suffix}")
+        return None
+
+    # Shared expert: blk.N.ffn_{gate,up,down}_shexp.weight
+    m = re.match(r"ffn_(gate|up|down)_shexp\.weight$", rest)
+    if m:
+        return f"model.layers.{layer_idx}.mlp.shared_experts.{m.group(1)}_proj.weight"
+
+    # noaux_tc gate correction bias: blk.N.exp_probs_b -> mlp.gate.e_score_correction_bias
+    if rest == "exp_probs_b":
+        return f"model.layers.{layer_idx}.mlp.gate.e_score_correction_bias"
+
+    # NextN/MTP shared head norm: blk.N.nextn_shared_head_norm.weight
+    if rest == "nextn_shared_head_norm.weight":
+        return f"model.layers.{layer_idx}.shared_head.norm.weight"
+
+    return None
+
+
 def _map_tensor_name(gguf_name: str, arch: str) -> str:
-    """Map a GGUF tensor name to HuggingFace format based on architecture."""
-    # Most architectures follow llama naming for now
+    """Map a GGUF tensor name to HuggingFace format based on architecture.
+
+    MLA-family arches (deepseek2/3, glm4moe, glm-dsa) get the MLA mapper first;
+    anything it does not own falls through to the llama mapper. Multi-tensor
+    transforms (kv_b concat, per-expert split) are handled separately in the
+    convert loop by _plan_tensor_emit.
+    """
+    if arch in _MLA_ARCHES:
+        mapped = _map_mla_tensor_name(gguf_name)
+        if mapped is not None:
+            return mapped
     return _map_llama_tensor_name(gguf_name)
 
 
@@ -455,7 +636,20 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def extract_tokenizer(reader: GGUFReader, output_dir: Path) -> None:
+_GLM_DSA_TEMPLATE_PATH = Path(__file__).parent / "data" / "glm_dsa_chat_template.jinja"
+
+
+def _get_chat_template(reader: GGUFReader, arch: str) -> Optional[str]:
+    """Return a chat template: GGUF metadata first, then a canonical GLM fallback."""
+    tmpl = get_metadata_str(reader, "tokenizer.chat_template")
+    if tmpl:
+        return tmpl
+    if arch in ("glm-dsa", "chatglm") and _GLM_DSA_TEMPLATE_PATH.exists():
+        return _GLM_DSA_TEMPLATE_PATH.read_text(encoding="utf-8")
+    return None
+
+
+def extract_tokenizer(reader: GGUFReader, output_dir: Path, arch: str = "llama") -> None:
     """Extract tokenizer from GGUF metadata and save standard files."""
     model_type = get_metadata_str(reader, "tokenizer.ggml.model") or "bpe"
     bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id") or 1
@@ -553,9 +747,17 @@ def extract_tokenizer(reader: GGUFReader, output_dir: Path) -> None:
             }
         )
 
+    # --- Chat template (GGUF metadata first, canonical GLM fallback for glm-dsa/chatglm) ---
+    chat_template = _get_chat_template(reader, arch)
+    if chat_template:
+        tokenizer_config["chat_template"] = chat_template
+        with open(output_dir / "chat_template.jinja", "w", encoding="utf-8") as f:
+            f.write(chat_template)
+        print("  ✓ Saved chat_template.jinja")
+
     with open(output_dir / "tokenizer_config.json", "w") as f:
         json.dump(tokenizer_config, f, indent=2, ensure_ascii=False)
-    print(f"  ✓ Saved tokenizer_config.json")
+    print("  ✓ Saved tokenizer_config.json")
 
     # --- special_tokens_map.json ---
     special_tokens = {
@@ -568,7 +770,7 @@ def extract_tokenizer(reader: GGUFReader, output_dir: Path) -> None:
 
     with open(output_dir / "special_tokens_map.json", "w") as f:
         json.dump(special_tokens, f, indent=2, ensure_ascii=False)
-    print(f"  ✓ Saved special_tokens_map.json")
+    print("  ✓ Saved special_tokens_map.json")
 
     # --- vocab.json (word → id mapping) ---
     vocab = {}
@@ -601,7 +803,7 @@ def extract_tokenizer(reader: GGUFReader, output_dir: Path) -> None:
     if tokenizer_json:
         with open(output_dir / "tokenizer.json", "w") as f:
             json.dump(tokenizer_json, f, indent=2, ensure_ascii=False)
-        print(f"  ✓ Saved tokenizer.json")
+        print("  ✓ Saved tokenizer.json")
 
 
 def _build_tokenizer_json(
@@ -619,16 +821,8 @@ def _build_tokenizer_json(
     for i, token in enumerate(tokens):
         vocab[token] = i
 
-    # Token type mapping: 1=normal, 2=unknown, 3=control, 4=user_defined, 5=unused, 6=byte
-    token_type_map = {
-        1: "Normal",
-        2: "Unknown",
-        3: "Control",
-        4: "UserDefined",
-        5: "Unused",
-        6: "Byte",
-    }
-
+    # Token type codes: 1=normal, 2=unknown, 3=control, 4=user_defined, 5=unused, 6=byte
+    # (mapping kept as a comment; token_types per-token is consumed below)
     added_tokens = []
     normal_tokens = []
     for i, token in enumerate(tokens):
@@ -731,6 +925,93 @@ def _build_tokenizer_json(
 # ---------------------------------------------------------------------------
 
 
+def _read_mla_dims(reader: GGUFReader, arch: str) -> dict[str, int]:
+    """Read MLA dims needed to reconstruct kv_b_proj from split k_b/v_b."""
+    def _g(key: str) -> Optional[int]:
+        return get_metadata_int(reader, f"{arch}.{key}") or get_metadata_int(reader, f"llama.{key}")
+    n_heads = _g("attention.head_count") or 64
+    qk_nope = _g("attention.qk_nope_head_dim") or 192
+    v_head = _g("attention.value_length") or _g("attention.v_head_dim") or qk_nope
+    return {"num_heads": n_heads, "qk_nope_head_dim": qk_nope, "v_head_dim": v_head}
+
+
+def _reconstruct_kv_b(k_b: np.ndarray, v_b: np.ndarray,
+                      n_heads: int, dk_nope: int, dv: int) -> np.ndarray:
+    """Reconstruct HF kv_b_proj from GGUF split attn_k_b / attn_v_b.
+
+    HF kv_b_proj.weight is [n_heads*(dk_nope+dv), kv_lora] and is consumed by
+    reshaping per-head to [n_heads, dk_nope+dv, kv_lora], then splitting nope-K
+    (first dk_nope) from V (last dv) within each head. GGUF stores k_b
+    ([n_heads*dk_nope, kv_lora]) and v_b ([n_heads*dv, kv_lora]) head-major, so
+    the inverse is: reshape each to [n_heads, dim, kv_lora], concat along dim 1,
+    flatten back to [n_heads*(dk_nope+dv), kv_lora].
+    """
+    if k_b.ndim != 2 or v_b.ndim != 2:
+        raise ValueError(f"kv_b reconstruction expects 2D k_b/v_b, got {k_b.ndim}D/{v_b.ndim}D")
+    kv_lora = k_b.shape[1]
+    if v_b.shape[1] != kv_lora:
+        raise ValueError(f"kv_lora mismatch: k_b has {kv_lora}, v_b has {v_b.shape[1]}")
+    k = k_b.reshape(n_heads, dk_nope, kv_lora)
+    v = v_b.reshape(n_heads, dv, kv_lora)
+    kv = np.concatenate([k, v], axis=1)  # [n_heads, dk_nope+dv, kv_lora]
+    return kv.reshape(n_heads * (dk_nope + dv), kv_lora).astype(k_b.dtype)
+
+
+def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
+                      mla_dims: dict[str, int],
+                      pending_kv_b: dict[str, dict[str, np.ndarray]]
+                      ) -> list[tuple[str, np.ndarray]]:
+    """Decide output (hf_name, arr) pairs for one source GGUF tensor.
+
+    Handles arch-specific multi-tensor transforms:
+      * Split attn_k_b/attn_v_b (deepseek2/3, glm4moe, and glm-dsa fallback when
+        the combined attn_kv_b is absent) -> combined kv_b_proj via per-head
+        interleave (_reconstruct_kv_b).
+      * glm-dsa stacked ffn_*_exps -> per-expert mlp.experts.{e}.{kind}_proj.
+
+    Returns [] when the tensor is buffered (waiting for its kv_b pair).
+    """
+    # --- Split kv_b -> combined kv_b_proj ---
+    m = re.match(r"blk\.(\d+)\.attn_(k_b|v_b)(?:\.weight)?$", gguf_name)
+    if m and arch in ("deepseek2", "deepseek3", "glm-dsa", "glm4moe"):
+        layer_idx = m.group(1)
+        which = "k" if m.group(2) == "k_b" else "v"
+        buf = pending_kv_b.setdefault(layer_idx, {})
+        buf[which] = arr
+        if "k" in buf and "v" in buf:
+            combined = _reconstruct_kv_b(
+                buf["k"], buf["v"], mla_dims["num_heads"],
+                mla_dims["qk_nope_head_dim"], mla_dims["v_head_dim"])
+            del pending_kv_b[layer_idx]
+            return [(f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight", combined)]
+        return []  # buffered until the pair arrives
+
+    # --- glm-dsa per-expert split: stacked ffn_*_exps [n_exp, out, in] ---
+    if arch == "glm-dsa":
+        m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps(?:\.weight)?$", gguf_name)
+        if m and arr.ndim == 3:
+            layer_idx, kind = m.group(1), m.group(2)
+            return [
+                (f"model.layers.{layer_idx}.mlp.experts.{e}.{kind}_proj.weight", arr[e])
+                for e in range(arr.shape[0])
+            ]
+
+    # --- default 1:1 rename ---
+    return [(_map_tensor_name(gguf_name, arch), arr)]
+
+
+def _detect_full_indexer_layers(all_keys: list[str]) -> list[int]:
+    """Layers that own a DSA indexer (Full layers in the IndexShare F/S pattern).
+
+    A layer is 'Full' iff it emitted at least one ``self_attn.indexer.*`` tensor;
+    'Shared' layers have none (they reuse a preceding Full layer's top-k indices).
+    """
+    return sorted({
+        int(k.split(".")[2]) for k in all_keys
+        if k.startswith("model.layers.") and ".self_attn.indexer." in k
+    })
+
+
 def extract_and_convert_weights(
     reader: GGUFReader, arch: str, output_dir: Path, dtype: str = "float16"
 ) -> dict[str, np.ndarray]:
@@ -767,15 +1048,18 @@ def extract_and_convert_weights(
             return 0
         path = output_dir / _shard_filename(shard_idx, total_shards)
         save_safetensors(shard_weights, str(path))
-        n_keys = len(shard_weights)
         n_bytes = sum(arr.nbytes for arr in shard_weights.values())
         shard_weights.clear()
         gc.collect()
         return n_bytes
 
+    # MLA dims needed for kv_b reconstruction (split k_b/v_b -> combined kv_b_proj)
+    mla_dims = _read_mla_dims(reader, arch)
+    # Buffer for split kv_b pairs (deepseek2/3; glm-dsa fallback when combined absent)
+    pending_kv_b: dict[str, dict[str, np.ndarray]] = {}
+
     for i, tensor in enumerate(reader.tensors):
         gguf_name = tensor.name
-        hf_name = _map_tensor_name(gguf_name, arch)
         qtype = tensor.tensor_type
         logical_shape = tuple(tensor.shape)
         n_bytes = tensor.n_bytes
@@ -828,19 +1112,23 @@ def extract_and_convert_weights(
                     skipped += 1
                     continue
 
-            weights[hf_name] = arr
-            all_keys.append(hf_name)
-            total_bytes_out += arr.nbytes
-            current_shard_bytes += arr.nbytes
-            pbar.update(1)
+            # Determine output tensors (may be 0, 1, or many for arch-specific
+            # transforms such as kv_b concat and per-expert split).
+            emit_pairs = _plan_tensor_emit(gguf_name, arr, arch, mla_dims, pending_kv_b)
+            for hf_name, out_arr in emit_pairs:
+                weights[hf_name] = out_arr
+                all_keys.append(hf_name)
+                total_bytes_out += out_arr.nbytes
+                current_shard_bytes += out_arr.nbytes
 
-            # Shard when approaching the per-shard byte limit
-            if current_shard_bytes >= max_shard_bytes:
-                n_bytes = _flush_shard(weights, shard_idx, None)
-                print(f"\n    ✓ Shard {shard_idx}: {len(all_keys)} tensors so far, {n_bytes / 1e9:.2f} GB")
-                shard_idx += 1
-                current_shard_bytes = 0
-                weights = {}
+                # Shard when approaching the per-shard byte limit
+                if current_shard_bytes >= max_shard_bytes:
+                    n_bytes = _flush_shard(weights, shard_idx, None)
+                    print(f"\n    ✓ Shard {shard_idx}: {len(all_keys)} tensors so far, {n_bytes / 1e9:.2f} GB")
+                    shard_idx += 1
+                    current_shard_bytes = 0
+                    weights = {}
+            pbar.update(1)
 
         except Exception as e:
             print(f"    ⚠ Error processing {gguf_name}: {e}")
@@ -848,6 +1136,30 @@ def extract_and_convert_weights(
             continue
 
     pbar.close()
+
+    # --- Flush any orphaned split-kv_b pairs (defensive; shouldn't happen on valid GGUF) ---
+    if pending_kv_b:
+        for layer_idx, buf in pending_kv_b.items():
+            if "k" in buf and "v" in buf:
+                combined = _reconstruct_kv_b(
+                    buf["k"], buf["v"], mla_dims["num_heads"],
+                    mla_dims["qk_nope_head_dim"], mla_dims["v_head_dim"])
+                hf_name = f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight"
+                weights[hf_name] = combined
+                all_keys.append(hf_name)
+                total_bytes_out += combined.nbytes
+                print(f"    ⚠ Flushed orphaned kv_b for layer {layer_idx}")
+            else:
+                missing = "v" if "k" in buf else "k"
+                print(f"    ⚠ Unpaired {missing}_b at layer {layer_idx} — discarded")
+
+    # --- IndexShare invariant: log Full-indexer layer count (glm-dsa) ---
+    if arch == "glm-dsa":
+        f_layers = _detect_full_indexer_layers(all_keys)
+        if f_layers:
+            print(f"    ℹ IndexShare: {len(f_layers)} Full-indexer layer(s): {f_layers}")
+        else:
+            print("    ℹ IndexShare: no indexer tensors found (all-Shared or non-DSA GGUF)")
 
     # --- Save remaining tensors as final shard ---
     if weights:
@@ -913,7 +1225,7 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     model_name = gguf_file.stem
 
     print("=" * 60)
-    print(f"GGUF → MLX Converter v2.0")
+    print("GGUF → MLX Converter v2.0")
     print(f"  Model: {model_name}")
     print(f"  Output: {output_path}")
     print("=" * 60)
@@ -965,12 +1277,27 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
         json.dump(config, f, indent=2)
     print("  ✓ Saved config.json")
 
+    # GLM-5.2: write generation_config.json with the multi-EOS array (matches
+    # the published zai-org/GLM-5.2 generation_config.json).
+    if arch == "glm-dsa":
+        gen_cfg = {
+            "_from_model_config": True,
+            "eos_token_id": [154820, 154827, 154829],
+            "pad_token_id": 154820,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "transformers_version": "5.12.0",
+        }
+        with open(output_path / "generation_config.json", "w") as f:
+            json.dump(gen_cfg, f, indent=2)
+        print("  ✓ Saved generation_config.json (GLM-5.2 multi-EOS)")
+
     # Step 3: Extract tokenizer
     print("\n[3/5] Extracting tokenizer...")
-    extract_tokenizer(reader, output_path)
+    extract_tokenizer(reader, output_path, arch)
 
     # Step 4: Extract, dequantize, and convert weights
-    print(f"\n[4/5] Extracting and converting weights...")
+    print("\n[4/5] Extracting and converting weights...")
     try:
         extract_and_convert_weights(reader, arch, output_path, dtype)
     except Exception as e:
@@ -978,11 +1305,11 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
         return False
 
     # Step 5: Verify output
-    print(f"\n[5/5] Finalizing...")
+    print("\n[5/5] Finalizing...")
     # Index file already created by extract_and_convert_weights
     index_path = output_path / "model.safetensors.index.json"
     if not index_path.exists():
-        print(f"❌ model.safetensors.index.json was not created")
+        print("❌ model.safetensors.index.json was not created")
         return False
 
     with open(index_path) as f:
@@ -995,7 +1322,7 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     print("✅ Conversion complete!")
     print(f"  Output directory: {output_path}")
     print(f"  Architecture:     {arch} → {hf_type}")
-    print(f"  Files generated:")
+    print("  Files generated:")
     for f_path in sorted(output_path.iterdir()):
         size = f_path.stat().st_size
         if size > 1_000_000_000:

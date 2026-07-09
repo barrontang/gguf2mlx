@@ -22,3 +22,19 @@ uv.lock
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Tracing artifacts (regenerable: synth via make_synth_trace.py, smoke via run_trace_task_suite.sh, batch via run_trace_suite_batched.sh)
+traces/synth/
+traces/smoke/
+traces/batch/
+*.run.log
+reap37_download.log
+# MLA retrieval-pattern trace runs (Story 5 re-scoped). Reproducible via
+# scripts/tracing/run_glm52_moe_trace.sh with TRACE_ACTIVATIONS=q_nope_absorbed,kv_cmpr.
+# The full long-ctx BLUE-FALCON run emits ~1 GB of JSONL — explicitly gitignored.
+traces/glm52-coding-en-retr_smoke-*.jsonl
+traces/glm52-coding-en-retr_smoke-*.jsonl.meta.json
+traces/glm52-coding-en-retr_full_smoke-*.jsonl
+traces/glm52-coding-en-retr_full_smoke-*.jsonl.meta.json
+traces/glm52-coding-en-retr_longctx-*.jsonl
+traces/glm52-coding-en-retr_longctx-*.jsonl.meta.json

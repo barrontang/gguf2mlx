@@ -107,13 +107,14 @@ print(generate(model, tok, prompt='Hello, world!', max_tokens=50))
 ## 🏗️ Supported Architectures
 
 <details open>
-<summary><b>44+ architectures supported</b></summary>
+<summary><b>45+ architectures supported</b></summary>
 
 | Family | Architectures |
 |--------|--------------|
 | **Llama** | llama, mistral, falcon, stablelm |
 | **Qwen** | qwen2, qwen2moe, qwen3moe |
 | **DeepSeek** | deepseek2, deepseek3 |
+| **GLM** | glm-dsa ⚠️ *(experimental)*, chatglm |
 | **Gemma** | gemma, gemma2, gemma3 |
 | **Phi** | phi, phi3 |
 | **GPT** | gpt2, gptneox, gpt_bigcode, refact |
@@ -123,6 +124,15 @@ print(generate(model, tok, prompt='Hello, world!', max_tokens=50))
 | **Others** | bert, bloom, cohere, granite, nemotron, exaone, openelm, chatglm, baichuan, xverse, orion, bitnet, plamo, codeshell, minicpm, minicpm3, t5, jais, arctic, smolm, chameleon, mpt |
 
 </details>
+
+> ⚠️ **GLM-5.2 (`glm-dsa`) is experimental.** The converter fully supports the
+> tensor layout (MLA + DSA lightning indexer + IndexShare F/S layers +
+> mixed dense/sparse MoE + MTP), but **end-to-end runnability is gated upstream**:
+> (1) llama.cpp has not yet registered a `GlmMoeDsaForCausalLM`→`glm-dsa` GGUF
+> producer, and (2) neither `mlx-lm` nor a released `transformers` ships a
+> `glm_moe_dsa` model class yet. Until those land, this produces
+> correctly-named, reference-matching weights but no runtime to load them. See
+> [`PLAN.md`](PLAN.md) for the full reverse-engineering notes.
 
 Missing one? [Open an issue](https://github.com/barrontang/gguf2mlx/issues) — we add new architectures fast.
 
