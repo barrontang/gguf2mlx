@@ -136,6 +136,23 @@ print(generate(model, tok, prompt='Hello, world!', max_tokens=50))
 
 Missing one? [Open an issue](https://github.com/barrontang/gguf2mlx/issues) — we add new architectures fast.
 
+## 🔝 Top GGUF Models (Compatibility Focus)
+
+This repo is tuned to handle the most common GGUF model families used in downloads and local inference workflows:
+
+1. Llama 3.x / 4.x  
+2. Qwen 2.x / 2.5  
+3. DeepSeek V3 / R1  
+4. Mistral / Mixtral  
+5. Gemma 2 / 3  
+6. Phi 3 / 4  
+7. Command-R / Command-R+  
+8. Yi  
+9. Falcon  
+10. DBRX  
+
+If a GGUF file is missing `general.architecture`, `gguf2mlx` now applies popular-name fallback detection for these families before using the default.
+
 ---
 
 ## 📊 Benchmarks
