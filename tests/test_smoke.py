@@ -6,7 +6,7 @@ test against a real GGUF lives in `tests/test_e2e.py` and is opt-in via env var.
 import subprocess
 import sys
 
-from gguf2mlx.gguf2mlx import get_metadata_float, get_metadata_int
+from gguf2mlx.gguf2mlx import detect_architecture, get_metadata_float, get_metadata_int
 
 
 class _FakeField:
@@ -59,3 +59,26 @@ def test_get_metadata_float_accepts_python_sequences():
 
     assert get_metadata_float(reader, "scalar_tuple") == 1.5
     assert get_metadata_float(reader, "empty_tuple") is None
+
+
+def test_detect_architecture_model_name_fallbacks():
+    reader = _FakeReader({"general.name": "Mixtral-8x7B-Instruct-v0.1"})
+    assert detect_architecture(reader) == "mistral"
+
+    reader = _FakeReader({"general.name": "DeepSeek-R1-Distill-Qwen-32B"})
+    assert detect_architecture(reader) == "qwen2"
+
+    reader = _FakeReader({"general.name": "DeepSeek-V3-0324"})
+    assert detect_architecture(reader) == "deepseek3"
+
+    reader = _FakeReader({"general.name": "Command-R+ 104B"})
+    assert detect_architecture(reader) == "command-r-plus"
+
+    reader = _FakeReader({"general.name": "Command-R 35B"})
+    assert detect_architecture(reader) == "command-r"
+
+    reader = _FakeReader({"general.name": "Yi-34B-Chat"})
+    assert detect_architecture(reader) == "llama"
+
+    reader = _FakeReader({"general.name": "Yi 1.5 9B Chat"})
+    assert detect_architecture(reader) == "llama"

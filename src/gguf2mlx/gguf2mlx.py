@@ -175,6 +175,21 @@ ARCH_MAP: dict[str, str] = {
     "chameleon": "chameleon",
 }
 
+# Popular GGUF naming patterns that do not directly include a GGUF architecture key.
+# These are used only when `general.architecture` is missing.
+MODEL_NAME_ARCH_FALLBACKS: list[tuple[str, str]] = [
+    (r"\bdeepseek-r1-distill-qwen\b", "qwen2"),
+    (r"\bdeepseek-r1-distill-llama\b", "llama"),
+    (r"\bdeepseek-v3\b", "deepseek3"),
+    (r"\bdeepseek-r1\b", "deepseek3"),
+    (r"\bdeepseek-v2\b", "deepseek2"),
+    (r"\bmixtral\b", "mistral"),
+    (r"\bcommand-r\+", "command-r-plus"),
+    (r"\bcommand-r\b", "command-r"),
+    # Keep Yi matching anchored to the start to avoid generic false positives.
+    (r"^\s*yi\b", "llama"),
+]
+
 
 def detect_architecture(reader: GGUFReader) -> str:
     """Detect model architecture from GGUF metadata."""
@@ -185,6 +200,12 @@ def detect_architecture(reader: GGUFReader) -> str:
     name = get_metadata_str(reader, "general.name")
     if name:
         name_lower = name.lower()
+        # Check specific popular-model fallbacks before generic substring matching.
+        # Order matters: this preserves intended routing for names like
+        # `deepseek-r1-distill-qwen` before broad ARCH_MAP substring checks.
+        for pattern, mapped_arch in MODEL_NAME_ARCH_FALLBACKS:
+            if re.search(pattern, name_lower):
+                return mapped_arch
         for gguf_arch, hf_name in ARCH_MAP.items():
             if gguf_arch in name_lower:
                 return gguf_arch
