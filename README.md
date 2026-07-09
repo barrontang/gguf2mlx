@@ -151,7 +151,7 @@ This repo is tuned to handle the most common GGUF model families used in downloa
 9. Falcon  
 10. DBRX  
 
-If a GGUF file is missing `general.architecture`, `gguf2mlx` now applies popular-name fallback detection for these families before using the default.
+If a GGUF file is missing `general.architecture`, `gguf2mlx` now applies popular-name fallback detection for these families before falling back to the safe default (`llama`).
 
 ---
 

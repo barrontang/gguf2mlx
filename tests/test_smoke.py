@@ -74,5 +74,11 @@ def test_detect_architecture_model_name_fallbacks():
     reader = _FakeReader({"general.name": "Command-R+ 104B"})
     assert detect_architecture(reader) == "command-r-plus"
 
+    reader = _FakeReader({"general.name": "Command-R 35B"})
+    assert detect_architecture(reader) == "command-r"
+
     reader = _FakeReader({"general.name": "Yi-34B-Chat"})
+    assert detect_architecture(reader) == "llama"
+
+    reader = _FakeReader({"general.name": "Yi 1.5 9B Chat"})
     assert detect_architecture(reader) == "llama"
