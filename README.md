@@ -1,3 +1,5 @@
+
+
 # 🧠 GGUF → MLX
 
 <div align="center">
@@ -85,7 +87,7 @@ print(generate(model, tok, prompt='Hello, world!', max_tokens=50))
 
 ```
 ┌──────────────┐     ┌─────────────────┐     ┌──────────────────┐
-│  model.gguf   │ ──▶ │  gguf2mlx v2.1  │ ──▶ │  mlx-model/      │
+│  model.gguf   │ ──▶ │  gguf2mlx v2.0.2│ ──▶ │  mlx-model/      │
 │  (quantized)  │     │                 │     │  ├ config.json    │
 │  Q4_K, Q8...  │     │  • dequantize   │     │  ├ tokenizer.json │
 └──────────────┘     │  • remap names   │     │  ├ vocab.json     │
