@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 GGUF to MLX Converter v2.0
 Converts GGUF models to MLX format (safetensors) for Apple Silicon inference.
@@ -16,10 +15,10 @@ import sys
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Optional
-from tqdm import tqdm
+from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Required imports with friendly error messages
@@ -37,8 +36,8 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from safetensors.numpy import save_file as save_safetensors
     from safetensors import safe_open
+    from safetensors.numpy import save_file as save_safetensors
 
     SAFETENSORS_AVAILABLE = True
 except ImportError:
@@ -51,7 +50,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
-def get_metadata_str(reader: GGUFReader, key: str) -> Optional[str]:
+def get_metadata_str(reader: GGUFReader, key: str) -> str | None:
     """Extract a string metadata value from GGUF fields."""
     field = reader.get_field(key)
     if field is None:
@@ -62,7 +61,7 @@ def get_metadata_str(reader: GGUFReader, key: str) -> Optional[str]:
     return str(val) if val is not None else None
 
 
-def get_metadata_int(reader: GGUFReader, key: str) -> Optional[int]:
+def get_metadata_int(reader: GGUFReader, key: str) -> int | None:
     """Extract an integer metadata value from GGUF fields."""
     field = reader.get_field(key)
     if field is None:
@@ -77,7 +76,7 @@ def get_metadata_int(reader: GGUFReader, key: str) -> Optional[int]:
     return int(val)
 
 
-def get_metadata_float(reader: GGUFReader, key: str) -> Optional[float]:
+def get_metadata_float(reader: GGUFReader, key: str) -> float | None:
     """Extract a float metadata value from GGUF fields."""
     field = reader.get_field(key)
     if field is None:
@@ -105,7 +104,7 @@ def get_metadata_array_str(reader: GGUFReader, key: str) -> list[str]:
                 for v in vals
             ]
         return []
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         return []
 
 
@@ -119,7 +118,7 @@ def get_metadata_array_int(reader: GGUFReader, key: str) -> list[int]:
         if isinstance(vals, (list, np.ndarray)):
             return [int(v) for v in vals]
         return []
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         return []
 
 
@@ -154,6 +153,7 @@ ARCH_MAP: dict[str, str] = {
     "deepseek3": "deepseek_v3",
     "chatglm": "chatglm",
     "glm-dsa": "glm_moe_dsa",  # GLM-5.2: MLA + DSA + MoE + MTP (experimental)
+    "glm4moe": "glm4_moe",
     "baichuan": "baichuan",
     "xverse": "xverse",
     "orion": "orion",
@@ -175,6 +175,21 @@ ARCH_MAP: dict[str, str] = {
     "granite": "granite",
     "smolm": "smolm",
     "chameleon": "chameleon",
+}
+
+# Architectures whose tensor layouts are explicitly handled below. Other names
+# may be detected for inspection, but conversion must not silently emit an
+# invalid Llama-layout model.
+CONVERTIBLE_ARCHES = {
+    "deepseek2",
+    "deepseek3",
+    "glm-dsa",
+    "glm4moe",
+    "llama",
+    "mistral",
+    "qwen2",
+    "qwen2moe",
+    "qwen3moe",
 }
 
 # Popular GGUF naming patterns that do not directly include a GGUF architecture key.
@@ -208,7 +223,7 @@ def detect_architecture(reader: GGUFReader) -> str:
         for pattern, mapped_arch in MODEL_NAME_ARCH_FALLBACKS:
             if re.search(pattern, name_lower):
                 return mapped_arch
-        for gguf_arch, hf_name in ARCH_MAP.items():
+        for gguf_arch in ARCH_MAP:
             if gguf_arch in name_lower:
                 return gguf_arch
     return "llama"  # Safe default
@@ -585,7 +600,7 @@ _INDEXER_FRAG_MAP = {
 _MLA_ARCHES = ("glm-dsa", "deepseek2", "deepseek3", "glm4moe")
 
 
-def _map_mla_tensor_name(gguf_name: str) -> Optional[str]:
+def _map_mla_tensor_name(gguf_name: str) -> str | None:
     """Map MLA-family tensor names (DeepSeek-V2/V3, GLM-DSA) to HF format.
 
     Returns None for anything it does not specifically own, so the caller can
@@ -668,7 +683,7 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
 _GLM_DSA_TEMPLATE_PATH = Path(__file__).parent / "data" / "glm_dsa_chat_template.jinja"
 
 
-def _get_chat_template(reader: GGUFReader, arch: str) -> Optional[str]:
+def _get_chat_template(reader: GGUFReader, arch: str) -> str | None:
     """Return a chat template: GGUF metadata first, then a canonical GLM fallback."""
     tmpl = get_metadata_str(reader, "tokenizer.chat_template")
     if tmpl:
@@ -682,7 +697,7 @@ def extract_tokenizer(
     reader: GGUFReader,
     output_dir: Path,
     arch: str = "llama",
-    model_max_length: Optional[int] = None,
+    model_max_length: int | None = None,
 ) -> None:
     """Extract tokenizer from GGUF metadata and save standard files."""
     model_type = get_metadata_str(reader, "tokenizer.ggml.model") or "bpe"
@@ -812,10 +827,8 @@ def extract_tokenizer(
     # --- vocab.json (word → id mapping) ---
     vocab = {}
     for i, token in enumerate(tokens):
-        if i < vocab_size:
-            # Normalize token: GGUF stores bytes, HF expects strings
-            if isinstance(token, str):
-                vocab[token] = i
+        if i < vocab_size and isinstance(token, str):
+            vocab[token] = i
 
     with open(output_dir / "vocab.json", "w") as f:
         json.dump(vocab, f, indent=2, ensure_ascii=False)
@@ -964,7 +977,7 @@ def _build_tokenizer_json(
 
 def _read_mla_dims(reader: GGUFReader, arch: str) -> dict[str, int]:
     """Read MLA dims needed to reconstruct kv_b_proj from split k_b/v_b."""
-    def _g(key: str) -> Optional[int]:
+    def _g(key: str) -> int | None:
         return get_metadata_int(reader, f"{arch}.{key}") or get_metadata_int(reader, f"llama.{key}")
     n_heads = _g("attention.head_count") or 64
     qk_nope = _g("attention.qk_nope_head_dim") or 192
@@ -1051,7 +1064,7 @@ def _detect_full_indexer_layers(all_keys: list[str]) -> list[int]:
 
 def extract_and_convert_weights(
     reader: GGUFReader, arch: str, output_dir: Path, dtype: str = "float16"
-) -> dict[str, np.ndarray]:
+) -> None:
     """Extract GGUF tensors, dequantize, rename, and save as safetensors."""
 
     print(f"\n  Converting {len(reader.tensors)} tensors...")
@@ -1108,7 +1121,7 @@ def extract_and_convert_weights(
 
         try:
             # Dequantize if needed
-            qtype_val = int(qtype) if hasattr(qtype, "value") else int(qtype)
+            qtype_val = int(qtype)
             raw_data = tensor.data
 
             if qtype_val == 0:  # F32
@@ -1144,7 +1157,7 @@ def extract_and_convert_weights(
                     arr = dequantize(raw_data, ggml_qtype)
                     # dequantize already returns correct shape, no .reshape needed
                     arr = arr.astype(np_dtype)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"    ⚠ Failed to dequantize {gguf_name} ({qtype}): {e}")
                     skipped += 1
                     continue
@@ -1167,7 +1180,7 @@ def extract_and_convert_weights(
                     weights = {}
             pbar.update(1)
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"    ⚠ Error processing {gguf_name}: {e}")
             skipped += 1
             continue
@@ -1189,6 +1202,9 @@ def extract_and_convert_weights(
             else:
                 missing = "v" if "k" in buf else "k"
                 print(f"    ⚠ Unpaired {missing}_b at layer {layer_idx} — discarded")
+
+    if skipped:
+        raise RuntimeError(f"Failed to convert {skipped} tensor(s); no partial model was published")
 
     # --- IndexShare invariant: log Full-indexer layer count (glm-dsa) ---
     if arch == "glm-dsa":
@@ -1223,7 +1239,7 @@ def extract_and_convert_weights(
 
         # Read keys from shard to build weight map
         with safe_open(str(new_path), framework="np") as f:
-            for key in f.keys():
+            for key in f:
                 weight_map[key] = new_name
 
     # --- Save index ---
@@ -1237,12 +1253,6 @@ def extract_and_convert_weights(
     print(f"\n  ✓ Saved {len(all_keys)} weight tensors ({total_shards} shards)")
     print(f"    Total input:  {total_bytes_in / 1e9:.2f} GB (GGUF)")
     print(f"    Total output: {total_bytes_out / 1e9:.2f} GB (safetensors)")
-    if skipped:
-        print(f"    ⚠ Skipped {skipped} tensors due to errors")
-
-    return weights
-
-
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
@@ -1280,7 +1290,7 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     # Step 2: Detect architecture & build config
     print("\n[2/5] Detecting architecture...")
     arch = detect_architecture(reader)
-    if arch not in ARCH_MAP:
+    if arch not in CONVERTIBLE_ARCHES:
         print(f"❌ Unsupported GGUF architecture: {arch}")
         return False
     hf_type = ARCH_MAP.get(arch, arch)
@@ -1309,8 +1319,8 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
                 17: "IQ2_XS", 19: "IQ1_S", 20: "IQ4_NL",
             }
             print(f"  Source quantization: {ft_names.get(int(ft), f'unknown({ft})')}")
-    except Exception:
-        pass
+    except (AttributeError, KeyError, TypeError, ValueError):
+        print("  ⚠ Could not read source quantization metadata")
 
     # Save config
     with open(output_path / "config.json", "w") as f:
@@ -1340,7 +1350,7 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     print("\n[4/5] Extracting and converting weights...")
     try:
         extract_and_convert_weights(reader, arch, output_path, dtype)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"❌ Weight extraction failed: {e}")
         return False
 
@@ -1382,21 +1392,29 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
 def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     output_path = Path(output_dir)
+    if output_path.exists() and (
+        not output_path.is_dir() or any(output_path.iterdir())
+    ):
+        print(f"❌ Output path already exists and is not empty: {output_path}")
+        return False
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     staging_path = Path(
         tempfile.mkdtemp(prefix=f".{output_path.name}.", dir=output_path.parent)
     )
 
     try:
-        if not _convert(gguf_path, str(staging_path), dtype):
+        try:
+            succeeded = _convert(gguf_path, str(staging_path), dtype)
+        except Exception as error:  # noqa: BLE001
+            print(f"❌ Conversion failed: {error}")
+            return False
+
+        if not succeeded:
             return False
 
         if output_path.exists():
-            if output_path.is_dir() and not any(output_path.iterdir()):
-                output_path.rmdir()
-            else:
-                print(f"❌ Output path already exists and is not empty: {output_path}")
-                return False
+            output_path.rmdir()
         staging_path.replace(output_path)
         return True
     finally:

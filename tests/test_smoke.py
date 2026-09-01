@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
+from gguf2mlx import gguf2mlx as core
 from gguf2mlx.gguf2mlx import (
     build_config,
     detect_architecture,
@@ -50,6 +51,7 @@ def test_cli_help():
     result = subprocess.run(
         [sys.executable, "-m", "gguf2mlx", "--help"],
         capture_output=True,
+        check=False,
         text=True,
         timeout=30,
     )
@@ -128,3 +130,48 @@ def test_extract_tokenizer_uses_context_length_and_zero_token_ids(tmp_path: Path
     assert tokenizer_config["bos_token"] == "<s>"
     assert tokenizer_config["eos_token"] == "</s>"
     assert tokenizer_config["model_max_length"] == 8192
+
+
+def test_convert_refuses_nonempty_output_without_starting(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+    output_dir.mkdir()
+    (output_dir / "existing.json").write_text("{}")
+    started = False
+
+    def fake_convert(*args, **kwargs):
+        nonlocal started
+        started = True
+        return True
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+
+    assert core.convert("model.gguf", str(output_dir)) is False
+    assert started is False
+    assert (output_dir / "existing.json").exists()
+
+
+def test_convert_cleans_staging_directory_after_failure(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+
+    def fake_convert(_input, staging_dir, _dtype):
+        (Path(staging_dir) / "partial.json").write_text("{}")
+        return False
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+
+    assert core.convert("model.gguf", str(output_dir)) is False
+    assert not output_dir.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_returns_false_and_cleans_up_after_exception(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+
+    def fake_convert(_input, staging_dir, _dtype):
+        (Path(staging_dir) / "partial.json").write_text("{}")
+        raise RuntimeError("conversion error")
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+
+    assert core.convert("model.gguf", str(output_dir)) is False
+    assert list(tmp_path.iterdir()) == []

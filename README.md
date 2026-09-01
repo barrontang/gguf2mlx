@@ -40,7 +40,7 @@ One command. Full conversion. Ready for `mlx_lm.load()`.
 | 🪙 **Tokenizer** | Extracts vocab, merges, special tokens → HuggingFace-compatible format |
 | 📊 **Progress Bar** | Real-time tqdm feedback during conversion |
 | 🛟 **BOS/EOS Fix** | Auto-corrects broken special tokens for Qwen, DeepSeek, and others |
-| 🏗️ **44+ Architectures** | Llama, Mistral, Qwen, DeepSeek, Gemma, Phi, Falcon, DBRX, Grok… |
+| 🏗️ **Strict conversion** | Converts supported Llama, Mistral, Qwen, DeepSeek, and GLM layouts; rejects unknown layouts |
 
 ---
 
@@ -106,10 +106,10 @@ print(generate(model, tok, prompt='Hello, world!', max_tokens=50))
 
 ---
 
-## 🏗️ Supported Architectures
+## 🏗️ Architecture Status
 
 <details open>
-<summary><b>45+ architectures supported</b></summary>
+<summary><b>GGUF architectures recognized for inspection</b></summary>
 
 | Family | Architectures |
 |--------|--------------|
@@ -126,6 +126,11 @@ print(generate(model, tok, prompt='Hello, world!', max_tokens=50))
 | **Others** | bert, bloom, cohere, granite, nemotron, exaone, openelm, chatglm, baichuan, xverse, orion, bitnet, plamo, codeshell, minicpm, minicpm3, t5, jais, arctic, smolm, chameleon, mpt |
 
 </details>
+
+Weight conversion is currently enabled for `llama`, `mistral`, `qwen2`,
+`qwen2moe`, `qwen3moe`, `deepseek2`, `deepseek3`, and experimental `glm-dsa`.
+`glm4moe` is also supported. Other architectures are detected by `--skip-weights` but rejected during
+conversion until their tensor layout has a dedicated, tested adapter.
 
 > ⚠️ **GLM-5.2 (`glm-dsa`) is experimental.** The converter fully supports the
 > tensor layout (MLA + DSA lightning indexer + IndexShare F/S layers +
