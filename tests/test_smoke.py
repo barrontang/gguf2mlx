@@ -98,6 +98,10 @@ def test_detect_architecture_model_name_fallbacks():
     assert detect_architecture(reader) == "llama"
 
 
+def test_detect_architecture_fails_closed_when_metadata_and_name_are_missing():
+    assert detect_architecture(_FakeReader({})) == "unknown"
+
+
 def test_build_config_preserves_zero_token_ids_and_dtype():
     reader = _FakeReader(
         {
@@ -132,6 +136,43 @@ def test_extract_tokenizer_uses_context_length_and_zero_token_ids(tmp_path: Path
     assert tokenizer_config["bos_token"] == "<s>"
     assert tokenizer_config["eos_token"] == "</s>"
     assert tokenizer_config["model_max_length"] == 8192
+
+
+def test_build_tokenizer_json_preserves_sentencepiece_unigram_shape():
+    tokenizer_json = core._build_tokenizer_json(
+        ["<unk>", "▁hello", "<0x20>", "</s>"],
+        [2, 1, 6, 3],
+        [],
+        [0.0, -1.0, -2.0, -3.0],
+        "sentencepiece",
+        bos_id=1,
+        eos_id=3,
+        pad_id=0,
+    )
+
+    assert tokenizer_json["model"]["type"] == "Unigram"
+    assert tokenizer_json["model"]["vocab"][1] == ["▁hello", -1.0]
+    assert tokenizer_json["model"]["byte_fallback"] is True
+    assert tokenizer_json["pre_tokenizer"]["type"] == "Metaspace"
+    assert tokenizer_json["decoder"]["decoders"][1]["type"] == "ByteFallback"
+
+
+def test_build_tokenizer_json_preserves_wordpiece_shape():
+    tokenizer_json = core._build_tokenizer_json(
+        ["[UNK]", "[CLS]", "[SEP]", "hello", "##s"],
+        [2, 3, 3, 1, 1],
+        [],
+        [],
+        "wordpiece",
+        bos_id=1,
+        eos_id=2,
+        pad_id=0,
+    )
+
+    assert tokenizer_json["model"]["type"] == "WordPiece"
+    assert tokenizer_json["pre_tokenizer"]["type"] == "BertPreTokenizer"
+    assert tokenizer_json["decoder"]["type"] == "WordPiece"
+    assert tokenizer_json["model"]["vocab"]["##s"] == 4
 
 
 def test_convert_refuses_nonempty_output_without_starting(tmp_path: Path, monkeypatch):
@@ -217,6 +258,27 @@ def test_convert_quantizes_output_with_mlx_lm(tmp_path: Path, monkeypatch):
     assert q_mode == "affine"
     assert (output_dir / "quantized.safetensors").exists()
     assert list(tmp_path.iterdir()) == [output_dir]
+
+
+def test_convert_quantize_rejects_unsupported_group_size_before_starting(
+    tmp_path: Path, monkeypatch
+):
+    output_dir = tmp_path / "model"
+    started = False
+
+    def fake_convert(*args, **kwargs):
+        nonlocal started
+        started = True
+        return True
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+
+    assert (
+        core.convert("model.gguf", str(output_dir), quantize=True, q_group_size=8)
+        is False
+    )
+    assert started is False
+    assert not output_dir.exists()
 
 
 def test_convert_quantize_requires_mlx_lm(tmp_path: Path, monkeypatch):

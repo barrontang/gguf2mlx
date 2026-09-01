@@ -24,9 +24,10 @@ directory with `config.json`, tokenizer assets, and safetensors weights.
 - rebuilding MLX-LM-compatible model artifacts
 - failing closed when a model layout is not actually supported
 
-> **Important:** the current converter writes **HF-style safetensors for MLX-LM**.
-> It does **not** yet emit MLX-native quantized weights, so quantized GGUF files
-> are currently expanded to FP16 or FP32 during conversion.
+> **Important:** `gguf2mlx` writes **HF-style safetensors for MLX-LM** and can
+> optionally run `mlx_lm.convert` to emit 4-bit MLX output. This is MLX-LM
+> re-quantization after conversion, not bit-for-bit preservation of the original
+> GGUF quantization blocks.
 
 ---
 
@@ -134,6 +135,10 @@ print('loaded')
 | Correct zero-valued special token IDs | Supported |
 | GGUF context length -> `model_max_length` | Supported |
 | MLX / MLX-LM optional dependency | Supported |
+| One-command 4-bit output via `mlx_lm.convert` | Supported |
+| Opt-in `mlx_lm.load()` integration test | Supported |
+| SentencePiece/Unigram tokenizer JSON shape | Partial |
+| WordPiece tokenizer JSON shape | Partial |
 | Regression tests for recent fixes | Supported |
 
 ---
@@ -177,9 +182,10 @@ unrelated architectures.
 2. Validate that the architecture has a supported adapter
 3. Build `config.json` using source metadata and selected dtype
 4. Export tokenizer assets from GGUF metadata
-5. Dequantize tensors to FP16 or FP32
+5. Dequantize GGUF tensors to FP16 or FP32
 6. Remap tensor names into the target Hugging Face / MLX-LM layout
-7. Write sharded safetensors atomically into the output directory
+7. Optionally run `mlx_lm.convert --quantize` into a second staged directory
+8. Write the selected output directory atomically
 
 If any required step fails, conversion fails and the staged output is cleaned up.
 
@@ -189,9 +195,10 @@ If any required step fails, conversion fails and the staged output is cleaned up
 
 This project is intentionally more honest about scope now:
 
-- **No MLX-native quantized output yet**; quantized GGUF expands to FP16/FP32
-- **Tokenizer fidelity is still evolving** across SentencePiece, Unigram, and
-  architecture-specific tokenizer variants
+- **4-bit MLX output uses MLX-LM re-quantization**; source GGUF Q4 blocks are not
+  preserved directly
+- **Tokenizer fidelity is still evolving** for architecture-specific normalizers
+  and edge-case added-token metadata
 - **Architecture coverage is adapter-based**, not "all GGUF models"
 - **Performance claims depend on model, prompt, hardware, and MLX-LM version**
 
@@ -211,8 +218,9 @@ These numbers reflect **conversion output size**, not a universal inference-spee
 | Mistral-7B | 4.3 GB | Q4_K_M | ~42s | 13.8 GB |
 | Phi-3-mini | 2.2 GB | Q4_K_M | ~20s | 6.6 GB |
 
-Because output is currently dequantized, converted models are substantially
-larger than the original GGUF quantized files.
+Plain conversion output is dequantized and can be substantially larger than the
+original GGUF quantized file. Use `--quantize --q-bits 4 --q-group-size 64` when
+you want compact MLX-LM quantized output.
 
 ---
 
@@ -239,19 +247,28 @@ Recent regression coverage includes:
 - preservation of zero-valued token IDs
 - correct dtype propagation into config
 - atomic staging cleanup on failed writes
+- MLX-LM quantization error handling
+- opt-in `mlx_lm.load()` validation of quantized output
+- SentencePiece/Unigram and WordPiece tokenizer JSON structure
 
 ---
 
-## Roadmap
+## Roadmap status
 
-Highest-value next steps:
+Completed:
 
-1. MLX quantized output
-2. MLX-LM load/integration tests on Apple Silicon
-3. More verified architecture adapters
-4. Higher-fidelity tokenizer preservation
+- MLX quantized output through bundled `mlx_lm.convert`
+- MLX-LM load/integration tests on Apple Silicon
+- strict adapter-based architecture validation
+- partial SentencePiece/Unigram and WordPiece tokenizer preservation
 
-Contributions in any of those areas are especially welcome.
+Remaining areas for contributors:
+
+- direct preservation/transcoding of GGUF quantization blocks without an FP16
+  intermediate
+- additional verified architecture adapters backed by model fixtures
+- broader tokenizer fixture coverage for architecture-specific normalizers,
+  byte fallback variants, and added-token edge cases
 
 ---
 
@@ -261,7 +278,7 @@ PRs are welcome, especially for:
 
 - new architecture adapters
 - tokenizer fidelity improvements
-- quantized MLX output
+- direct GGUF quantization preservation
 - Apple Silicon integration coverage
 
 ---

@@ -197,6 +197,8 @@ CONVERTIBLE_ARCHES = {
     "qwen3moe",
 }
 
+SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
+
 # Popular GGUF naming patterns that do not directly include a GGUF architecture key.
 # These are used only when `general.architecture` is missing.
 MODEL_NAME_ARCH_FALLBACKS: list[tuple[str, str]] = [
@@ -231,7 +233,7 @@ def detect_architecture(reader: GGUFReader) -> str:
         for gguf_arch in ARCH_MAP:
             if gguf_arch in name_lower:
                 return gguf_arch
-    return "llama"  # Safe default
+    return "unknown"
 
 
 def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[str, Any]:
@@ -882,9 +884,9 @@ def _build_tokenizer_json(
     normal_tokens = []
     for i, token in enumerate(tokens):
         tt = token_types[i] if i < len(token_types) else 1
-        # Control/special tokens go in added_tokens
-        if tt in (3,) or i in (bos_id, eos_id, pad_id):
-            special = i in (bos_id, eos_id, pad_id)
+        # Preserve GGUF control and user-defined token semantics.
+        if tt in (3, 4) or i in (bos_id, eos_id, pad_id):
+            special = tt == 3 or i in (bos_id, eos_id, pad_id)
             added_tokens.append(
                 {
                     "id": i,
@@ -899,8 +901,10 @@ def _build_tokenizer_json(
         else:
             normal_tokens.append(token)
 
+    normalized_model_type = model_type.lower()
+
     # Build model block
-    if model_type in ("bpe", "gpt2"):
+    if normalized_model_type in ("bpe", "gpt2"):
         model_block = {
             "type": "BPE",
             "dropout": None,
@@ -912,7 +916,7 @@ def _build_tokenizer_json(
             "vocab": vocab,
             "merges": merges if merges else [],
         }
-    elif model_type == "llama":
+    elif normalized_model_type == "llama":
         model_block = {
             "type": "BPE",
             "dropout": None,
@@ -924,12 +928,92 @@ def _build_tokenizer_json(
             "vocab": vocab,
             "merges": merges if merges else [],
         }
-    else:
-        # Generic fallback
+    elif normalized_model_type in ("spm", "sentencepiece", "unigram"):
+        vocab_scores = []
+        for i, token in enumerate(tokens):
+            score = scores[i] if i < len(scores) else 0.0
+            vocab_scores.append([token, score])
         model_block = {
-            "type": "BPE",
+            "type": "Unigram",
+            "unk_id": 0,
+            "vocab": vocab_scores,
+            "byte_fallback": any(token.startswith("<0x") and token.endswith(">") for token in tokens),
+        }
+    elif normalized_model_type == "wordpiece":
+        model_block = {
+            "type": "WordPiece",
+            "unk_token": tokens[0] if tokens else "[UNK]",
+            "continuing_subword_prefix": "##",
+            "max_input_chars_per_word": 100,
             "vocab": vocab,
-            "merges": merges if merges else [],
+        }
+    else:
+        raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
+
+    normalizer = {"type": "NFC"}
+    pre_tokenizer = {
+        "type": "Sequence",
+        "pretokenizers": [
+            {
+                "type": "Split",
+                "pattern": {
+                    "Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+                },
+                "behavior": "Isolated",
+                "invert": False,
+            },
+            {
+                "type": "ByteLevel",
+                "add_prefix_space": False,
+                "trim_offsets": False,
+                "use_regex": False,
+            },
+        ],
+    }
+    post_processor = {
+        "type": "ByteLevel",
+        "add_prefix_space": False,
+        "trim_offsets": False,
+        "use_regex": False,
+    }
+    decoder = {
+        "type": "ByteLevel",
+        "add_prefix_space": False,
+        "trim_offsets": False,
+        "use_regex": False,
+    }
+
+    if normalized_model_type in ("spm", "sentencepiece", "unigram", "llama"):
+        pre_tokenizer = {
+            "type": "Metaspace",
+            "replacement": "▁",
+            "prepend_scheme": "always",
+            "split": True,
+        }
+        post_processor = None
+        decoder = {
+            "type": "Sequence",
+            "decoders": [
+                {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+                {"type": "ByteFallback"},
+                {"type": "Fuse"},
+                {"type": "Strip", "content": " ", "start": 1, "stop": 0},
+            ],
+        }
+    elif normalized_model_type == "wordpiece":
+        normalizer = {
+            "type": "BertNormalizer",
+            "clean_text": True,
+            "handle_chinese_chars": True,
+            "strip_accents": None,
+            "lowercase": True,
+        }
+        pre_tokenizer = {"type": "BertPreTokenizer"}
+        post_processor = None
+        decoder = {
+            "type": "WordPiece",
+            "prefix": "##",
+            "cleanup": True,
         }
 
     tokenizer_json = {
@@ -937,38 +1021,10 @@ def _build_tokenizer_json(
         "truncation": None,
         "padding": None,
         "added_tokens": added_tokens,
-        "normalizer": {"type": "NFC"},
-        "pre_tokenizer": {
-            "type": "Sequence",
-            "pretokenizers": [
-                {
-                    "type": "Split",
-                    "pattern": {
-                        "Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
-                    },
-                    "behavior": "Isolated",
-                    "invert": False,
-                },
-                {
-                    "type": "ByteLevel",
-                    "add_prefix_space": False,
-                    "trim_offsets": False,
-                    "use_regex": False,
-                },
-            ],
-        },
-        "post_processor": {
-            "type": "ByteLevel",
-            "add_prefix_space": False,
-            "trim_offsets": False,
-            "use_regex": False,
-        },
-        "decoder": {
-            "type": "ByteLevel",
-            "add_prefix_space": False,
-            "trim_offsets": False,
-            "use_regex": False,
-        },
+        "normalizer": normalizer,
+        "pre_tokenizer": pre_tokenizer,
+        "post_processor": post_processor,
+        "decoder": decoder,
         "model": model_block,
     }
 
@@ -1428,6 +1484,11 @@ def convert(
     q_mode: str = "affine",
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
+    if quantize and q_group_size not in SUPPORTED_MLX_LM_Q_GROUP_SIZES:
+        supported = ", ".join(str(size) for size in sorted(SUPPORTED_MLX_LM_Q_GROUP_SIZES))
+        print(f"❌ Unsupported q_group_size={q_group_size}; supported values: {supported}")
+        return False
+
     output_path = Path(output_dir)
     if output_path.exists() and (
         not output_path.is_dir() or any(output_path.iterdir())
@@ -1513,6 +1574,7 @@ def main() -> None:
         "--q-group-size",
         type=int,
         default=64,
+        choices=sorted(SUPPORTED_MLX_LM_Q_GROUP_SIZES),
         help="Quantization group size for mlx-lm (default: 64)",
     )
     parser.add_argument(
