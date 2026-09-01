@@ -3,10 +3,20 @@
 We do NOT download a model in CI (too slow, too big). The actual end-to-end
 test against a real GGUF lives in `tests/test_e2e.py` and is opt-in via env var.
 """
+import json
 import subprocess
 import sys
+from pathlib import Path
 
-from gguf2mlx.gguf2mlx import detect_architecture, get_metadata_float, get_metadata_int
+import numpy as np
+
+from gguf2mlx.gguf2mlx import (
+    build_config,
+    detect_architecture,
+    extract_tokenizer,
+    get_metadata_float,
+    get_metadata_int,
+)
 
 
 class _FakeField:
@@ -82,3 +92,39 @@ def test_detect_architecture_model_name_fallbacks():
 
     reader = _FakeReader({"general.name": "Yi 1.5 9B Chat"})
     assert detect_architecture(reader) == "llama"
+
+
+def test_build_config_preserves_zero_token_ids_and_dtype():
+    reader = _FakeReader(
+        {
+            "tokenizer.ggml.tokens": ["<s>", "</s>"],
+            "tokenizer.ggml.bos_token_id": 0,
+            "tokenizer.ggml.eos_token_id": 1,
+        }
+    )
+
+    config = build_config(reader, "llama", dtype="float32")
+
+    assert config["bos_token_id"] == 0
+    assert config["eos_token_id"] == 1
+    assert config["torch_dtype"] == "float32"
+
+
+def test_extract_tokenizer_uses_context_length_and_zero_token_ids(tmp_path: Path):
+    reader = _FakeReader(
+        {
+            "tokenizer.ggml.model": "bpe",
+            "tokenizer.ggml.tokens": np.array(["<s>", "</s>", "<pad>"]),
+            "tokenizer.ggml.token_type": np.array([3, 3, 3]),
+            "tokenizer.ggml.bos_token_id": 0,
+            "tokenizer.ggml.eos_token_id": 1,
+            "tokenizer.ggml.padding_token_id": 2,
+        }
+    )
+
+    extract_tokenizer(reader, tmp_path, model_max_length=8192)
+
+    tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+    assert tokenizer_config["bos_token"] == "<s>"
+    assert tokenizer_config["eos_token"] == "</s>"
+    assert tokenizer_config["model_max_length"] == 8192

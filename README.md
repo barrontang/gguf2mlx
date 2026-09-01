@@ -184,6 +184,11 @@ pytest
 ruff check src/
 ```
 
+The `mlx` extra installs both MLX and MLX-LM for loading converted models.
+
+Conversion writes to a temporary staging directory and refuses to replace a
+non-empty output directory, preventing failed runs from leaving mixed model files.
+
 ---
 
 ## 🤝 Contributing

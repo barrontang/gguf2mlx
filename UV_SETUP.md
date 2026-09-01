@@ -34,11 +34,10 @@ uv sync --all-extras
 ### Running Commands
 ```bash
 # Convert GGUF to MLX
-uv run python gguf2mlx.py --input ./models/phi3-mini.gguf --output ./models/phi3-mini-mlx
+uv run gguf2mlx --input ./models/phi3-mini.gguf --output ./models/phi3-mini-mlx
 
 # Run demos
-uv run python demo.py --input ./models/phi3-mini-mlx --prompt "Hello world" --output result.txt
-uv run python demo1.py --input ./models/phi3-mini-mlx --prompt "Explain AI" --output ai_result.txt
+uv run python demo.py --input ./models/phi3-mini.gguf --prompt "Hello world" --keep
 ```
 
 ### Package Management

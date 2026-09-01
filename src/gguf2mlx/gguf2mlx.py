@@ -11,7 +11,9 @@ import argparse
 import gc
 import json
 import re
+import shutil
 import sys
+import tempfile
 import warnings
 from pathlib import Path
 from typing import Any, Optional
@@ -299,7 +301,7 @@ def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[st
     return config
 
 
-def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
+def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[str, Any]:
     """Build MLX-compatible config.json from GGUF metadata."""
 
     def _warn(key: str, value: Any) -> None:
@@ -382,8 +384,10 @@ def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
 
     file_type = get_metadata_int(reader, "general.file_type") or 1
     model_name = get_metadata_str(reader, "general.name") or "unknown"
-    bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id") or 1
-    eos_id = get_metadata_int(reader, "tokenizer.ggml.eos_token_id") or 2
+    bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id")
+    eos_id = get_metadata_int(reader, "tokenizer.ggml.eos_token_id")
+    bos_id = 1 if bos_id is None else bos_id
+    eos_id = 2 if eos_id is None else eos_id
 
     hf_model_type = ARCH_MAP.get(arch, arch)
 
@@ -418,7 +422,7 @@ def build_config(reader: GGUFReader, arch: str) -> dict[str, Any]:
         "hidden_act": "silu",
         "tie_word_embeddings": tie_embeddings,
         "attention_bias": attention_bias,
-        "torch_dtype": "float16",
+        "torch_dtype": dtype,
         "transformers_version": "4.50.0",
         "bos_token_id": bos_id,
         "eos_token_id": eos_id,
@@ -674,12 +678,20 @@ def _get_chat_template(reader: GGUFReader, arch: str) -> Optional[str]:
     return None
 
 
-def extract_tokenizer(reader: GGUFReader, output_dir: Path, arch: str = "llama") -> None:
+def extract_tokenizer(
+    reader: GGUFReader,
+    output_dir: Path,
+    arch: str = "llama",
+    model_max_length: Optional[int] = None,
+) -> None:
     """Extract tokenizer from GGUF metadata and save standard files."""
     model_type = get_metadata_str(reader, "tokenizer.ggml.model") or "bpe"
-    bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id") or 1
-    eos_id = get_metadata_int(reader, "tokenizer.ggml.eos_token_id") or 2
-    pad_id = get_metadata_int(reader, "tokenizer.ggml.padding_token_id") or 0
+    bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id")
+    eos_id = get_metadata_int(reader, "tokenizer.ggml.eos_token_id")
+    pad_id = get_metadata_int(reader, "tokenizer.ggml.padding_token_id")
+    bos_id = 1 if bos_id is None else bos_id
+    eos_id = 2 if eos_id is None else eos_id
+    pad_id = 0 if pad_id is None else pad_id
 
     tokens = get_metadata_array_str(reader, "tokenizer.ggml.tokens")
     token_types = get_metadata_array_int(reader, "tokenizer.ggml.token_type")
@@ -757,7 +769,7 @@ def extract_tokenizer(reader: GGUFReader, output_dir: Path, arch: str = "llama")
         "eos_token": tokens[eos_id] if eos_id < vocab_size else "</s>",
         "unk_token": tokens[0] if tokens else "<unk>",
         "pad_token": tokens[pad_id] if pad_id < vocab_size else "<pad>",
-        "model_max_length": 131072,
+        "model_max_length": model_max_length or 4096,
         "tokenizer_class": "PreTrainedTokenizerFast",
         "clean_up_tokenization_spaces": False,
     }
@@ -1236,7 +1248,7 @@ def extract_and_convert_weights(
 # ---------------------------------------------------------------------------
 
 
-def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
+def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     """Convert a GGUF file to MLX-compatible safetensors format."""
 
     gguf_file = Path(gguf_path)
@@ -1268,12 +1280,15 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     # Step 2: Detect architecture & build config
     print("\n[2/5] Detecting architecture...")
     arch = detect_architecture(reader)
+    if arch not in ARCH_MAP:
+        print(f"❌ Unsupported GGUF architecture: {arch}")
+        return False
     hf_type = ARCH_MAP.get(arch, arch)
     model_name_full = get_metadata_str(reader, "general.name") or model_name
     print(f"  Architecture: {arch} (HF type: {hf_type})")
     print(f"  Model name:   {model_name_full}")
 
-    config = build_config(reader, arch)
+    config = build_config(reader, arch, dtype)
     print(
         f"  Config: {config['num_hidden_layers']} layers, "
         f"{config['hidden_size']} hidden, "
@@ -1319,7 +1334,7 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
 
     # Step 3: Extract tokenizer
     print("\n[3/5] Extracting tokenizer...")
-    extract_tokenizer(reader, output_path, arch)
+    extract_tokenizer(reader, output_path, arch, config["max_position_embeddings"])
 
     # Step 4: Extract, dequantize, and convert weights
     print("\n[4/5] Extracting and converting weights...")
@@ -1362,6 +1377,31 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     print("=" * 60)
 
     return True
+
+
+def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
+    """Convert into a staging directory so failed runs never leave partial output."""
+    output_path = Path(output_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path = Path(
+        tempfile.mkdtemp(prefix=f".{output_path.name}.", dir=output_path.parent)
+    )
+
+    try:
+        if not _convert(gguf_path, str(staging_path), dtype):
+            return False
+
+        if output_path.exists():
+            if output_path.is_dir() and not any(output_path.iterdir()):
+                output_path.rmdir()
+            else:
+                print(f"❌ Output path already exists and is not empty: {output_path}")
+                return False
+        staging_path.replace(output_path)
+        return True
+    finally:
+        if staging_path.exists():
+            shutil.rmtree(staging_path)
 
 
 # ---------------------------------------------------------------------------
