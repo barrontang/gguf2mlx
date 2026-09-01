@@ -45,6 +45,11 @@ except ImportError:
     print("❌ safetensors library required. Install: pip install safetensors")
     sys.exit(1)
 
+try:
+    from mlx_lm import convert as mlx_lm_convert
+except ImportError:
+    mlx_lm_convert = None
+
 # ---------------------------------------------------------------------------
 # GGUF metadata helpers
 # ---------------------------------------------------------------------------
@@ -1389,7 +1394,39 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     return True
 
 
-def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
+def _quantize_output_with_mlx_lm(
+    model_path: Path,
+    output_path: Path,
+    q_bits: int,
+    q_group_size: int,
+    q_mode: str,
+) -> None:
+    """Quantize an MLX-LM-loadable directory into a new MLX output directory."""
+    if mlx_lm_convert is None:
+        raise RuntimeError(
+            "Quantization requested but mlx-lm is not installed. "
+            "Install with `pip install -e '.[mlx]'` or `pip install mlx-lm`."
+        )
+
+    mlx_lm_convert(
+        str(model_path),
+        mlx_path=str(output_path),
+        quantize=True,
+        q_bits=q_bits,
+        q_group_size=q_group_size,
+        q_mode=q_mode,
+    )
+
+
+def convert(
+    gguf_path: str,
+    output_dir: str,
+    dtype: str = "float16",
+    quantize: bool = False,
+    q_bits: int = 4,
+    q_group_size: int = 64,
+    q_mode: str = "affine",
+) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     output_path = Path(output_dir)
     if output_path.exists() and (
@@ -1402,10 +1439,12 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     staging_path = Path(
         tempfile.mkdtemp(prefix=f".{output_path.name}.", dir=output_path.parent)
     )
+    fp_output_path = staging_path / "fp"
+    quantized_output_path = staging_path / "quantized"
 
     try:
         try:
-            succeeded = _convert(gguf_path, str(staging_path), dtype)
+            succeeded = _convert(gguf_path, str(fp_output_path), dtype)
         except Exception as error:  # noqa: BLE001
             print(f"❌ Conversion failed: {error}")
             return False
@@ -1413,9 +1452,25 @@ def convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
         if not succeeded:
             return False
 
+        final_stage_path = fp_output_path
+        if quantize:
+            print("\n[mlx-lm] Quantizing converted output...")
+            try:
+                _quantize_output_with_mlx_lm(
+                    fp_output_path,
+                    quantized_output_path,
+                    q_bits=q_bits,
+                    q_group_size=q_group_size,
+                    q_mode=q_mode,
+                )
+            except Exception as error:  # noqa: BLE001
+                print(f"❌ Quantization failed: {error}")
+                return False
+            final_stage_path = quantized_output_path
+
         if output_path.exists():
             output_path.rmdir()
-        staging_path.replace(output_path)
+        final_stage_path.replace(output_path)
         return True
     finally:
         if staging_path.exists():
@@ -1444,6 +1499,30 @@ def main() -> None:
         help="Output data type (default: float16)",
     )
     parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Run mlx-lm quantization after conversion to produce a quantized MLX output directory",
+    )
+    parser.add_argument(
+        "--q-bits",
+        type=int,
+        default=4,
+        help="Quantization bit-width for mlx-lm (default: 4)",
+    )
+    parser.add_argument(
+        "--q-group-size",
+        type=int,
+        default=64,
+        help="Quantization group size for mlx-lm (default: 64)",
+    )
+    parser.add_argument(
+        "--q-mode",
+        type=str,
+        default="affine",
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
+        help="Quantization mode for mlx-lm (default: affine)",
+    )
+    parser.add_argument(
         "--skip-weights",
         action="store_true",
         help="Skip weight extraction (metadata + tokenizer only, for inspection)",
@@ -1465,7 +1544,15 @@ def main() -> None:
             print(f"  {name}")
         return
 
-    success = convert(args.input, args.output, args.dtype)
+    success = convert(
+        args.input,
+        args.output,
+        args.dtype,
+        quantize=args.quantize,
+        q_bits=args.q_bits,
+        q_group_size=args.q_group_size,
+        q_mode=args.q_mode,
+    )
     if not success:
         sys.exit(1)
 

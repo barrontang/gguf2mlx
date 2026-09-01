@@ -57,6 +57,8 @@ def test_cli_help():
     )
     assert result.returncode == 0, f"--help failed: {result.stderr}"
     assert "input" in result.stdout.lower() or "gguf" in result.stdout.lower()
+    assert "--quantize" in result.stdout
+    assert "--q-bits" in result.stdout
 
 
 def test_get_metadata_int_accepts_python_sequences():
@@ -174,4 +176,83 @@ def test_convert_returns_false_and_cleans_up_after_exception(tmp_path: Path, mon
     monkeypatch.setattr(core, "_convert", fake_convert)
 
     assert core.convert("model.gguf", str(output_dir)) is False
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_quantizes_output_with_mlx_lm(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+    quantize_calls = []
+
+    def fake_convert(_input, staging_dir, _dtype):
+        staging_path = Path(staging_dir)
+        staging_path.mkdir(parents=True, exist_ok=True)
+        (staging_path / "config.json").write_text("{}")
+        return True
+
+    def fake_quantize(model_path, output_path, q_bits, q_group_size, q_mode):
+        quantize_calls.append((model_path, output_path, q_bits, q_group_size, q_mode))
+        output_path.mkdir(parents=True, exist_ok=True)
+        (output_path / "quantized.safetensors").write_text("ok")
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+    monkeypatch.setattr(core, "_quantize_output_with_mlx_lm", fake_quantize)
+
+    assert (
+        core.convert(
+            "model.gguf",
+            str(output_dir),
+            quantize=True,
+            q_bits=4,
+            q_group_size=128,
+            q_mode="affine",
+        )
+        is True
+    )
+    assert len(quantize_calls) == 1
+    model_path, quantized_path, q_bits, q_group_size, q_mode = quantize_calls[0]
+    assert model_path.name == "fp"
+    assert quantized_path.name == "quantized"
+    assert q_bits == 4
+    assert q_group_size == 128
+    assert q_mode == "affine"
+    assert (output_dir / "quantized.safetensors").exists()
+    assert list(tmp_path.iterdir()) == [output_dir]
+
+
+def test_convert_quantize_requires_mlx_lm(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+
+    def fake_convert(_input, staging_dir, _dtype):
+        staging_path = Path(staging_dir)
+        staging_path.mkdir(parents=True, exist_ok=True)
+        (staging_path / "config.json").write_text("{}")
+        return True
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+    monkeypatch.setattr(core, "mlx_lm_convert", None)
+
+    assert core.convert("model.gguf", str(output_dir), quantize=True) is False
+    assert not output_dir.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_cleans_staging_directory_after_quantization_failure(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+
+    def fake_convert(_input, staging_dir, _dtype):
+        staging_path = Path(staging_dir)
+        staging_path.mkdir(parents=True, exist_ok=True)
+        (staging_path / "config.json").write_text("{}")
+        return True
+
+    def fake_quantize(_model_path, output_path, q_bits, q_group_size, q_mode):
+        output_path.mkdir(parents=True, exist_ok=True)
+        (output_path / "partial.json").write_text("{}")
+        raise RuntimeError("quantization error")
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+    monkeypatch.setattr(core, "_quantize_output_with_mlx_lm", fake_quantize)
+
+    assert core.convert("model.gguf", str(output_dir), quantize=True) is False
+    assert not output_dir.exists()
     assert list(tmp_path.iterdir()) == []
