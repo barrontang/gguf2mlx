@@ -3,10 +3,21 @@
 We do NOT download a model in CI (too slow, too big). The actual end-to-end
 test against a real GGUF lives in `tests/test_e2e.py` and is opt-in via env var.
 """
+import json
 import subprocess
 import sys
+from pathlib import Path
 
-from gguf2mlx.gguf2mlx import detect_architecture, get_metadata_float, get_metadata_int
+import numpy as np
+
+from gguf2mlx import gguf2mlx as core
+from gguf2mlx.gguf2mlx import (
+    build_config,
+    detect_architecture,
+    extract_tokenizer,
+    get_metadata_float,
+    get_metadata_int,
+)
 
 
 class _FakeField:
@@ -40,6 +51,7 @@ def test_cli_help():
     result = subprocess.run(
         [sys.executable, "-m", "gguf2mlx", "--help"],
         capture_output=True,
+        check=False,
         text=True,
         timeout=30,
     )
@@ -82,3 +94,84 @@ def test_detect_architecture_model_name_fallbacks():
 
     reader = _FakeReader({"general.name": "Yi 1.5 9B Chat"})
     assert detect_architecture(reader) == "llama"
+
+
+def test_build_config_preserves_zero_token_ids_and_dtype():
+    reader = _FakeReader(
+        {
+            "tokenizer.ggml.tokens": ["<s>", "</s>"],
+            "tokenizer.ggml.bos_token_id": 0,
+            "tokenizer.ggml.eos_token_id": 1,
+        }
+    )
+
+    config = build_config(reader, "llama", dtype="float32")
+
+    assert config["bos_token_id"] == 0
+    assert config["eos_token_id"] == 1
+    assert config["torch_dtype"] == "float32"
+
+
+def test_extract_tokenizer_uses_context_length_and_zero_token_ids(tmp_path: Path):
+    reader = _FakeReader(
+        {
+            "tokenizer.ggml.model": "bpe",
+            "tokenizer.ggml.tokens": np.array(["<s>", "</s>", "<pad>"]),
+            "tokenizer.ggml.token_type": np.array([3, 3, 3]),
+            "tokenizer.ggml.bos_token_id": 0,
+            "tokenizer.ggml.eos_token_id": 1,
+            "tokenizer.ggml.padding_token_id": 2,
+        }
+    )
+
+    extract_tokenizer(reader, tmp_path, model_max_length=8192)
+
+    tokenizer_config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+    assert tokenizer_config["bos_token"] == "<s>"
+    assert tokenizer_config["eos_token"] == "</s>"
+    assert tokenizer_config["model_max_length"] == 8192
+
+
+def test_convert_refuses_nonempty_output_without_starting(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+    output_dir.mkdir()
+    (output_dir / "existing.json").write_text("{}")
+    started = False
+
+    def fake_convert(*args, **kwargs):
+        nonlocal started
+        started = True
+        return True
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+
+    assert core.convert("model.gguf", str(output_dir)) is False
+    assert started is False
+    assert (output_dir / "existing.json").exists()
+
+
+def test_convert_cleans_staging_directory_after_failure(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+
+    def fake_convert(_input, staging_dir, _dtype):
+        (Path(staging_dir) / "partial.json").write_text("{}")
+        return False
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+
+    assert core.convert("model.gguf", str(output_dir)) is False
+    assert not output_dir.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_returns_false_and_cleans_up_after_exception(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+
+    def fake_convert(_input, staging_dir, _dtype):
+        (Path(staging_dir) / "partial.json").write_text("{}")
+        raise RuntimeError("conversion error")
+
+    monkeypatch.setattr(core, "_convert", fake_convert)
+
+    assert core.convert("model.gguf", str(output_dir)) is False
+    assert list(tmp_path.iterdir()) == []

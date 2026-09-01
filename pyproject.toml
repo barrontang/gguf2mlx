@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mlx = ["mlx>=0.18.0"]
+mlx = ["mlx>=0.18.0", "mlx-lm>=0.29.0"]
 dev = ["pytest", "pytest-cov", "ruff", "mypy"]
 
 [project.scripts]
