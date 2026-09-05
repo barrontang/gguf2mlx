@@ -1,3 +1,4 @@
+use once_cell::sync::Lazy;
 use regex::Regex;
 
 const MODEL_NAME_ARCH_FALLBACKS: [(&str, &str); 10] = [
@@ -12,6 +13,18 @@ const MODEL_NAME_ARCH_FALLBACKS: [(&str, &str); 10] = [
     (r"^\s*yi\b", "llama"),
     (r"\bglm-dsa\b", "glm-dsa"),
 ];
+
+static MODEL_NAME_ARCH_FALLBACKS_REGEX: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
+    MODEL_NAME_ARCH_FALLBACKS
+        .iter()
+        .map(|(pattern, mapped)| {
+            (
+                Regex::new(pattern).expect("MODEL_NAME_ARCH_FALLBACKS contains an invalid regex"),
+                *mapped,
+            )
+        })
+        .collect()
+});
 
 const ARCH_SUBSTRINGS: [&str; 39] = [
     "llama",
@@ -63,9 +76,9 @@ pub fn detect_architecture(general_architecture: Option<&str>, general_name: Opt
     }
     if let Some(name) = general_name {
         let lowered = name.to_lowercase();
-        for (pattern, mapped) in MODEL_NAME_ARCH_FALLBACKS {
-            if Regex::new(pattern).map(|re| re.is_match(&lowered)).unwrap_or(false) {
-                return mapped.to_string();
+        for (pattern, mapped) in MODEL_NAME_ARCH_FALLBACKS_REGEX.iter() {
+            if pattern.is_match(&lowered) {
+                return (*mapped).to_string();
             }
         }
         for arch in ARCH_SUBSTRINGS {

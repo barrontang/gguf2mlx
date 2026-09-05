@@ -247,6 +247,13 @@ The repository now includes an initial Rust core scaffold at:
 
 - `rust/gguf2mlx-rs`
 
+To build and enable the optional PyO3 extension locally:
+
+```bash
+python -m pip install maturin
+maturin develop --manifest-path rust/gguf2mlx-rs/Cargo.toml
+```
+
 Current integration behavior:
 
 - Python CLI/UX remains the primary entrypoint.
