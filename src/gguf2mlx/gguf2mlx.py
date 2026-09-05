@@ -17,7 +17,7 @@ import tempfile
 import warnings
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import numpy as np
@@ -1553,6 +1553,19 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _is_safe_bundle_path(path: str) -> bool:
+    if "\\" in path:
+        return False
+    pure = PurePosixPath(path)
+    if pure.is_absolute():
+        return False
+    if str(pure) != path:
+        return False
+    if any(part in {".", ".."} for part in pure.parts):
+        return False
+    return len(pure.parts) > 0
+
+
 def package_mlx_directory(model_dir: str, output_bundle: str | None = None) -> bool:
     """Package an MLX model directory into a .mlx bundle with manifest hashes."""
     model_path = Path(model_dir)
@@ -1600,13 +1613,19 @@ def package_mlx_directory(model_dir: str, output_bundle: str | None = None) -> b
 
     bundle_sha = _sha256_file(bundle_path)
     sha_path = bundle_path.with_suffix(bundle_path.suffix + ".sha256")
-    sha_path.write_text(f"{bundle_sha}  {bundle_path.name}\n")
+    sha_path.write_text(f"{bundle_sha}  {bundle_path.name}\n", encoding="utf-8")
 
     print(f"✅ Packed MLX bundle: {bundle_path}")
     print(f"  ✓ Manifest: {manifest['file_count']} files with SHA-256 hashes")
     print(f"  ✓ Bundle SHA-256: {bundle_sha}")
     print(f"  ✓ Sidecar hash file: {sha_path}")
-    return verify_mlx_bundle(str(bundle_path))
+    verified = verify_mlx_bundle(str(bundle_path))
+    if not verified:
+        bundle_path.unlink(missing_ok=True)
+        sha_path.unlink(missing_ok=True)
+        print("❌ Verification failed; removed generated bundle artifacts")
+        return False
+    return True
 
 
 def verify_mlx_bundle(bundle_path: str) -> bool:
@@ -1624,16 +1643,47 @@ def verify_mlx_bundle(bundle_path: str) -> bool:
                 return False
 
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            if not isinstance(manifest, dict):
+                print("❌ Invalid manifest format: manifest.json must be an object")
+                return False
             expected_files = manifest.get("files", [])
             if not isinstance(expected_files, list):
                 print("❌ Invalid manifest format: files must be a list")
                 return False
 
-            manifest_paths = {entry.get("path") for entry in expected_files}
-            zip_files = {name for name in names if not name.endswith("/") and name != "manifest.json"}
-            if manifest_paths != zip_files:
-                missing = sorted(manifest_paths - zip_files)
-                extra = sorted(zip_files - manifest_paths)
+            manifest_paths = set()
+            for entry in expected_files:
+                if not isinstance(entry, dict):
+                    print("❌ Invalid manifest entry: each file entry must be an object")
+                    return False
+                rel_path = entry.get("path")
+                if not isinstance(rel_path, str):
+                    print("❌ Invalid manifest entry: path must be a string")
+                    return False
+                if not _is_safe_bundle_path(rel_path):
+                    print(f"❌ Invalid manifest entry path: {rel_path}")
+                    return False
+                if rel_path in manifest_paths:
+                    print(f"❌ Duplicate manifest entry path: {rel_path}")
+                    return False
+                manifest_paths.add(rel_path)
+
+            zip_entries = {name for name in names if not name.endswith("/")}
+            if len(zip_entries) != len(names):
+                print("❌ Archive contains directory entries; only files are allowed")
+                return False
+            for name in zip_entries:
+                if name == "manifest.json":
+                    continue
+                if not _is_safe_bundle_path(name):
+                    print(f"❌ Invalid archive member path: {name}")
+                    return False
+
+            allowed_entries = set(manifest_paths)
+            allowed_entries.add("manifest.json")
+            if zip_entries != allowed_entries:
+                missing = sorted(allowed_entries - zip_entries)
+                extra = sorted(zip_entries - allowed_entries)
                 if missing:
                     print(f"❌ Missing files in bundle: {missing}")
                 if extra:
@@ -1644,8 +1694,11 @@ def verify_mlx_bundle(bundle_path: str) -> bool:
                 rel_path = entry.get("path")
                 expected_sha = entry.get("sha256")
                 expected_size = entry.get("size")
-                if not rel_path or not expected_sha:
-                    print("❌ Invalid manifest entry: missing path or sha256")
+                if not rel_path:
+                    print("❌ Invalid manifest entry: missing path")
+                    return False
+                if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+                    print(f"❌ Invalid manifest entry sha256 for {rel_path}: {expected_sha}")
                     return False
                 with zf.open(rel_path) as f:
                     data = f.read()
@@ -1656,17 +1709,25 @@ def verify_mlx_bundle(bundle_path: str) -> bool:
                     print(f"   expected: {expected_sha}")
                     print(f"   actual:   {actual_sha}")
                     return False
-                if expected_size is not None and int(expected_size) != actual_size:
-                    print(f"❌ Size mismatch for {rel_path}: expected {expected_size}, got {actual_size}")
-                    return False
+                if expected_size is not None:
+                    if not isinstance(expected_size, int) or isinstance(expected_size, bool):
+                        print(f"❌ Invalid manifest entry size for {rel_path}: {expected_size}")
+                        return False
+                    if expected_size != actual_size:
+                        print(f"❌ Size mismatch for {rel_path}: expected {expected_size}, got {actual_size}")
+                        return False
     except (OSError, zipfile.BadZipFile, json.JSONDecodeError, TypeError, ValueError) as error:
         print(f"❌ Bundle verification failed: {error}")
         return False
 
     sidecar_path = path.with_suffix(path.suffix + ".sha256")
     if sidecar_path.exists():
-        line = sidecar_path.read_text().strip()
-        expected_bundle_sha = line.split(maxsplit=1)[0] if line else ""
+        line = sidecar_path.read_text(encoding="utf-8").strip()
+        match = re.fullmatch(r"([0-9a-f]{64})(?:\s{2}.+)?", line)
+        if not match:
+            print(f"❌ Invalid sidecar hash format: {sidecar_path}")
+            return False
+        expected_bundle_sha = match.group(1)
         actual_bundle_sha = _sha256_file(path)
         if expected_bundle_sha != actual_bundle_sha:
             print("❌ Bundle SHA-256 mismatch against sidecar file")
