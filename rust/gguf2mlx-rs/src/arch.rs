@@ -37,16 +37,16 @@ const ARCH_SUBSTRINGS: [&str; 39] = [
     "bloom",
     "starcoder",
     "refact",
-    "command-r",
     "command-r-plus",
-    "qwen2",
+    "command-r",
     "qwen2moe",
     "qwen3moe",
+    "qwen2",
     "phi3",
     "phi",
-    "gemma",
-    "gemma2",
     "gemma3",
+    "gemma2",
+    "gemma",
     "stablelm",
     "deepseek2",
     "deepseek3",
@@ -59,12 +59,12 @@ const ARCH_SUBSTRINGS: [&str; 39] = [
     "bitnet",
     "plamo",
     "codeshell",
-    "minicpm",
     "minicpm3",
+    "minicpm",
     "t5",
     "jais",
-    "olmo",
     "olmo2",
+    "olmo",
     "openelm",
 ];
 
@@ -88,4 +88,33 @@ pub fn detect_architecture(general_architecture: Option<&str>, general_name: Opt
         }
     }
     "unknown".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_architecture;
+
+    #[test]
+    fn respects_more_specific_substrings_first() {
+        assert_eq!(detect_architecture(None, Some("phi3-mini")), "phi3");
+        assert_eq!(detect_architecture(None, Some("gemma2-9b")), "gemma2");
+        assert_eq!(detect_architecture(None, Some("gemma3-27b")), "gemma3");
+        assert_eq!(detect_architecture(None, Some("minicpm3-4b")), "minicpm3");
+        assert_eq!(detect_architecture(None, Some("olmo2-13b")), "olmo2");
+        assert_eq!(detect_architecture(None, Some("Command-R+ 104B")), "command-r-plus");
+    }
+
+    #[test]
+    fn mirrors_existing_python_fallback_examples() {
+        assert_eq!(
+            detect_architecture(None, Some("DeepSeek-R1-Distill-Qwen-32B")),
+            "qwen2"
+        );
+        assert_eq!(
+            detect_architecture(None, Some("Mixtral-8x7B-Instruct-v0.1")),
+            "mistral"
+        );
+        assert_eq!(detect_architecture(None, Some("Yi-34B-Chat")), "llama");
+        assert_eq!(detect_architecture(None, None), "unknown");
+    }
 }
