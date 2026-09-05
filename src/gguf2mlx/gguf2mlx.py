@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 from tqdm import tqdm
+
 from .rust_backend import detect_architecture as rust_detect_architecture
 
 # ---------------------------------------------------------------------------
