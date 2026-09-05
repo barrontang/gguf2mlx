@@ -23,6 +23,8 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
+from .rust_backend import detect_architecture as rust_detect_architecture
+
 # ---------------------------------------------------------------------------
 # Required imports with friendly error messages
 # ---------------------------------------------------------------------------
@@ -221,10 +223,15 @@ MODEL_NAME_ARCH_FALLBACKS: list[tuple[str, str]] = [
 def detect_architecture(reader: GGUFReader) -> str:
     """Detect model architecture from GGUF metadata."""
     arch = get_metadata_str(reader, "general.architecture")
+    name = get_metadata_str(reader, "general.name")
+
+    rust_arch = rust_detect_architecture(arch, name)
+    if rust_arch:
+        return rust_arch
+
     if arch:
         return arch
     # Try fallback based on model name
-    name = get_metadata_str(reader, "general.name")
     if name:
         name_lower = name.lower()
         # Check specific popular-model fallbacks before generic substring matching.

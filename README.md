@@ -258,6 +258,25 @@ GGUF2MLX_RUN_E2E=1 pytest tests/test_e2e.py
 ruff check src/ tests/
 ```
 
+### Hybrid Rust migration (in progress)
+
+The repository now includes an initial Rust core scaffold at:
+
+- `rust/gguf2mlx-rs`
+
+To build and enable the optional PyO3 extension locally:
+
+```bash
+python -m pip install maturin
+maturin develop --manifest-path rust/gguf2mlx-rs/Cargo.toml
+```
+
+Current integration behavior:
+
+- Python CLI/UX remains the primary entrypoint.
+- Python can use an optional `gguf2mlx_rust` extension for architecture detection.
+- If the Rust extension is unavailable, the existing Python logic is used unchanged.
+
 Recent regression coverage includes:
 
 - strict rejection of unsupported architectures
