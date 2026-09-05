@@ -73,6 +73,22 @@ gguf2mlx --input model.gguf --output ./mlx-model-f32 --dtype float32
 
 # Inspect metadata without writing weights
 gguf2mlx --input model.gguf --skip-weights
+
+# New command form (equivalent conversion subcommand)
+gguf2mlx convert --input model.gguf --output ./mlx-model
+```
+
+### Package an MLX model directory into `.mlx`
+
+`gguf2mlx` can now package an MLX model directory into a single `.mlx` bundle,
+auto-generate a manifest list, and include SHA-256 integrity metadata.
+
+```bash
+# Package model directory into model.mlx (+ model.mlx.sha256)
+gguf2mlx package --model-dir ./mlx-model --output ./mlx-model.mlx
+
+# Verify embedded manifest and SHA-256 integrity
+gguf2mlx verify --bundle ./mlx-model.mlx
 ```
 
 ### Load with MLX-LM
@@ -136,6 +152,7 @@ print('loaded')
 | GGUF context length -> `model_max_length` | Supported |
 | MLX / MLX-LM optional dependency | Supported |
 | One-command 4-bit output via `mlx_lm.convert` | Supported |
+| Package `.mlx` bundles + SHA-256 manifest integrity | Supported |
 | Opt-in `mlx_lm.load()` integration test | Supported |
 | SentencePiece/Unigram tokenizer JSON shape | Partial |
 | WordPiece tokenizer JSON shape | Partial |

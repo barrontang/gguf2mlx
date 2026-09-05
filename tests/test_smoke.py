@@ -6,6 +6,7 @@ test against a real GGUF lives in `tests/test_e2e.py` and is opt-in via env var.
 import json
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +60,19 @@ def test_cli_help():
     assert "input" in result.stdout.lower() or "gguf" in result.stdout.lower()
     assert "--quantize" in result.stdout
     assert "--q-bits" in result.stdout
+
+
+def test_cli_package_help():
+    result = subprocess.run(
+        [sys.executable, "-m", "gguf2mlx", "package", "--help"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, f"package --help failed: {result.stderr}"
+    assert "--model-dir" in result.stdout
+    assert ".mlx" in result.stdout
 
 
 def test_get_metadata_int_accepts_python_sequences():
@@ -318,3 +332,146 @@ def test_convert_cleans_staging_directory_after_quantization_failure(tmp_path: P
     assert core.convert("model.gguf", str(output_dir), quantize=True) is False
     assert not output_dir.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_package_mlx_directory_creates_manifest_and_hashes(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text('{"model_type":"llama"}')
+    (model_dir / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+    (model_dir / "tokenizer.json").write_text("{}")
+
+    bundle = tmp_path / "model.mlx"
+    assert core.package_mlx_directory(str(model_dir), str(bundle)) is True
+    assert bundle.exists()
+    assert bundle.with_suffix(".mlx.sha256").exists()
+    assert core.verify_mlx_bundle(str(bundle)) is True
+
+    with zipfile.ZipFile(bundle, "r") as zf:
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+    assert manifest["format"] == "gguf2mlx.mlx_bundle.v1"
+    assert manifest["file_count"] == 3
+    assert manifest["source_model_dir"] == "model"
+    assert isinstance(manifest["created_at"], str)
+    assert {entry["path"] for entry in manifest["files"]} == {
+        "config.json",
+        "model-00001-of-00001.safetensors",
+        "tokenizer.json",
+    }
+    assert all(len(entry["sha256"]) == 64 for entry in manifest["files"])
+
+
+def test_package_mlx_directory_uses_default_output_path(tmp_path: Path):
+    model_dir = tmp_path / "model-dir"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+
+    assert core.package_mlx_directory(str(model_dir)) is True
+    default_bundle = tmp_path / "model-dir.mlx"
+    assert default_bundle.exists()
+    assert core.verify_mlx_bundle(str(default_bundle)) is True
+
+
+def test_verify_mlx_bundle_detects_manifest_hash_mismatch(tmp_path: Path):
+    bundle = tmp_path / "bad.mlx"
+    bad_manifest = {
+        "format": "gguf2mlx.mlx_bundle.v1",
+        "file_count": 1,
+        "files": [{"path": "config.json", "size": 2, "sha256": "0" * 64}],
+    }
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("config.json", "{}")
+        zf.writestr("manifest.json", json.dumps(bad_manifest))
+
+    assert core.verify_mlx_bundle(str(bundle)) is False
+
+
+def test_verify_mlx_bundle_rejects_non_object_manifest(tmp_path: Path):
+    bundle = tmp_path / "bad-manifest-type.mlx"
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("config.json", "{}")
+        zf.writestr("manifest.json", '["not-an-object"]')
+
+    assert core.verify_mlx_bundle(str(bundle)) is False
+
+
+def test_verify_mlx_bundle_detects_sidecar_hash_mismatch(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+
+    bundle = tmp_path / "model.mlx"
+    assert core.package_mlx_directory(str(model_dir), str(bundle)) is True
+
+    bundle.with_suffix(".mlx.sha256").write_text(f"{'0' * 64}  {bundle.name}\n")
+    assert core.verify_mlx_bundle(str(bundle)) is False
+
+
+def test_verify_mlx_bundle_rejects_malformed_sidecar(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+
+    bundle = tmp_path / "model.mlx"
+    assert core.package_mlx_directory(str(model_dir), str(bundle)) is True
+
+    bundle.with_suffix(".mlx.sha256").write_text("invalid-sidecar-format\n")
+    assert core.verify_mlx_bundle(str(bundle)) is False
+
+
+def test_verify_mlx_bundle_detects_extra_undeclared_file(tmp_path: Path):
+    bundle = tmp_path / "extra-file.mlx"
+    manifest = {
+        "format": "gguf2mlx.mlx_bundle.v1",
+        "file_count": 1,
+        "files": [{"path": "config.json", "size": 2, "sha256": core._sha256_bytes(b"{}")}],
+    }
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("config.json", "{}")
+        zf.writestr("extra.json", "{}")
+        zf.writestr("manifest.json", json.dumps(manifest))
+
+    assert core.verify_mlx_bundle(str(bundle)) is False
+
+
+def test_verify_mlx_bundle_rejects_unsafe_manifest_path(tmp_path: Path):
+    bundle = tmp_path / "unsafe-manifest-path.mlx"
+    manifest = {
+        "format": "gguf2mlx.mlx_bundle.v1",
+        "file_count": 1,
+        "files": [{"path": "../config.json", "size": 2, "sha256": core._sha256_bytes(b"{}")}],
+    }
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("../config.json", "{}")
+        zf.writestr("manifest.json", json.dumps(manifest))
+
+    assert core.verify_mlx_bundle(str(bundle)) is False
+
+
+def test_verify_mlx_bundle_rejects_unsafe_archive_member_path(tmp_path: Path):
+    bundle = tmp_path / "unsafe-archive-path.mlx"
+    manifest = {
+        "format": "gguf2mlx.mlx_bundle.v1",
+        "file_count": 1,
+        "files": [{"path": "config.json", "size": 2, "sha256": core._sha256_bytes(b"{}")}],
+    }
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("config.json", "{}")
+        zf.writestr("./extra.json", "{}")
+        zf.writestr("manifest.json", json.dumps(manifest))
+
+    assert core.verify_mlx_bundle(str(bundle)) is False
+
+
+def test_verify_mlx_bundle_rejects_invalid_sha_format(tmp_path: Path):
+    bundle = tmp_path / "bad-sha-format.mlx"
+    manifest = {
+        "format": "gguf2mlx.mlx_bundle.v1",
+        "file_count": 1,
+        "files": [{"path": "config.json", "size": 2, "sha256": "not-a-sha"}],
+    }
+    with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("config.json", "{}")
+        zf.writestr("manifest.json", json.dumps(manifest))
+
+    assert core.verify_mlx_bundle(str(bundle)) is False
