@@ -8,12 +8,15 @@ Phase 1: Real weight extraction, safetensors output, architecture detection,
 
 import argparse
 import gc
+import hashlib
 import json
 import re
 import shutil
 import sys
 import tempfile
 import warnings
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1538,15 +1541,149 @@ def convert(
             shutil.rmtree(staging_path)
 
 
+def _sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def package_mlx_directory(model_dir: str, output_bundle: str | None = None) -> bool:
+    """Package an MLX model directory into a .mlx bundle with manifest hashes."""
+    model_path = Path(model_dir)
+    if not model_path.exists() or not model_path.is_dir():
+        print(f"❌ MLX model directory not found: {model_dir}")
+        return False
+
+    bundle_path = Path(output_bundle) if output_bundle else model_path.with_suffix(".mlx")
+    if bundle_path.suffix != ".mlx":
+        bundle_path = bundle_path.with_suffix(".mlx")
+
+    if bundle_path.exists():
+        print(f"❌ Output bundle already exists: {bundle_path}")
+        return False
+
+    files = sorted(p for p in model_path.rglob("*") if p.is_file())
+    if not files:
+        print(f"❌ MLX model directory is empty: {model_path}")
+        return False
+
+    manifest_files = []
+    for file_path in files:
+        rel_path = file_path.relative_to(model_path).as_posix()
+        manifest_files.append(
+            {
+                "path": rel_path,
+                "size": file_path.stat().st_size,
+                "sha256": _sha256_file(file_path),
+            }
+        )
+
+    manifest = {
+        "format": "gguf2mlx.mlx_bundle.v1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_model_dir": model_path.name,
+        "file_count": len(manifest_files),
+        "files": manifest_files,
+    }
+
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for entry in manifest_files:
+            zf.write(model_path / entry["path"], arcname=entry["path"])
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    bundle_sha = _sha256_file(bundle_path)
+    sha_path = bundle_path.with_suffix(bundle_path.suffix + ".sha256")
+    sha_path.write_text(f"{bundle_sha}  {bundle_path.name}\n")
+
+    print(f"✅ Packed MLX bundle: {bundle_path}")
+    print(f"  ✓ Manifest: {manifest['file_count']} files with SHA-256 hashes")
+    print(f"  ✓ Bundle SHA-256: {bundle_sha}")
+    print(f"  ✓ Sidecar hash file: {sha_path}")
+    return verify_mlx_bundle(str(bundle_path))
+
+
+def verify_mlx_bundle(bundle_path: str) -> bool:
+    """Verify a .mlx bundle against its embedded manifest and optional sidecar SHA."""
+    path = Path(bundle_path)
+    if not path.exists() or not path.is_file():
+        print(f"❌ Bundle not found: {bundle_path}")
+        return False
+
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = set(zf.namelist())
+            if "manifest.json" not in names:
+                print("❌ Missing manifest.json in bundle")
+                return False
+
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            expected_files = manifest.get("files", [])
+            if not isinstance(expected_files, list):
+                print("❌ Invalid manifest format: files must be a list")
+                return False
+
+            manifest_paths = {entry.get("path") for entry in expected_files}
+            zip_files = {name for name in names if not name.endswith("/") and name != "manifest.json"}
+            if manifest_paths != zip_files:
+                missing = sorted(manifest_paths - zip_files)
+                extra = sorted(zip_files - manifest_paths)
+                if missing:
+                    print(f"❌ Missing files in bundle: {missing}")
+                if extra:
+                    print(f"❌ Extra files in bundle not in manifest: {extra}")
+                return False
+
+            for entry in expected_files:
+                rel_path = entry.get("path")
+                expected_sha = entry.get("sha256")
+                expected_size = entry.get("size")
+                if not rel_path or not expected_sha:
+                    print("❌ Invalid manifest entry: missing path or sha256")
+                    return False
+                with zf.open(rel_path) as f:
+                    data = f.read()
+                actual_sha = _sha256_bytes(data)
+                actual_size = len(data)
+                if actual_sha != expected_sha:
+                    print(f"❌ SHA-256 mismatch for {rel_path}")
+                    print(f"   expected: {expected_sha}")
+                    print(f"   actual:   {actual_sha}")
+                    return False
+                if expected_size is not None and int(expected_size) != actual_size:
+                    print(f"❌ Size mismatch for {rel_path}: expected {expected_size}, got {actual_size}")
+                    return False
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError, TypeError, ValueError) as error:
+        print(f"❌ Bundle verification failed: {error}")
+        return False
+
+    sidecar_path = path.with_suffix(path.suffix + ".sha256")
+    if sidecar_path.exists():
+        line = sidecar_path.read_text().strip()
+        expected_bundle_sha = line.split(maxsplit=1)[0] if line else ""
+        actual_bundle_sha = _sha256_file(path)
+        if expected_bundle_sha != actual_bundle_sha:
+            print("❌ Bundle SHA-256 mismatch against sidecar file")
+            print(f"   expected: {expected_bundle_sha}")
+            print(f"   actual:   {actual_bundle_sha}")
+            return False
+
+    print(f"✅ Bundle verification passed: {path}")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="GGUF to MLX Converter — Convert GGUF models to MLX safetensors format"
-    )
+def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--input", "-i", required=True, help="Input GGUF file path"
     )
@@ -1590,21 +1727,19 @@ def main() -> None:
         help="Skip weight extraction (metadata + tokenizer only, for inspection)",
     )
 
-    args = parser.parse_args()
 
-    # Auto-derive output directory from input filename if not specified
+def _run_convert_command(args: argparse.Namespace) -> int:
     if args.output is None:
         args.output = Path(args.input).stem + "-mlx"
 
     if args.skip_weights:
-        # Just dump info
         reader = GGUFReader(args.input)
         print(f"Architecture: {detect_architecture(reader)}")
         print(f"Tensors: {len(reader.tensors)}")
         print(f"Fields: {len(reader.fields)}")
         for name in sorted(reader.fields.keys()):
             print(f"  {name}")
-        return
+        return 0
 
     success = convert(
         args.input,
@@ -1615,7 +1750,55 @@ def main() -> None:
         q_group_size=args.q_group_size,
         q_mode=args.q_mode,
     )
-    if not success:
+    return 0 if success else 1
+
+
+def main(argv: list[str] | None = None) -> None:
+    argv = list(argv) if argv is not None else sys.argv[1:]
+    command = argv[0] if argv else None
+
+    if command in {"convert", "package", "verify"}:
+        parser = argparse.ArgumentParser(
+            description="gguf2mlx command suite for conversion, packaging, and verification"
+        )
+        subparsers = parser.add_subparsers(dest="command", required=True)
+
+        convert_parser = subparsers.add_parser("convert", help="Convert GGUF to MLX directory")
+        _add_convert_arguments(convert_parser)
+
+        package_parser = subparsers.add_parser(
+            "package", help="Package an MLX model directory into a .mlx bundle"
+        )
+        package_parser.add_argument(
+            "--model-dir", "-m", required=True, help="Input MLX model directory"
+        )
+        package_parser.add_argument(
+            "--output", "-o", help="Output .mlx bundle path (default: <model-dir>.mlx)"
+        )
+
+        verify_parser = subparsers.add_parser(
+            "verify", help="Verify .mlx bundle manifest and SHA-256 integrity"
+        )
+        verify_parser.add_argument("--bundle", "-b", required=True, help="Path to .mlx bundle")
+
+        args = parser.parse_args(argv)
+        if args.command == "convert":
+            exit_code = _run_convert_command(args)
+        elif args.command == "package":
+            exit_code = 0 if package_mlx_directory(args.model_dir, args.output) else 1
+        else:
+            exit_code = 0 if verify_mlx_bundle(args.bundle) else 1
+        if exit_code:
+            sys.exit(exit_code)
+        return
+
+    parser = argparse.ArgumentParser(
+        description="GGUF to MLX Converter — Convert GGUF models to MLX safetensors format"
+    )
+    _add_convert_arguments(parser)
+
+    args = parser.parse_args(argv)
+    if _run_convert_command(args):
         sys.exit(1)
 
 
