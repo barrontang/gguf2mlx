@@ -116,6 +116,18 @@ def test_detect_architecture_fails_closed_when_metadata_and_name_are_missing():
     assert detect_architecture(_FakeReader({})) == "unknown"
 
 
+def test_detect_architecture_prefers_rust_backend_result(monkeypatch):
+    monkeypatch.setattr(core, "rust_detect_architecture", lambda arch, name: "qwen3moe")
+    reader = _FakeReader({"general.architecture": "llama", "general.name": "Llama-3"})
+    assert detect_architecture(reader) == "qwen3moe"
+
+
+def test_detect_architecture_falls_back_when_rust_backend_returns_none(monkeypatch):
+    monkeypatch.setattr(core, "rust_detect_architecture", lambda arch, name: None)
+    reader = _FakeReader({"general.name": "Mixtral-8x7B-Instruct-v0.1"})
+    assert detect_architecture(reader) == "mistral"
+
+
 def test_build_config_preserves_zero_token_ids_and_dtype():
     reader = _FakeReader(
         {
