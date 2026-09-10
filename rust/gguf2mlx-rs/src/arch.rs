@@ -26,7 +26,7 @@ static MODEL_NAME_ARCH_FALLBACKS_REGEX: Lazy<Vec<(Regex, &'static str)>> = Lazy:
         .collect()
 });
 
-const ARCH_SUBSTRINGS: [&str; 39] = [
+const ARCH_SUBSTRINGS: [&str; 40] = [
     "llama",
     "mistral",
     "falcon",
@@ -43,6 +43,7 @@ const ARCH_SUBSTRINGS: [&str; 39] = [
     "qwen3moe",
     "qwen2",
     "phi3",
+    "phi2",
     "phi",
     "gemma3",
     "gemma2",
@@ -68,7 +69,10 @@ const ARCH_SUBSTRINGS: [&str; 39] = [
     "openelm",
 ];
 
-pub fn detect_architecture(general_architecture: Option<&str>, general_name: Option<&str>) -> String {
+pub fn detect_architecture(
+    general_architecture: Option<&str>,
+    general_name: Option<&str>,
+) -> String {
     if let Some(arch) = general_architecture {
         if !arch.is_empty() {
             return arch.to_string();
@@ -97,11 +101,15 @@ mod tests {
     #[test]
     fn respects_more_specific_substrings_first() {
         assert_eq!(detect_architecture(None, Some("phi3-mini")), "phi3");
+        assert_eq!(detect_architecture(None, Some("phi2")), "phi2");
         assert_eq!(detect_architecture(None, Some("gemma2-9b")), "gemma2");
         assert_eq!(detect_architecture(None, Some("gemma3-27b")), "gemma3");
         assert_eq!(detect_architecture(None, Some("minicpm3-4b")), "minicpm3");
         assert_eq!(detect_architecture(None, Some("olmo2-13b")), "olmo2");
-        assert_eq!(detect_architecture(None, Some("Command-R+ 104B")), "command-r-plus");
+        assert_eq!(
+            detect_architecture(None, Some("Command-R+ 104B")),
+            "command-r-plus"
+        );
     }
 
     #[test]

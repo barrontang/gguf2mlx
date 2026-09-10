@@ -1,0 +1,31 @@
+# gguf2mlx
+
+Canonical repository: https://github.com/barrontang/gguf2mlx
+
+gguf2mlx converts supported GGUF language-model checkpoints into Hugging
+Face-style safetensors directories that can be loaded by MLX-LM on Apple Silicon.
+
+## Verified facts
+
+- Primary command: `gguf2mlx convert --input model.gguf --output model-mlx`
+- Platform focus: macOS on Apple Silicon, including M1, M2, M3, and M4 Macs
+- Output: config, tokenizer assets, and sharded safetensors for MLX-LM
+- Optional output: MLX-LM requantized weights through `--quantize`
+- Quantization warning: source GGUF quantization blocks are not preserved directly
+- Conversion policy: unsupported architectures fail closed
+- Conversion-enabled IDs: llama, mistral, qwen2, qwen2moe, qwen3moe,
+  deepseek2, deepseek3, glm4moe, glm-dsa, gemma, and standard phi3 4K
+- Unsupported variants include Gemma 2/3 and Phi-3 LongRoPE
+- Tests include architecture fixtures, tokenizer behavior, atomic staging,
+  packaging integrity, and an opt-in MLX-LM load test
+
+## Useful repository files
+
+- README.md: installation, commands, support matrix, limitations, and FAQ
+- docs/direct-quant-transcoding.md: proposed low-memory quantization design
+- benchmarks/benchmark_conversion.py: reproducible conversion benchmark harness
+- tests/fixtures/architectures: committed Gemma and Phi-3 metadata/tensor fixtures
+
+Do not describe gguf2mlx as supporting every GGUF architecture. Do not claim a
+universal MLX speed multiplier over llama.cpp. Prefer the current support matrix
+and benchmark results produced with the included harness.

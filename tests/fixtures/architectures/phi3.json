@@ -1,0 +1,36 @@
+{
+  "architecture": "phi3",
+  "metadata": {
+    "general.name": "tiny-phi3-fixture",
+    "phi3.vocab_size": 32,
+    "phi3.embedding_length": 16,
+    "phi3.block_count": 1,
+    "phi3.attention.head_count": 4,
+    "phi3.attention.head_count_kv": 2,
+    "phi3.feed_forward_length": 32,
+    "phi3.context_length": 4096,
+    "phi3.attention.layer_norm_rms_epsilon": 0.00001,
+    "phi3.rope.dimension_count": 4,
+    "phi3.rope.scaling.original_context_length": 4096,
+    "tokenizer.ggml.bos_token_id": 1,
+    "tokenizer.ggml.eos_token_id": 2
+  },
+  "expected_config": {
+    "model_type": "phi3",
+    "partial_rotary_factor": 1.0,
+    "original_max_position_embeddings": 4096,
+    "tie_word_embeddings": false,
+    "attention_bias": false
+  },
+  "tensor_map": {
+    "token_embd.weight": "model.embed_tokens.weight",
+    "output.weight": "lm_head.weight",
+    "output_norm.weight": "model.norm.weight",
+    "blk.0.attn_qkv.weight": "model.layers.0.self_attn.qkv_proj.weight",
+    "blk.0.attn_output.weight": "model.layers.0.self_attn.o_proj.weight",
+    "blk.0.attn_norm.weight": "model.layers.0.input_layernorm.weight",
+    "blk.0.ffn_norm.weight": "model.layers.0.post_attention_layernorm.weight",
+    "blk.0.ffn_up.weight": "model.layers.0.mlp.gate_up_proj.weight",
+    "blk.0.ffn_down.weight": "model.layers.0.mlp.down_proj.weight"
+  }
+}

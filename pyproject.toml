@@ -1,10 +1,19 @@
 [project]
 name = "gguf2mlx"
-version = "2.0.2"
-description = "Convert GGUF models to MLX (Apple Silicon) safetensors format"
+version = "2.1.0"
+description = "Convert verified GGUF models to MLX-LM safetensors on Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "Apache-2.0"
+keywords = [
+    "gguf",
+    "mlx",
+    "mlx-lm",
+    "apple-silicon",
+    "safetensors",
+    "llama.cpp",
+    "model-conversion",
+]
 authors = [
     {name = "Barron Tang", email = "barrontom2011@gmail.com"},
 ]
@@ -12,7 +21,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -27,9 +35,14 @@ dependencies = [
     "tqdm",
 ]
 
+[project.urls]
+Homepage = "https://github.com/barrontang/gguf2mlx"
+Repository = "https://github.com/barrontang/gguf2mlx"
+Issues = "https://github.com/barrontang/gguf2mlx/issues"
+
 [project.optional-dependencies]
 mlx = ["mlx>=0.18.0", "mlx-lm>=0.29.0"]
-dev = ["pytest", "pytest-cov", "ruff", "mypy"]
+dev = ["pytest", "pytest-cov", "ruff", "mypy", "tokenizers>=0.20"]
 
 [project.scripts]
 gguf2mlx = "gguf2mlx:main"

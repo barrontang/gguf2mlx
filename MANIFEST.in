@@ -1,0 +1,6 @@
+include LICENSE
+include README.md
+include llms.txt
+recursive-include benchmarks *.py
+recursive-include docs *.md
+recursive-include tests/fixtures *.json

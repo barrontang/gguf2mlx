@@ -1,28 +1,42 @@
-# GGUF -> MLX
+# GGUF to MLX Converter for Apple Silicon
 
 <div align="center">
 
-**Convert supported GGUF checkpoints into MLX-LM-loadable safetensors on Apple Silicon.**
+**Convert supported GGUF language models into MLX-LM-compatible safetensors on Apple Silicon Macs.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-orange)](https://github.com/barrontang/gguf2mlx)
 [![Validation](https://img.shields.io/badge/conversion-strict-purple)](https://github.com/barrontang/gguf2mlx)
+
+**GGUF → dequantized safetensors → optional 4-bit MLX, with strict architecture validation.**
+
+[Quick start](#quick-start) · [Supported models](#supported-conversion-matrix) · [Benchmarks](#reproducible-benchmarks) · [FAQ](#frequently-asked-questions)
 
 </div>
 
 ---
 
-## Why this repo exists
+## What is gguf2mlx?
 
 GGUF is great for distribution, but MLX and MLX-LM expect a Hugging Face-style
 directory with `config.json`, tokenizer assets, and safetensors weights.
 
-`gguf2mlx` bridges that gap for **supported architectures** by:
+`gguf2mlx` is a command-line converter for Mac users who have a model in GGUF
+format but need an MLX-LM model directory. It bridges that gap for **supported
+architectures** by:
 
 - reading GGUF metadata and tensors
 - rebuilding MLX-LM-compatible model artifacts
 - failing closed when a model layout is not actually supported
+
+Use it when a model release provides GGUF files but no MLX checkpoint, when you
+want to load that model through `mlx_lm.load()`, or when you need an inspectable
+Hugging Face-style model directory on an M1, M2, M3, or M4 Mac.
+
+If the original Hugging Face weights are available, converting those directly
+with MLX-LM is preferable because it avoids inheriting quantization error from an
+already-quantized GGUF file.
 
 > **Important:** `gguf2mlx` writes **HF-style safetensors for MLX-LM** and can
 > optionally run `mlx_lm.convert` to emit 4-bit MLX output. This is MLX-LM
@@ -141,7 +155,7 @@ print('loaded')
 
 ---
 
-## What is solid today
+## What works today
 
 | Capability | Status |
 |---|---|
@@ -154,39 +168,48 @@ print('loaded')
 | One-command 4-bit output via `mlx_lm.convert` | Supported |
 | Package `.mlx` bundles + SHA-256 manifest integrity | Supported |
 | Opt-in `mlx_lm.load()` integration test | Supported |
-| SentencePiece/Unigram tokenizer JSON shape | Partial |
-| WordPiece tokenizer JSON shape | Partial |
-| Regression tests for recent fixes | Supported |
+| Embedded `tokenizer.huggingface.json` preservation | Supported |
+| GGUF BOS/EOS/UNK and space-prefix metadata | Supported |
+| Executable Unigram and WordPiece tokenizer tests | Supported |
+| Gemma and Phi-3 architecture fixtures | Supported |
 
 ---
 
 ## Supported conversion matrix
 
-`gguf2mlx` now distinguishes between:
+`gguf2mlx` distinguishes between:
 
 1. **recognized for inspection** via GGUF metadata, and
-2. **verified for weight conversion** with dedicated adapters.
+2. **conversion enabled** through an explicit tensor adapter.
 
-### Verified weight conversion
+The current code recognizes 48 architecture identifiers for inspection and
+enables conversion for 11 identifiers.
 
-| Family | Architectures |
-|---|---|
-| Llama | `llama`, `mistral` |
-| Qwen | `qwen2`, `qwen2moe`, `qwen3moe` |
-| DeepSeek | `deepseek2`, `deepseek3` |
-| GLM | `glm4moe` |
-| GLM (experimental) | `glm-dsa` |
+### Conversion-enabled architectures
+
+| Family | GGUF architecture IDs | Status |
+|---|---|---|
+| Llama | `llama`, `mistral` | Conversion enabled |
+| Qwen | `qwen2`, `qwen2moe`, `qwen3moe` | Conversion enabled |
+| DeepSeek | `deepseek2`, `deepseek3` | Conversion enabled |
+| GLM | `glm4moe` | Conversion enabled |
+| Gemma | `gemma` | Fixture-validated adapter |
+| Phi | `phi3` | Phi-3 4K fixture-validated adapter |
+| GLM | `glm-dsa` | Experimental conversion only |
+
+Gemma 2/3 and Phi-3 LongRoPE are different layouts and are not included in the
+basic Gemma or Phi-3 4K support claim.
 
 ### Inspection only (not converted)
 
 These may still be recognized by metadata or `--skip-weights`, but they are
 **rejected during conversion** until a dedicated, tested adapter exists:
 
-`falcon`, `gpt2`, `bert`, `bloom`, `mpt`, `dbrx`, `gemma`, `phi`, `gptneox`,
-`stablelm`, `olmo`, `cohere`, `granite`, `nemotron`, `exaone`, `openelm`,
-`command-r`, `baichuan`, `xverse`, `orion`, `bitnet`, `plamo`, `codeshell`,
-`minicpm`, `t5`, `jais`, `arctic`, `smolm`, `chameleon`, and others without a
-verified adapter.
+`arctic`, `baichuan`, `bert`, `bitnet`, `bloom`, `chameleon`, `chatglm`,
+`codeshell`, `command-r`, `command-r-plus`, `dbrx`, `exaone`, `falcon`,
+`gemma2`, `gemma3`, `gpt2`, `gptneox`, `granite`, `grok-1`, `jais`, `minicpm`,
+`minicpm3`, `mpt`, `nemotron`, `olmo`, `olmo2`, `openelm`, `orion`, `phi`,
+`phi2`, `plamo`, `refact`, `smolm`, `stablelm`, `starcoder`, `t5`, and `xverse`.
 
 That means no more silent "Llama fallback" producing invalid outputs for
 unrelated architectures.
@@ -214,30 +237,90 @@ This project is intentionally more honest about scope now:
 
 - **4-bit MLX output uses MLX-LM re-quantization**; source GGUF Q4 blocks are not
   preserved directly
-- **Tokenizer fidelity is still evolving** for architecture-specific normalizers
-  and edge-case added-token metadata
+- **Tokenizer fidelity still depends on available GGUF metadata**; embedded
+  Hugging Face tokenizer JSON is preserved when present
 - **Architecture coverage is adapter-based**, not "all GGUF models"
 - **Performance claims depend on model, prompt, hardware, and MLX-LM version**
+- **Phi-3 LongRoPE is rejected** until its factor tensors are represented safely
+  in the generated MLX configuration
 
 If you need guaranteed support for a new family, open an issue with the exact
 GGUF architecture and source model.
 
 ---
 
-## Benchmarks
+## Reproducible benchmarks
 
-These numbers reflect **conversion output size**, not a universal inference-speed claim.
+The repository does not claim that MLX is universally faster than llama.cpp.
+Conversion and inference performance depend on model architecture, quantization,
+prompt length, hardware, thermals, and library versions.
 
-| Model | GGUF Size | Quant | Convert Time (M4 Max) | MLX Output Size |
-|---|---:|---|---:|---:|
-| Qwen2.5-7B | 4.7 GB | Q4_K_M | ~45s | 14.2 GB |
-| Llama-3.2-3B | 2.0 GB | Q4_K_M | ~18s | 6.0 GB |
-| Mistral-7B | 4.3 GB | Q4_K_M | ~42s | 13.8 GB |
-| Phi-3-mini | 2.2 GB | Q4_K_M | ~20s | 6.6 GB |
+Run the included benchmark harness to record conversion time, peak RSS, input
+size, output size, platform information, and installed package versions:
+
+```bash
+uv run benchmarks/benchmark_conversion.py \
+  --input ./model-Q4_K_M.gguf \
+  --output ./benchmark-model-mlx \
+  --result-json ./benchmark-results/model.json
+```
+
+To benchmark the complete GGUF-to-4-bit-MLX path:
+
+```bash
+uv run --extra mlx benchmarks/benchmark_conversion.py \
+  --input ./model-Q4_K_M.gguf \
+  --output ./benchmark-model-mlx-4bit \
+  --quantize \
+  --result-json ./benchmark-results/model-4bit.json
+```
 
 Plain conversion output is dequantized and can be substantially larger than the
 original GGUF quantized file. Use `--quantize --q-bits 4 --q-group-size 64` when
 you want compact MLX-LM quantized output.
+
+## Choosing the right tool
+
+| Starting point | Goal | Recommended tool |
+|---|---|---|
+| GGUF model | Run the GGUF directly | llama.cpp or a GGUF application |
+| Original Hugging Face model | Create an MLX model | `mlx_lm.convert` |
+| GGUF-only model release | Create an MLX-LM directory | `gguf2mlx` |
+| Existing MLX model directory | Create a portable archive | `gguf2mlx package` |
+
+## Frequently asked questions
+
+### How do I convert a GGUF model to MLX on a Mac?
+
+Install `gguf2mlx[mlx]`, then run `gguf2mlx convert --input model.gguf
+--output model-mlx`. The output directory can be passed to `mlx_lm.load()` when
+the GGUF architecture and variant appear in the supported matrix.
+
+### Does GGUF-to-MLX conversion restore FP16 model quality?
+
+No. Dequantization expands the stored values into FP16 or FP32, but it cannot
+recover information removed when the source GGUF was quantized.
+
+### Does the 4-bit output preserve the original GGUF Q4 blocks?
+
+No. The current implementation dequantizes the GGUF and then uses MLX-LM to
+perform a second quantization. A lower-memory direct pipeline is designed in
+`docs/direct-quant-transcoding.md`.
+
+### Why is the converted model larger than the GGUF file?
+
+A quantized GGUF stores only a few bits per weight plus block metadata. Plain
+conversion writes FP16 or FP32 safetensors, so a larger output is expected.
+
+### Are Gemma and Phi supported?
+
+The base `gemma` architecture and standard Phi-3 4K layout have fixture-backed
+adapters. Gemma 2, Gemma 3, Phi-2, Phi-MoE, and Phi-3 LongRoPE remain unsupported.
+
+### Is MLX always faster than llama.cpp?
+
+No universal multiplier is claimed. Use the same model quality, prompt, context,
+sampling settings, and hardware when comparing runtimes.
 
 ---
 
@@ -255,7 +338,7 @@ pytest
 GGUF2MLX_RUN_E2E=1 pytest tests/test_e2e.py
 
 # Lint
-ruff check src/ tests/
+ruff check src/ tests/ benchmarks/
 ```
 
 ### Hybrid Rust migration (in progress)
@@ -280,12 +363,15 @@ Current integration behavior:
 Recent regression coverage includes:
 
 - strict rejection of unsupported architectures
+- Gemma tensor mapping and GGUF norm-weight restoration fixtures
+- Phi-3 fused QKV and gated-MLP fixtures
 - preservation of zero-valued token IDs
+- preservation of embedded Hugging Face tokenizer JSON
+- executable tokenizer encode/decode checks
 - correct dtype propagation into config
 - atomic staging cleanup on failed writes
 - MLX-LM quantization error handling
 - opt-in `mlx_lm.load()` validation of quantized output
-- SentencePiece/Unigram and WordPiece tokenizer JSON structure
 
 ---
 
@@ -296,13 +382,16 @@ Completed:
 - MLX quantized output through bundled `mlx_lm.convert`
 - MLX-LM load/integration tests on Apple Silicon
 - strict adapter-based architecture validation
-- partial SentencePiece/Unigram and WordPiece tokenizer preservation
+- fixture-backed Gemma and standard Phi-3 4K adapters
+- GGUF tokenizer flags and embedded tokenizer JSON preservation
+- reproducible conversion benchmark harness
 
 Remaining areas for contributors:
 
-- direct preservation/transcoding of GGUF quantization blocks without an FP16
-  intermediate
-- additional verified architecture adapters backed by model fixtures
+- implement the bounded-memory pipeline described in
+  `docs/direct-quant-transcoding.md`
+- add opt-in real-GGUF load and logit validation for each fixture-backed adapter
+- add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks
 - broader tokenizer fixture coverage for architecture-specific normalizers,
   byte fallback variants, and added-token edge cases
 
@@ -312,16 +401,21 @@ Remaining areas for contributors:
 
 PRs are welcome, especially for:
 
-- new architecture adapters
+- new architecture adapters backed by tensor manifests and load tests
 - tokenizer fidelity improvements
-- direct GGUF quantization preservation
+- bounded-memory GGUF-to-MLX quantization
 - Apple Silicon integration coverage
+
+When requesting a new model family, include the exact GGUF architecture, model
+name, quantization type, tokenizer type, and a public fixture or model URL. If
+the project saves you conversion work, starring the repository helps other Mac
+users discover it.
 
 ---
 
 ## License
 
-MIT © [Barron Tang](https://github.com/barrontang)
+Apache-2.0 © [Barron Tang](https://github.com/barrontang)
 
 ---
 

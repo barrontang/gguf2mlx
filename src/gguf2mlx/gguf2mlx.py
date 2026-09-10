@@ -101,6 +101,21 @@ def get_metadata_float(reader: GGUFReader, key: str) -> float | None:
     return float(val)
 
 
+def get_metadata_bool(reader: GGUFReader, key: str) -> bool | None:
+    """Extract a boolean metadata value while preserving an explicit false value."""
+    field = reader.get_field(key)
+    if field is None:
+        return None
+    val = field.contents()
+    if val is None:
+        return None
+    if isinstance(val, np.ndarray):
+        return bool(val.flat[0]) if val.size > 0 else None
+    if isinstance(val, (list, tuple)):
+        return bool(val[0]) if len(val) > 0 else None
+    return bool(val)
+
+
 def get_metadata_array_str(reader: GGUFReader, key: str) -> list[str]:
     """Extract a string array from GGUF fields (e.g., tokenizer tokens)."""
     field = reader.get_field(key)
@@ -113,6 +128,20 @@ def get_metadata_array_str(reader: GGUFReader, key: str) -> list[str]:
                 v.decode("utf-8", errors="replace") if isinstance(v, bytes) else str(v)
                 for v in vals
             ]
+        return []
+    except (AttributeError, TypeError, ValueError):
+        return []
+
+
+def get_metadata_array_float(reader: GGUFReader, key: str) -> list[float]:
+    """Extract a float array from GGUF metadata."""
+    field = reader.get_field(key)
+    if field is None:
+        return []
+    try:
+        vals = field.contents()
+        if isinstance(vals, (list, np.ndarray)):
+            return [float(v) for v in vals]
         return []
     except (AttributeError, TypeError, ValueError):
         return []
@@ -154,6 +183,7 @@ ARCH_MAP: dict[str, str] = {
     "qwen2moe": "qwen2_moe",
     "qwen3moe": "qwen3_moe",
     "phi3": "phi3",
+    "phi2": "phi",
     "phi": "phi",
     "gemma": "gemma",
     "gemma2": "gemma2",
@@ -195,12 +225,16 @@ CONVERTIBLE_ARCHES = {
     "deepseek3",
     "glm-dsa",
     "glm4moe",
+    "gemma",
     "llama",
     "mistral",
+    "phi3",
     "qwen2",
     "qwen2moe",
     "qwen3moe",
 }
+
+STRICT_ADAPTER_ARCHES = {"gemma", "phi3"}
 
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
 
@@ -240,10 +274,23 @@ def detect_architecture(reader: GGUFReader) -> str:
         for pattern, mapped_arch in MODEL_NAME_ARCH_FALLBACKS:
             if re.search(pattern, name_lower):
                 return mapped_arch
-        for gguf_arch in ARCH_MAP:
+        for gguf_arch in sorted(ARCH_MAP, key=len, reverse=True):
             if gguf_arch in name_lower:
                 return gguf_arch
     return "unknown"
+
+
+def validate_architecture_variant(reader: GGUFReader, arch: str) -> str | None:
+    """Return an actionable error when a recognized architecture variant is unverified."""
+    if arch == "phi3" and any(
+        tensor.name in {"rope_factors_long", "rope_factors_short"}
+        for tensor in reader.tensors
+    ):
+        return (
+            "Phi-3 LongRoPE tensors are not supported yet; the verified adapter "
+            "currently targets standard Phi-3 4K checkpoints."
+        )
+    return None
 
 
 def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[str, Any]:
@@ -430,10 +477,10 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
         "olmo", "olmo2", "openelm",
     )
 
-    # Detect attention bias (Qwen, Gemma, etc.)
+    # Detect attention bias. Gemma projections are bias-free; Phi-3 uses a fused,
+    # bias-free QKV projection in MLX-LM.
     attention_bias = arch in (
         "qwen2", "qwen2moe", "qwen3moe",
-        "gemma", "gemma2", "gemma3",
     )
 
     # Convert model_type to CamelCase architecture class name
@@ -497,6 +544,34 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
             config["shared_expert_intermediate_size"] = shared_ffn_size
             config["output_router_logits"] = False
             config["router_aux_loss_coef"] = 0.001
+
+    if arch == "gemma":
+        config["head_dim"] = (
+            get_metadata_int(reader, "gemma.attention.key_length")
+            or hidden_size // num_heads
+        )
+        config["hidden_activation"] = "gelu_pytorch_tanh"
+        config["attention_bias"] = False
+        config["tie_word_embeddings"] = True
+
+    if arch == "phi3":
+        head_dim = hidden_size // num_heads
+        rope_dim = get_metadata_int(reader, "phi3.rope.dimension_count") or head_dim
+        original_context = get_metadata_int(
+            reader, "phi3.rope.scaling.original_context_length"
+        ) or min(ctx_length, 4096)
+        config["partial_rotary_factor"] = rope_dim / head_dim
+        config["original_max_position_embeddings"] = original_context
+        config["attention_bias"] = False
+        config["tie_word_embeddings"] = False
+
+        rope_scaling_type = get_metadata_str(reader, "phi3.rope.scaling.type")
+        rope_scaling_factor = get_metadata_float(reader, "phi3.rope.scaling.factor")
+        if rope_scaling_type == "linear" and rope_scaling_factor is not None:
+            config["rope_scaling"] = {
+                "type": "linear",
+                "factor": rope_scaling_factor,
+            }
 
     # --- GLM-5.2 (glm-dsa): MLA + DSA + MoE + MTP + IndexShare ---
     if arch == "glm-dsa":
@@ -594,6 +669,44 @@ def _map_llama_tensor_name(gguf_name: str) -> str:
     return gguf_name
 
 
+def _map_phi3_tensor_name(gguf_name: str) -> str:
+    """Map Phi-3 GGUF tensors to the fused layout expected by MLX-LM."""
+    if gguf_name == "token_embd.weight":
+        return "model.embed_tokens.weight"
+    if gguf_name == "output.weight":
+        return "lm_head.weight"
+    if gguf_name == "output_norm.weight":
+        return "model.norm.weight"
+
+    match = re.fullmatch(r"blk\.(\d+)\.(.+)", gguf_name)
+    if match is None:
+        return gguf_name
+
+    layer_idx, rest = match.groups()
+    tensor_map = {
+        "attn_qkv.weight": "self_attn.qkv_proj.weight",
+        "attn_output.weight": "self_attn.o_proj.weight",
+        "attn_norm.weight": "input_layernorm.weight",
+        "ffn_norm.weight": "post_attention_layernorm.weight",
+        "ffn_up.weight": "mlp.gate_up_proj.weight",
+        "ffn_down.weight": "mlp.down_proj.weight",
+    }
+    suffix = tensor_map.get(rest)
+    if suffix is None:
+        return gguf_name
+    return f"model.layers.{layer_idx}.{suffix}"
+
+
+def _restore_architecture_tensor(gguf_name: str, arr: np.ndarray, arch: str) -> np.ndarray:
+    """Undo architecture-specific transformations applied during HF-to-GGUF export."""
+    if arch == "gemma" and (
+        gguf_name == "output_norm.weight"
+        or re.fullmatch(r"blk\.\d+\.(attn_norm|ffn_norm)\.weight", gguf_name)
+    ):
+        return arr - np.array(1, dtype=arr.dtype)
+    return arr
+
+
 # MLA-family tensor fragments shared by DeepSeek-V2/V3 and GLM-DSA.
 # Maps the GGUF block-relative fragment -> HF self_attn.* suffix.
 # NOTE: split attn_k_b / attn_v_b are NOT here — they require concatenation and
@@ -689,7 +802,13 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
         mapped = _map_mla_tensor_name(gguf_name)
         if mapped is not None:
             return mapped
-    return _map_llama_tensor_name(gguf_name)
+    if arch == "phi3":
+        mapped = _map_phi3_tensor_name(gguf_name)
+    else:
+        mapped = _map_llama_tensor_name(gguf_name)
+    if arch in STRICT_ADAPTER_ARCHES and mapped == gguf_name:
+        raise ValueError(f"Unsupported {arch} tensor: {gguf_name}")
+    return mapped
 
 
 # ---------------------------------------------------------------------------
@@ -718,20 +837,29 @@ def extract_tokenizer(
 ) -> None:
     """Extract tokenizer from GGUF metadata and save standard files."""
     model_type = get_metadata_str(reader, "tokenizer.ggml.model") or "bpe"
+    tokenizer_pre = get_metadata_str(reader, "tokenizer.ggml.pre")
+    embedded_hf_json = get_metadata_str(reader, "tokenizer.huggingface.json")
     bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id")
     eos_id = get_metadata_int(reader, "tokenizer.ggml.eos_token_id")
+    unk_id = get_metadata_int(reader, "tokenizer.ggml.unknown_token_id")
     pad_id = get_metadata_int(reader, "tokenizer.ggml.padding_token_id")
+    bos_was_missing = bos_id is None
+    eos_was_missing = eos_id is None
     bos_id = 1 if bos_id is None else bos_id
     eos_id = 2 if eos_id is None else eos_id
+    unk_id = 0 if unk_id is None else unk_id
     pad_id = 0 if pad_id is None else pad_id
+    add_bos_token = get_metadata_bool(reader, "tokenizer.ggml.add_bos_token")
+    add_eos_token = get_metadata_bool(reader, "tokenizer.ggml.add_eos_token")
+    add_space_prefix = get_metadata_bool(reader, "tokenizer.ggml.add_space_prefix")
+    add_bos_token = True if add_bos_token is None else add_bos_token
+    add_eos_token = False if add_eos_token is None else add_eos_token
+    add_space_prefix = True if add_space_prefix is None else add_space_prefix
 
     tokens = get_metadata_array_str(reader, "tokenizer.ggml.tokens")
     token_types = get_metadata_array_int(reader, "tokenizer.ggml.token_type")
     merges = get_metadata_array_str(reader, "tokenizer.ggml.merges")
-    scores = [
-        float(s)
-        for s in get_metadata_array_str(reader, "tokenizer.ggml.scores")
-    ] if reader.get_field("tokenizer.ggml.scores") else []
+    scores = get_metadata_array_float(reader, "tokenizer.ggml.scores")
 
     if not tokens:
         print("  ⚠ No tokenizer tokens found in GGUF — creating minimal tokenizer")
@@ -751,7 +879,7 @@ def extract_tokenizer(
         "<|im_end|>", "</s>", "<|end_of_text|>", "<|eot_id|>", "<|end|>",
     ]
 
-    if tokens and (bos_id in (0, 1, 2, 3)):
+    if tokens and bos_was_missing:
         found = False
         for candidate in SPECIAL_BOS_CANDIDATES:
             if candidate in tokens:
@@ -771,7 +899,7 @@ def extract_tokenizer(
                 if found:
                     break
 
-    if tokens and (eos_id in (0, 1, 2, 3)):
+    if tokens and eos_was_missing:
         found = False
         for candidate in SPECIAL_EOS_CANDIDATES:
             if candidate in tokens:
@@ -795,16 +923,18 @@ def extract_tokenizer(
 
     # --- tokenizer_config.json ---
     tokenizer_config = {
-        "add_bos_token": True,
-        "add_eos_token": False,
+        "add_bos_token": add_bos_token,
+        "add_eos_token": add_eos_token,
         "bos_token": tokens[bos_id] if bos_id < vocab_size else "<s>",
         "eos_token": tokens[eos_id] if eos_id < vocab_size else "</s>",
-        "unk_token": tokens[0] if tokens else "<unk>",
+        "unk_token": tokens[unk_id] if unk_id < vocab_size else "<unk>",
         "pad_token": tokens[pad_id] if pad_id < vocab_size else "<pad>",
         "model_max_length": model_max_length or 4096,
         "tokenizer_class": "PreTrainedTokenizerFast",
         "clean_up_tokenization_spaces": False,
     }
+    if tokenizer_pre:
+        tokenizer_config["gguf_tokenizer_pre"] = tokenizer_pre
 
     if model_type == "llama" or model_type == "bpe":
         tokenizer_config.update(
@@ -832,7 +962,7 @@ def extract_tokenizer(
     special_tokens = {
         "bos_token": tokens[bos_id] if bos_id < vocab_size else "<s>",
         "eos_token": tokens[eos_id] if eos_id < vocab_size else "</s>",
-        "unk_token": tokens[0] if tokens else "<unk>",
+        "unk_token": tokens[unk_id] if unk_id < vocab_size else "<unk>",
     }
     if pad_id < vocab_size and tokens[pad_id]:
         special_tokens["pad_token"] = tokens[pad_id]
@@ -864,9 +994,30 @@ def extract_tokenizer(
         print(f"  ✓ Saved merges.txt ({len(merges)} merges)")
 
     # --- tokenizer.json (for fast tokenizers) ---
-    tokenizer_json = _build_tokenizer_json(
-        tokens, token_types, merges, scores, model_type, bos_id, eos_id, pad_id
-    )
+    tokenizer_json = None
+    if embedded_hf_json:
+        try:
+            parsed_hf_json = json.loads(embedded_hf_json)
+            if not isinstance(parsed_hf_json, dict) or "model" not in parsed_hf_json:
+                raise ValueError("embedded tokenizer JSON is not a tokenizer object")
+            tokenizer_json = parsed_hf_json
+            print("  ✓ Preserved embedded tokenizer.huggingface.json")
+        except (json.JSONDecodeError, ValueError) as error:
+            warnings.warn(f"Invalid tokenizer.huggingface.json; rebuilding tokenizer: {error}")
+
+    if tokenizer_json is None:
+        tokenizer_json = _build_tokenizer_json(
+            tokens,
+            token_types,
+            merges,
+            scores,
+            model_type,
+            bos_id,
+            eos_id,
+            pad_id,
+            unk_id=unk_id,
+            add_space_prefix=add_space_prefix,
+        )
     if tokenizer_json:
         with open(output_dir / "tokenizer.json", "w") as f:
             json.dump(tokenizer_json, f, indent=2, ensure_ascii=False)
@@ -882,6 +1033,8 @@ def _build_tokenizer_json(
     bos_id: int,
     eos_id: int,
     pad_id: int,
+    unk_id: int = 0,
+    add_space_prefix: bool = True,
 ) -> dict:
     """Build a complete tokenizer.json for HuggingFace tokenizers."""
     vocab = {}
@@ -918,7 +1071,7 @@ def _build_tokenizer_json(
         model_block = {
             "type": "BPE",
             "dropout": None,
-            "unk_token": tokens[0] if tokens else "<unk>",
+            "unk_token": tokens[unk_id] if unk_id < len(tokens) else "<unk>",
             "continuing_subword_prefix": "",
             "end_of_word_suffix": "",
             "fuse_unk": False,
@@ -926,33 +1079,21 @@ def _build_tokenizer_json(
             "vocab": vocab,
             "merges": merges if merges else [],
         }
-    elif normalized_model_type == "llama":
-        model_block = {
-            "type": "BPE",
-            "dropout": None,
-            "unk_token": None,
-            "continuing_subword_prefix": "▁",
-            "end_of_word_suffix": "",
-            "fuse_unk": False,
-            "byte_fallback": False,
-            "vocab": vocab,
-            "merges": merges if merges else [],
-        }
-    elif normalized_model_type in ("spm", "sentencepiece", "unigram"):
+    elif normalized_model_type in ("llama", "spm", "sentencepiece", "unigram"):
         vocab_scores = []
         for i, token in enumerate(tokens):
             score = scores[i] if i < len(scores) else 0.0
             vocab_scores.append([token, score])
         model_block = {
             "type": "Unigram",
-            "unk_id": 0,
+            "unk_id": unk_id,
             "vocab": vocab_scores,
             "byte_fallback": any(token.startswith("<0x") and token.endswith(">") for token in tokens),
         }
     elif normalized_model_type == "wordpiece":
         model_block = {
             "type": "WordPiece",
-            "unk_token": tokens[0] if tokens else "[UNK]",
+            "unk_token": tokens[unk_id] if unk_id < len(tokens) else "[UNK]",
             "continuing_subword_prefix": "##",
             "max_input_chars_per_word": 100,
             "vocab": vocab,
@@ -997,7 +1138,7 @@ def _build_tokenizer_json(
         pre_tokenizer = {
             "type": "Metaspace",
             "replacement": "▁",
-            "prepend_scheme": "always",
+            "prepend_scheme": "always" if add_space_prefix else "never",
             "split": True,
         }
         post_processor = None
@@ -1080,7 +1221,8 @@ def _reconstruct_kv_b(k_b: np.ndarray, v_b: np.ndarray,
 
 def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
                       mla_dims: dict[str, int],
-                      pending_kv_b: dict[str, dict[str, np.ndarray]]
+                      pending_kv_b: dict[str, dict[str, np.ndarray]],
+                      pending_qkv: dict[str, dict[str, np.ndarray]],
                       ) -> list[tuple[str, np.ndarray]]:
     """Decide output (hf_name, arr) pairs for one source GGUF tensor.
 
@@ -1092,6 +1234,20 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
 
     Returns [] when the tensor is buffered (waiting for its kv_b pair).
     """
+    arr = _restore_architecture_tensor(gguf_name, arr, arch)
+
+    # --- Phi-3 split Q/K/V -> fused qkv_proj ---
+    match = re.fullmatch(r"blk\.(\d+)\.attn_(q|k|v)\.weight", gguf_name)
+    if match and arch == "phi3":
+        layer_idx, projection = match.groups()
+        buf = pending_qkv.setdefault(layer_idx, {})
+        buf[projection] = arr
+        if all(name in buf for name in ("q", "k", "v")):
+            fused = np.concatenate([buf["q"], buf["k"], buf["v"]], axis=0)
+            del pending_qkv[layer_idx]
+            return [(f"model.layers.{layer_idx}.self_attn.qkv_proj.weight", fused)]
+        return []
+
     # --- Split kv_b -> combined kv_b_proj ---
     m = re.match(r"blk\.(\d+)\.attn_(k_b|v_b)(?:\.weight)?$", gguf_name)
     if m and arch in ("deepseek2", "deepseek3", "glm-dsa", "glm4moe"):
@@ -1178,6 +1334,7 @@ def extract_and_convert_weights(
     mla_dims = _read_mla_dims(reader, arch)
     # Buffer for split kv_b pairs (deepseek2/3; glm-dsa fallback when combined absent)
     pending_kv_b: dict[str, dict[str, np.ndarray]] = {}
+    pending_qkv: dict[str, dict[str, np.ndarray]] = {}
 
     for i, tensor in enumerate(reader.tensors):
         gguf_name = tensor.name
@@ -1235,7 +1392,14 @@ def extract_and_convert_weights(
 
             # Determine output tensors (may be 0, 1, or many for arch-specific
             # transforms such as kv_b concat and per-expert split).
-            emit_pairs = _plan_tensor_emit(gguf_name, arr, arch, mla_dims, pending_kv_b)
+            emit_pairs = _plan_tensor_emit(
+                gguf_name,
+                arr,
+                arch,
+                mla_dims,
+                pending_kv_b,
+                pending_qkv,
+            )
             for hf_name, out_arr in emit_pairs:
                 weights[hf_name] = out_arr
                 all_keys.append(hf_name)
@@ -1273,6 +1437,13 @@ def extract_and_convert_weights(
             else:
                 missing = "v" if "k" in buf else "k"
                 print(f"    ⚠ Unpaired {missing}_b at layer {layer_idx} — discarded")
+
+    if pending_qkv:
+        incomplete = ", ".join(
+            f"layer {layer_idx} ({'/'.join(sorted(parts))})"
+            for layer_idx, parts in sorted(pending_qkv.items())
+        )
+        raise RuntimeError(f"Incomplete Phi-3 QKV tensor groups: {incomplete}")
 
     if skipped:
         raise RuntimeError(f"Failed to convert {skipped} tensor(s); no partial model was published")
@@ -1363,6 +1534,10 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     arch = detect_architecture(reader)
     if arch not in CONVERTIBLE_ARCHES:
         print(f"❌ Unsupported GGUF architecture: {arch}")
+        return False
+    variant_error = validate_architecture_variant(reader, arch)
+    if variant_error:
+        print(f"❌ {variant_error}")
         return False
     hf_type = ARCH_MAP.get(arch, arch)
     model_name_full = get_metadata_str(reader, "general.name") or model_name

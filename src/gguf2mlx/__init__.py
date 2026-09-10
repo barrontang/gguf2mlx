@@ -3,7 +3,7 @@ GGUF to MLX Converter — Convert GGUF models to MLX safetensors format
 for optimized inference on Apple Silicon devices.
 """
 
-__version__ = "2.0.2"
+__version__ = "2.1.0"
 
 from .gguf2mlx import (
     build_config,

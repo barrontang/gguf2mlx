@@ -13,6 +13,7 @@ import pytest
 from gguf2mlx import gguf2mlx as core
 
 RUN_E2E = os.getenv("GGUF2MLX_RUN_E2E") == "1"
+ARCH_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "architectures"
 
 pytestmark = [
     pytest.mark.skipif(
@@ -127,3 +128,52 @@ def test_quantized_output_loads_with_mlx_lm(tmp_path: Path, monkeypatch: pytest.
 
     logits = model(mx.array([[3, 4]], dtype=mx.int32))
     assert logits.shape == (1, 2, 32)
+
+
+@pytest.mark.parametrize("fixture_name", ["gemma", "phi3"])
+def test_adapter_fixture_matches_mlx_lm_parameter_contract(fixture_name: str):
+    pytest.importorskip("mlx")
+    pytest.importorskip("mlx_lm")
+
+    from mlx.utils import tree_flatten
+
+    fixture = json.loads(
+        (ARCH_FIXTURE_DIR / f"{fixture_name}.json").read_text(encoding="utf-8")
+    )
+    if fixture_name == "gemma":
+        from mlx_lm.models.gemma import Model, ModelArgs
+
+        model = Model(
+            ModelArgs(
+                model_type="gemma",
+                hidden_size=16,
+                num_hidden_layers=1,
+                intermediate_size=32,
+                num_attention_heads=4,
+                head_dim=4,
+                rms_norm_eps=1e-6,
+                vocab_size=32,
+                num_key_value_heads=2,
+            )
+        )
+    else:
+        from mlx_lm.models.phi3 import Model, ModelArgs
+
+        model = Model(
+            ModelArgs(
+                model_type="phi3",
+                hidden_size=16,
+                num_hidden_layers=1,
+                intermediate_size=32,
+                num_attention_heads=4,
+                rms_norm_eps=1e-5,
+                vocab_size=32,
+                num_key_value_heads=2,
+                max_position_embeddings=4096,
+                original_max_position_embeddings=4096,
+            )
+        )
+
+    model_keys = {name for name, _ in tree_flatten(model.parameters())}
+    expected_keys = set(fixture["tensor_map"].values())
+    assert expected_keys <= model_keys
