@@ -43,6 +43,39 @@ already-quantized GGUF file.
 > re-quantization after conversion, not bit-for-bit preservation of the original
 > GGUF quantization blocks.
 
+## GitHub discoverability setup
+
+If you want this repository to be indexed faster by GitHub search and external
+search engines, configure these three surfaces:
+
+### 1) Repository description (meta description)
+
+Use a short, keyword-rich sentence in the repo **Description** field, for
+example:
+
+> Convert GGUF language models to MLX-LM safetensors on Apple Silicon, with
+> strict architecture validation and optional 4-bit MLX quantization.
+
+### 2) Repository topics
+
+Recommended topics for this project:
+
+- `gguf`
+- `mlx`
+- `mlx-lm`
+- `apple-silicon`
+- `llm`
+- `model-conversion`
+- `safetensors`
+- `python`
+- `rust`
+- `quantization`
+
+### 3) GitHub Pages
+
+Enable **GitHub Pages** in repository settings (even a simple README-rendered
+site helps discoverability and external crawling).
+
 ---
 
 ## Quick start
