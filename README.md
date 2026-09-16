@@ -50,26 +50,35 @@ search engines, configure these three surfaces:
 
 ### 1) Repository description (meta description)
 
-Use a short, keyword-rich sentence in the repo **Description** field, for
-example:
+Use a short, keyword-rich sentence in the repo **Description** field.
 
-> Convert GGUF language models to MLX-LM safetensors on Apple Silicon, with
-> strict architecture validation and optional 4-bit MLX quantization.
+**Chinese (1-2 sentences):**
+
+> 在 Apple Silicon（M1/M2/M3/M4）上将 GGUF 语言模型转换为 MLX-LM 兼容的
+> safetensors。支持严格架构校验与可选 4-bit MLX 量化，面向可复现、可验证的模型转换流程。
+
+**English (1-2 sentences):**
+
+> Convert GGUF language models to MLX-LM-compatible safetensors on Apple Silicon
+> (M1/M2/M3/M4). Includes strict architecture validation and optional 4-bit MLX
+> quantization for a reproducible, verifiable conversion workflow.
 
 ### 2) Repository topics
 
-Recommended topics for this project:
+Final prioritized topics for this project:
 
 - `gguf`
 - `mlx`
 - `mlx-lm`
-- `apple-silicon`
 - `llm`
 - `model-conversion`
+- `apple-silicon`
 - `safetensors`
+- `quantization`
 - `python`
 - `rust`
-- `quantization`
+- `macos`
+- `huggingface`
 
 ### 3) GitHub Pages
 
