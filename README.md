@@ -217,6 +217,8 @@ print('loaded')
 | GGUF BOS/EOS/UNK and space-prefix metadata | Supported |
 | Executable Unigram and WordPiece tokenizer tests | Supported |
 | Gemma and Phi-3 architecture fixtures | Supported |
+| Bounded-memory direct quantization (`--direct-quant`) | Supported |
+| StableLM conversion adapter | Supported |
 
 ---
 
@@ -228,7 +230,7 @@ print('loaded')
 2. **conversion enabled** through an explicit tensor adapter.
 
 The current code recognizes 48 architecture identifiers for inspection and
-enables conversion for 11 identifiers.
+enables conversion for 12 identifiers.
 
 ### Conversion-enabled architectures
 
@@ -240,6 +242,7 @@ enables conversion for 11 identifiers.
 | GLM | `glm4moe` | Conversion enabled |
 | Gemma | `gemma` | Fixture-validated adapter |
 | Phi | `phi3` | Phi-3 4K fixture-validated adapter |
+| StableLM | `stablelm` | Conversion enabled |
 | GLM | `glm-dsa` | Experimental conversion only |
 
 Gemma 2/3 and Phi-3 LongRoPE are different layouts and are not included in the
@@ -254,7 +257,7 @@ These may still be recognized by metadata or `--skip-weights`, but they are
 `codeshell`, `command-r`, `command-r-plus`, `dbrx`, `exaone`, `falcon`,
 `gemma2`, `gemma3`, `gpt2`, `gptneox`, `granite`, `grok-1`, `jais`, `minicpm`,
 `minicpm3`, `mpt`, `nemotron`, `olmo`, `olmo2`, `openelm`, `orion`, `phi`,
-`phi2`, `plamo`, `refact`, `smolm`, `stablelm`, `starcoder`, `t5`, and `xverse`.
+`phi2`, `plamo`, `refact`, `smolm`, `starcoder`, `t5`, and `xverse`.
 
 That means no more silent "Llama fallback" producing invalid outputs for
 unrelated architectures.
@@ -430,15 +433,18 @@ Completed:
 - fixture-backed Gemma and standard Phi-3 4K adapters
 - GGUF tokenizer flags and embedded tokenizer JSON preservation
 - reproducible conversion benchmark harness
+- bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, llama/gemma, Q4_0/Q8_0 source qtypes)
+- StableLM conversion adapter (norm_eps, partial_rotary_factor, qk_layernorm, use_parallel_residual)
 
 Remaining areas for contributors:
 
-- implement the bounded-memory pipeline described in
-  `docs/direct-quant-transcoding.md`
 - add opt-in real-GGUF load and logit validation for each fixture-backed adapter
+- publish end-to-end `mlx_lm.load()` parity validation and fixed-corpus perplexity deltas for `--direct-quant`
+- publish peak RSS and output-size comparison between `--direct-quant` and `mlx_lm.convert`
 - add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks
 - broader tokenizer fixture coverage for architecture-specific normalizers,
   byte fallback variants, and added-token edge cases
+- expand `--direct-quant` to wider architectures and source quantization types beyond Q4_0/Q8_0
 
 ---
 
@@ -448,7 +454,8 @@ PRs are welcome, especially for:
 
 - new architecture adapters backed by tensor manifests and load tests
 - tokenizer fidelity improvements
-- bounded-memory GGUF-to-MLX quantization
+- end-to-end `mlx_lm.load()` parity validation and perplexity benchmarks for `--direct-quant`
+- expanding `--direct-quant` to additional architectures and source quantization types
 - Apple Silicon integration coverage
 
 When requesting a new model family, include the exact GGUF architecture, model
