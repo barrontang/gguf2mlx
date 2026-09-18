@@ -232,6 +232,7 @@ CONVERTIBLE_ARCHES = {
     "qwen2",
     "qwen2moe",
     "qwen3moe",
+    "stablelm",
 }
 
 STRICT_ADAPTER_ARCHES = {"gemma", "phi3"}
@@ -575,6 +576,44 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
                 "type": "linear",
                 "factor": rope_scaling_factor,
             }
+
+    # --- StableLM ---
+    if arch == "stablelm":
+        # StableLM uses LayerNorm (not RMSNorm); the HF config key is norm_eps.
+        # The GGUF metadata key is stablelm.attention.layer_norm_epsilon (no "rms_").
+        # The generic build above may have silently fallen back to a default — re-read
+        # explicitly and replace the rms key with the correct one.
+        stablelm_norm_eps = get_metadata_float(
+            reader, "stablelm.attention.layer_norm_epsilon"
+        ) or norm_eps
+        config.pop("rms_norm_eps", None)
+        config["norm_eps"] = stablelm_norm_eps
+
+        # partial_rotary_factor = rope_dim / (hidden_size // num_heads)
+        rope_dim = get_metadata_int(reader, "stablelm.rope.dimension_count")
+        if rope_dim is not None and num_heads > 0:
+            head_dim = hidden_size // num_heads
+            config["partial_rotary_factor"] = rope_dim / head_dim
+
+        # qk_layernorm: present when per-head Q/K norm tensors exist in the file.
+        tensor_names = {t.name for t in reader.tensors}
+        config["qk_layernorm"] = any(
+            "attn_q_norm" in name or "attn_k_norm" in name for name in tensor_names
+        )
+
+        # use_parallel_residual: False when blk.N.ffn_norm tensors are present.
+        config["use_parallel_residual"] = not any(
+            "ffn_norm" in name for name in tensor_names
+        )
+
+        # Fix CamelCase: StableLmForCausalLM (capital L, not Stablelm…)
+        config["architectures"] = ["StableLmForCausalLM"]
+
+        config["tie_word_embeddings"] = False
+        config["attention_bias"] = any(
+            "attn_q.bias" in name or "attn_k.bias" in name or "attn_v.bias" in name
+            for name in tensor_names
+        )
 
     # --- GLM-5.2 (glm-dsa): MLA + DSA + MoE + MTP + IndexShare ---
     if arch == "glm-dsa":

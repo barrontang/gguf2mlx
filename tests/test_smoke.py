@@ -30,8 +30,9 @@ class _FakeField:
 
 
 class _FakeReader:
-    def __init__(self, mapping):
+    def __init__(self, mapping, tensors=None):
         self._mapping = mapping
+        self.tensors = tensors or []
 
     def get_field(self, key):
         value = self._mapping.get(key)
@@ -381,6 +382,46 @@ def test_convert_uses_direct_quant_pipeline_when_requested(tmp_path: Path, monke
     assert q_group_size == 64
     assert q_mode == "affine"
     assert (output_dir / "config.json").exists()
+
+
+def test_build_config_stablelm_overrides():
+    # StableLM-2-12B style: qk_layernorm=True, use_parallel_residual=False,
+    # norm_eps not rms_norm_eps, partial_rotary_factor from rope.dimension_count.
+    class _FakeTensor:
+        def __init__(self, name):
+            self.name = name
+
+    reader = _FakeReader(
+        {
+            "general.architecture": "stablelm",
+            "stablelm.embedding_length": 5120,
+            "stablelm.block_count": 40,
+            "stablelm.attention.head_count": 32,
+            "stablelm.attention.head_count_kv": 8,
+            "stablelm.feed_forward_length": 13824,
+            "stablelm.context_length": 4096,
+            "stablelm.rope.freq_base": 10000.0,
+            "stablelm.attention.layer_norm_epsilon": 1e-5,
+            "stablelm.rope.dimension_count": 40,  # 40 / (5120//32=160) = 0.25
+            "tokenizer.ggml.bos_token_id": 100257,
+            "tokenizer.ggml.eos_token_id": 100278,
+        },
+        tensors=[
+            _FakeTensor("blk.0.attn_q_norm.weight"),   # qk_layernorm = True
+            _FakeTensor("blk.0.ffn_norm.weight"),       # use_parallel_residual = False
+        ],
+    )
+
+    config = build_config(reader, "stablelm")
+
+    assert config["model_type"] == "stablelm"
+    assert config["architectures"] == ["StableLmForCausalLM"]
+    assert "rms_norm_eps" not in config
+    assert abs(config["norm_eps"] - 1e-5) < 1e-10
+    assert config["qk_layernorm"] is True
+    assert config["use_parallel_residual"] is False
+    assert abs(config["partial_rotary_factor"] - 0.25) < 1e-6
+    assert config["tie_word_embeddings"] is False
 
 
 def test_quantize_affine_4bit_roundtrip_shape_and_dtype():

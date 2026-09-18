@@ -1,0 +1,5 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/Users/barrontang/gguf2mlx/.venv/bin/python": true
+    }
+}
