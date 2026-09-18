@@ -43,48 +43,6 @@ already-quantized GGUF file.
 > re-quantization after conversion, not bit-for-bit preservation of the original
 > GGUF quantization blocks.
 
-## GitHub discoverability setup
-
-If you want this repository to be indexed faster by GitHub search and external
-search engines, configure these three surfaces:
-
-### 1) Repository description (meta description)
-
-Use a short, keyword-rich sentence in the repo **Description** field.
-
-**Chinese (1-2 sentences):**
-
-> 在 Apple Silicon（M1/M2/M3/M4）上将 GGUF 语言模型转换为 MLX-LM 兼容的
-> safetensors。支持严格架构校验与可选 4-bit MLX 量化，面向可复现、可验证的模型转换流程。
-
-**English (1-2 sentences):**
-
-> Convert GGUF language models to MLX-LM-compatible safetensors on Apple Silicon
-> (M1/M2/M3/M4). Includes strict architecture validation and optional 4-bit MLX
-> quantization for a reproducible, verifiable conversion workflow.
-
-### 2) Repository topics
-
-Final prioritized topics for this project:
-
-- `gguf`
-- `mlx`
-- `mlx-lm`
-- `llm`
-- `model-conversion`
-- `apple-silicon`
-- `safetensors`
-- `quantization`
-- `python`
-- `rust`
-- `macos`
-- `huggingface`
-
-### 3) GitHub Pages
-
-Enable **GitHub Pages** in repository settings (even a simple README-rendered
-site helps discoverability and external crawling).
-
 ---
 
 ## Quick start
@@ -124,7 +82,7 @@ gguf2mlx --input model.gguf --output ./mlx-model
 # GGUF -> 4-bit MLX in one command
 gguf2mlx --input model-Q4.gguf --output ./mlx-model-4bit --quantize --q-bits 4 --q-group-size 64
 
-# Experimental bounded-memory direct quantization path (llama/gemma only)
+# Bounded-memory direct quantization (llama, gemma, mistral, qwen2, stablelm)
 gguf2mlx --input model-Q4.gguf --output ./mlx-model-4bit-direct --quantize --direct-quant --q-bits 4 --q-group-size 64 --q-mode affine
 
 # Float32 output
@@ -352,8 +310,8 @@ recover information removed when the source GGUF was quantized.
 ### Does the 4-bit output preserve the original GGUF Q4 blocks?
 
 No. The current implementation dequantizes the GGUF and then uses MLX-LM to
-perform a second quantization. A lower-memory direct pipeline is designed in
-`docs/direct-quant-transcoding.md`.
+perform a second quantization. Use `--direct-quant` for the bounded-memory path
+that skips the FP16 staging directory; see `docs/direct-quant-transcoding.md`.
 
 ### Why is the converted model larger than the GGUF file?
 
@@ -433,18 +391,18 @@ Completed:
 - fixture-backed Gemma and standard Phi-3 4K adapters
 - GGUF tokenizer flags and embedded tokenizer JSON preservation
 - reproducible conversion benchmark harness
-- bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, llama/gemma, Q4_0/Q8_0 source qtypes)
+- bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, llama/gemma/mistral/qwen2/stablelm, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K–Q8_K/BF16 source qtypes)
 - StableLM conversion adapter (norm_eps, partial_rotary_factor, qk_layernorm, use_parallel_residual)
+- `mlx_lm.load()` parity validation test for `--direct-quant` output (`tests/test_e2e.py`)
 
 Remaining areas for contributors:
 
 - add opt-in real-GGUF load and logit validation for each fixture-backed adapter
-- publish end-to-end `mlx_lm.load()` parity validation and fixed-corpus perplexity deltas for `--direct-quant`
-- publish peak RSS and output-size comparison between `--direct-quant` and `mlx_lm.convert`
+- publish fixed-corpus perplexity deltas comparing `--direct-quant` output against `mlx_lm.convert` baseline
+- publish peak RSS and output-size comparison results from `benchmarks/benchmark_conversion.py --compare`
 - add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks
 - broader tokenizer fixture coverage for architecture-specific normalizers,
   byte fallback variants, and added-token edge cases
-- expand `--direct-quant` to wider architectures and source quantization types beyond Q4_0/Q8_0
 
 ---
 
