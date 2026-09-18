@@ -60,6 +60,7 @@ def test_cli_help():
     assert "input" in result.stdout.lower() or "gguf" in result.stdout.lower()
     assert "--quantize" in result.stdout
     assert "--q-bits" in result.stdout
+    assert "--direct-quant" in result.stdout
 
 
 def test_cli_package_help():
@@ -344,6 +345,54 @@ def test_convert_cleans_staging_directory_after_quantization_failure(tmp_path: P
     assert core.convert("model.gguf", str(output_dir), quantize=True) is False
     assert not output_dir.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_uses_direct_quant_pipeline_when_requested(tmp_path: Path, monkeypatch):
+    output_dir = tmp_path / "model"
+    calls = []
+
+    def fake_direct_convert(gguf_path, output_path, dtype, q_bits, q_group_size, q_mode):
+        calls.append((gguf_path, output_path, dtype, q_bits, q_group_size, q_mode))
+        out = Path(output_path)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "config.json").write_text("{}")
+        (out / "model.safetensors.index.json").write_text('{"weight_map": {}}')
+        return True
+
+    monkeypatch.setattr(core, "_convert_direct_quantized", fake_direct_convert)
+
+    assert (
+        core.convert(
+            "model.gguf",
+            str(output_dir),
+            quantize=True,
+            q_bits=4,
+            q_group_size=64,
+            q_mode="affine",
+            direct_quant=True,
+        )
+        is True
+    )
+    assert len(calls) == 1
+    _, staged_output, dtype, q_bits, q_group_size, q_mode = calls[0]
+    assert Path(staged_output).name == "direct-quantized"
+    assert dtype == "float16"
+    assert q_bits == 4
+    assert q_group_size == 64
+    assert q_mode == "affine"
+    assert (output_dir / "config.json").exists()
+
+
+def test_quantize_affine_4bit_roundtrip_shape_and_dtype():
+    arr = np.arange(128, dtype=np.float32).reshape(2, 64)
+    packed, scales, biases = core._quantize_affine_4bit(arr, 64)
+
+    assert packed.shape == (2, 32)
+    assert packed.dtype == np.uint8
+    assert scales.shape == (2, 1)
+    assert scales.dtype == np.float16
+    assert biases.shape == (2, 1)
+    assert biases.dtype == np.float16
 
 
 def test_package_mlx_directory_creates_manifest_and_hashes(tmp_path: Path):

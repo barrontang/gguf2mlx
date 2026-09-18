@@ -124,6 +124,9 @@ gguf2mlx --input model.gguf --output ./mlx-model
 # GGUF -> 4-bit MLX in one command
 gguf2mlx --input model-Q4.gguf --output ./mlx-model-4bit --quantize --q-bits 4 --q-group-size 64
 
+# Experimental bounded-memory direct quantization path (llama/gemma only)
+gguf2mlx --input model-Q4.gguf --output ./mlx-model-4bit-direct --quantize --direct-quant --q-bits 4 --q-group-size 64 --q-mode affine
+
 # Float32 output
 gguf2mlx --input model.gguf --output ./mlx-model-f32 --dtype float32
 

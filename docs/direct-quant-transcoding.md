@@ -2,13 +2,28 @@
 
 ## Status
 
-This document defines a future low-memory conversion path. The current converter
-dequantizes each GGUF tensor to FP16 or FP32, writes safetensors, and optionally
-asks MLX-LM to quantize that intermediate model.
+This document now tracks the direct quantization path implemented behind
+`--direct-quant`. The default converter path still dequantizes GGUF tensors to
+FP16/FP32 safetensors and can optionally invoke `mlx_lm.convert`.
 
-The first implementation should optimize memory and temporary disk usage. It
-must not claim bit-for-bit preservation because GGUF block formats and MLX
-group-wise quantization layouts are not generally interchangeable.
+The direct path currently targets an initial constrained scope and remains
+experimental.
+
+## Implemented in this repository
+
+- CLI flag: `gguf2mlx convert --quantize --direct-quant`
+- Bounded-memory shard writing (no full FP16 model directory) for direct mode
+- Direct affine 4-bit quantization (`q_bits=4`, `q_mode=affine`, `q_group_size=64`)
+- Architecture gate: `llama` and `gemma`
+- Source quantization gate for direct-quantized linear projections: `Q4_0`, `Q8_0`
+- Non-projection tensors currently follow the existing FP16 fallback path
+- Quantization metadata is added to `config.json` only after shard success
+
+## Still pending for full acceptance criteria
+
+- End-to-end `mlx_lm.load()` parity validation and fixed-corpus quality deltas
+- Published RSS and output-size comparison against `mlx_lm.convert`
+- Wider architecture and source quantization support
 
 ## Goals
 

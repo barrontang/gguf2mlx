@@ -237,6 +237,9 @@ CONVERTIBLE_ARCHES = {
 STRICT_ADAPTER_ARCHES = {"gemma", "phi3"}
 
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
+DIRECT_QUANT_SUPPORTED_ARCHES = {"llama", "gemma"}
+DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES = {2, 7}  # Q4_0, Q8_0
+DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES = 256 * 1024 * 1024
 
 # Popular GGUF naming patterns that do not directly include a GGUF architecture key.
 # These are used only when `general.architecture` is missing.
@@ -1289,6 +1292,117 @@ def _detect_full_indexer_layers(all_keys: list[str]) -> list[int]:
     })
 
 
+def _decode_tensor_to_array(
+    tensor: Any,
+    dtype: str,
+    gguf_name: str,
+) -> np.ndarray | None:
+    """Decode one GGUF tensor into HF-layout ndarray."""
+    np_dtype = np.float16 if dtype == "float16" else np.float32
+    qtype = tensor.tensor_type
+    qtype_val = int(qtype)
+    logical_shape = tuple(tensor.shape)
+    raw_data = tensor.data
+
+    if qtype_val == 0:  # F32
+        arr = np.array(raw_data, dtype=np.float32).reshape(logical_shape)
+        if dtype == "float16":
+            arr = arr.astype(np.float16)
+        if arr.ndim == 2:
+            arr = arr.T
+        return arr
+    if qtype_val == 1:  # F16
+        arr = np.array(raw_data, dtype=np.float16).reshape(logical_shape)
+        if arr.ndim == 2:
+            arr = arr.T
+        return arr.astype(np_dtype)
+    if qtype_val == 28:  # F64
+        arr = np.array(raw_data, dtype=np.float64).reshape(logical_shape)
+        if arr.ndim == 2:
+            arr = arr.T
+        return arr.astype(np_dtype)
+    if qtype_val in (24, 25, 26, 27):  # I8, I16, I32, I64
+        int_dtype_map = {24: np.int8, 25: np.int16, 26: np.int32, 27: np.int64}
+        arr = np.array(raw_data, dtype=int_dtype_map.get(qtype_val, np.int32))
+        arr = arr.reshape(logical_shape).astype(np_dtype)
+        if arr.ndim == 2:
+            arr = arr.T
+        return arr
+
+    try:
+        ggml_qtype = (
+            qtype if isinstance(qtype, GGMLQuantizationType) else GGMLQuantizationType(qtype_val)
+        )
+        arr = dequantize(raw_data, ggml_qtype)
+        return arr.astype(np_dtype)
+    except Exception as e:  # noqa: BLE001
+        print(f"    ⚠ Failed to dequantize {gguf_name} ({qtype}): {e}")
+        return None
+
+
+def _is_direct_quantizable_linear_weight(hf_name: str, arr: np.ndarray) -> bool:
+    """Only quantize 2D linear projection weights in the first direct pipeline release."""
+    return arr.ndim == 2 and hf_name.endswith("_proj.weight")
+
+
+def _quantize_affine_4bit(
+    arr: np.ndarray, q_group_size: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Quantize a 2D array into affine 4-bit groups."""
+    if arr.ndim != 2:
+        raise ValueError(f"Direct quantization expects 2D tensors, got {arr.ndim}D")
+    rows, cols = arr.shape
+    if cols % q_group_size != 0:
+        raise ValueError(
+            f"Column size {cols} is not divisible by q_group_size={q_group_size}"
+        )
+
+    grouped = arr.astype(np.float32).reshape(rows, cols // q_group_size, q_group_size)
+    mins = grouped.min(axis=-1)
+    maxs = grouped.max(axis=-1)
+    scales = (maxs - mins) / 15.0
+    zero_scale = scales == 0.0
+    safe_scales = scales.copy()
+    safe_scales[zero_scale] = 1.0
+
+    q = np.round((grouped - mins[..., None]) / safe_scales[..., None])
+    q = np.clip(q, 0, 15).astype(np.uint8)
+    q[zero_scale[..., None].repeat(q_group_size, axis=-1)] = 0
+
+    low = q[..., 0::2]
+    high = q[..., 1::2] << 4
+    packed = (low | high).reshape(rows, cols // 2).astype(np.uint8)
+    return packed, safe_scales.astype(np.float16), mins.astype(np.float16)
+
+
+def _finalize_safetensor_shards(output_dir: Path, total_bytes_out: int) -> tuple[int, int]:
+    """Rename placeholder shard filenames and write model.safetensors.index.json."""
+    shard_files = sorted(
+        output_dir.glob("model-*-of-NNNNN.safetensors"),
+        key=lambda p: int(p.stem.split("-")[1]),
+    )
+    total_shards = len(shard_files)
+    if total_shards == 0:
+        raise RuntimeError("No safetensor shards were written")
+
+    weight_map: dict[str, str] = {}
+    for i, old_path in enumerate(shard_files, 1):
+        new_name = f"model-{i:05d}-of-{total_shards:05d}.safetensors"
+        new_path = output_dir / new_name
+        old_path.rename(new_path)
+        with safe_open(str(new_path), framework="np") as f:
+            for key in f:
+                weight_map[key] = new_name
+
+    index_json = {
+        "metadata": {"total_size": total_bytes_out},
+        "weight_map": weight_map,
+    }
+    with open(output_dir / "model.safetensors.index.json", "w") as f:
+        json.dump(index_json, f, indent=2)
+    return len(weight_map), total_shards
+
+
 def extract_and_convert_weights(
     reader: GGUFReader, arch: str, output_dir: Path, dtype: str = "float16"
 ) -> None:
@@ -1297,7 +1411,6 @@ def extract_and_convert_weights(
     print(f"\n  Converting {len(reader.tensors)} tensors...")
     print(f"  Output dtype: {dtype}")
 
-    np_dtype = np.float16 if dtype == "float16" else np.float32
     weights: dict[str, np.ndarray] = {}
     all_keys: list[str] = []
 
@@ -1338,8 +1451,6 @@ def extract_and_convert_weights(
 
     for i, tensor in enumerate(reader.tensors):
         gguf_name = tensor.name
-        qtype = tensor.tensor_type
-        logical_shape = tuple(tensor.shape)
         n_bytes = tensor.n_bytes
         total_bytes_in += n_bytes
 
@@ -1348,47 +1459,10 @@ def extract_and_convert_weights(
             print(f"    [{i + 1}/{len(reader.tensors)}] Processing...")
 
         try:
-            # Dequantize if needed
-            qtype_val = int(qtype)
-            raw_data = tensor.data
-
-            if qtype_val == 0:  # F32
-                arr = np.array(raw_data, dtype=np.float32).reshape(logical_shape)
-                if dtype == "float16":
-                    arr = arr.astype(np.float16)
-                # F32/F16 tensors use GGUF layout [in_features, out_features],
-                # need transpose to HF layout [out_features, in_features]
-                if arr.ndim == 2:
-                    arr = arr.T
-            elif qtype_val == 1:  # F16
-                arr = np.array(raw_data, dtype=np.float16).reshape(logical_shape)
-                if arr.ndim == 2:
-                    arr = arr.T
-            elif qtype_val == 28:  # F64
-                arr = np.array(raw_data, dtype=np.float64).reshape(logical_shape)
-                if arr.ndim == 2:
-                    arr = arr.T
-                arr = arr.astype(np_dtype)
-            elif qtype_val in (24, 25, 26, 27):  # I8, I16, I32, I64
-                int_dtype_map = {24: np.int8, 25: np.int16, 26: np.int32, 27: np.int64}
-                arr = np.array(raw_data, dtype=int_dtype_map.get(qtype_val, np.int32))
-                arr = arr.reshape(logical_shape).astype(np_dtype)
-                if arr.ndim == 2:
-                    arr = arr.T
-            else:
-                # Quantized: gguf's dequantize already returns [out_features, in_features]
-                # (HF layout), so don't reshape or transpose
-                try:
-                    ggml_qtype = (
-                        qtype if isinstance(qtype, GGMLQuantizationType) else GGMLQuantizationType(qtype_val)
-                    )
-                    arr = dequantize(raw_data, ggml_qtype)
-                    # dequantize already returns correct shape, no .reshape needed
-                    arr = arr.astype(np_dtype)
-                except Exception as e:  # noqa: BLE001
-                    print(f"    ⚠ Failed to dequantize {gguf_name} ({qtype}): {e}")
-                    skipped += 1
-                    continue
+            arr = _decode_tensor_to_array(tensor, dtype, gguf_name)
+            if arr is None:
+                skipped += 1
+                continue
 
             # Determine output tensors (may be 0, 1, or many for arch-specific
             # transforms such as kv_b concat and per-expert split).
@@ -1466,35 +1540,201 @@ def extract_and_convert_weights(
     if not all_keys:
         raise RuntimeError("No weights extracted!")
 
-    # --- Rename shards with correct total-count filenames ---
-    shard_files = sorted(
-        output_dir.glob("model-*-of-NNNNN.safetensors"),
-        key=lambda p: int(p.stem.split("-")[1])
-    )
-    total_shards = len(shard_files)
-    weight_map: dict[str, str] = {}
+    indexed_keys, total_shards = _finalize_safetensor_shards(output_dir, total_bytes_out)
 
-    for i, old_path in enumerate(shard_files, 1):
-        new_name = f"model-{i:05d}-of-{total_shards:05d}.safetensors"
-        new_path = output_dir / new_name
-        old_path.rename(new_path)
-
-        # Read keys from shard to build weight map
-        with safe_open(str(new_path), framework="np") as f:
-            for key in f:
-                weight_map[key] = new_name
-
-    # --- Save index ---
-    index_json = {
-        "metadata": {"total_size": total_bytes_out},
-        "weight_map": weight_map,
-    }
-    with open(output_dir / "model.safetensors.index.json", "w") as f:
-        json.dump(index_json, f, indent=2)
-
-    print(f"\n  ✓ Saved {len(all_keys)} weight tensors ({total_shards} shards)")
+    print(f"\n  ✓ Saved {indexed_keys} weight tensors ({total_shards} shards)")
     print(f"    Total input:  {total_bytes_in / 1e9:.2f} GB (GGUF)")
     print(f"    Total output: {total_bytes_out / 1e9:.2f} GB (safetensors)")
+
+
+def extract_and_convert_weights_direct_quant(
+    reader: GGUFReader,
+    arch: str,
+    output_dir: Path,
+    dtype: str,
+    q_bits: int,
+    q_group_size: int,
+    q_mode: str,
+) -> None:
+    """Bounded-memory direct quantization path for supported linear weights."""
+    if q_bits != 4 or q_group_size != 64 or q_mode != "affine":
+        raise RuntimeError(
+            "Direct quantization currently supports only affine 4-bit with q_group_size=64"
+        )
+
+    np_dtype = np.float16 if dtype == "float16" else np.float32
+    weights: dict[str, np.ndarray] = {}
+    total_bytes_in = 0
+    total_bytes_out = 0
+    current_shard_bytes = 0
+    shard_idx = 1
+    skipped = 0
+    quantized_tensors = 0
+    fallback_tensors = 0
+    max_shard_bytes = DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES
+
+    pbar = tqdm(total=len(reader.tensors), desc="  Direct quantizing", unit="tensor")
+
+    def _shard_filename(idx: int, total_final: int | None = None) -> str:
+        if total_final is None:
+            return f"model-{idx:05d}-of-NNNNN.safetensors"
+        return f"model-{idx:05d}-of-{total_final:05d}.safetensors"
+
+    def _flush_shard(shard_weights: dict[str, np.ndarray], index: int) -> int:
+        if not shard_weights:
+            return 0
+        path = output_dir / _shard_filename(index, None)
+        save_safetensors(shard_weights, str(path))
+        n_bytes = sum(arr.nbytes for arr in shard_weights.values())
+        shard_weights.clear()
+        gc.collect()
+        return n_bytes
+
+    mla_dims = _read_mla_dims(reader, arch)
+    pending_kv_b: dict[str, dict[str, np.ndarray]] = {}
+    pending_qkv: dict[str, dict[str, np.ndarray]] = {}
+
+    for tensor in reader.tensors:
+        gguf_name = tensor.name
+        total_bytes_in += tensor.n_bytes
+        try:
+            arr = _decode_tensor_to_array(tensor, dtype, gguf_name)
+            if arr is None:
+                skipped += 1
+                continue
+
+            emit_pairs = _plan_tensor_emit(
+                gguf_name,
+                arr,
+                arch,
+                mla_dims,
+                pending_kv_b,
+                pending_qkv,
+            )
+            qtype_val = int(tensor.tensor_type)
+            for hf_name, out_arr in emit_pairs:
+                if _is_direct_quantizable_linear_weight(hf_name, out_arr):
+                    if qtype_val not in DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES:
+                        raise RuntimeError(
+                            f"Unsupported source quantization for direct quantization: "
+                            f"{gguf_name} has qtype={qtype_val}; supported: "
+                            f"{sorted(DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES)}"
+                        )
+                    packed, scales, biases = _quantize_affine_4bit(out_arr, q_group_size)
+                    base = hf_name.removesuffix(".weight")
+                    quantized_entries = {
+                        f"{base}.weight": packed,
+                        f"{base}.scales": scales.astype(np_dtype),
+                        f"{base}.biases": biases.astype(np_dtype),
+                    }
+                    for name, value in quantized_entries.items():
+                        weights[name] = value
+                        total_bytes_out += value.nbytes
+                        current_shard_bytes += value.nbytes
+                    quantized_tensors += 1
+                else:
+                    weights[hf_name] = out_arr
+                    total_bytes_out += out_arr.nbytes
+                    current_shard_bytes += out_arr.nbytes
+                    fallback_tensors += 1
+
+                if current_shard_bytes >= max_shard_bytes:
+                    _flush_shard(weights, shard_idx)
+                    shard_idx += 1
+                    current_shard_bytes = 0
+            pbar.update(1)
+        except Exception as error:  # noqa: BLE001
+            print(f"    ⚠ Error processing {gguf_name}: {error}")
+            skipped += 1
+
+    pbar.close()
+
+    if pending_qkv:
+        incomplete = ", ".join(
+            f"layer {layer_idx} ({'/'.join(sorted(parts))})"
+            for layer_idx, parts in sorted(pending_qkv.items())
+        )
+        raise RuntimeError(f"Incomplete Phi-3 QKV tensor groups: {incomplete}")
+
+    if pending_kv_b:
+        raise RuntimeError("Incomplete split kv_b tensor groups in direct quantization path")
+
+    if skipped:
+        raise RuntimeError(
+            f"Failed to convert {skipped} tensor(s); no partial model was published"
+        )
+
+    if weights:
+        _flush_shard(weights, shard_idx)
+
+    indexed_keys, total_shards = _finalize_safetensor_shards(output_dir, total_bytes_out)
+    print(f"\n  ✓ Direct quantization wrote {indexed_keys} tensors across {total_shards} shards")
+    print(f"    Quantized projection tensors: {quantized_tensors}")
+    print(f"    Fallback non-projection tensors: {fallback_tensors}")
+    print(f"    Total input:  {total_bytes_in / 1e9:.2f} GB (GGUF)")
+    print(f"    Total output: {total_bytes_out / 1e9:.2f} GB (safetensors)")
+
+
+def _convert_direct_quantized(
+    gguf_path: str,
+    output_dir: str,
+    dtype: str,
+    q_bits: int,
+    q_group_size: int,
+    q_mode: str,
+) -> bool:
+    """Convert GGUF directly into quantized MLX-LM-compatible shards."""
+    gguf_file = Path(gguf_path)
+    if not gguf_file.exists():
+        print(f"❌ GGUF file not found: {gguf_path}")
+        return False
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    reader = GGUFReader(str(gguf_path))
+
+    arch = detect_architecture(reader)
+    if arch not in DIRECT_QUANT_SUPPORTED_ARCHES:
+        print(
+            "❌ Direct quantization currently supports only: "
+            f"{', '.join(sorted(DIRECT_QUANT_SUPPORTED_ARCHES))}. Detected: {arch}"
+        )
+        return False
+    variant_error = validate_architecture_variant(reader, arch)
+    if variant_error:
+        print(f"❌ {variant_error}")
+        return False
+
+    print("\n[direct-quant] Building config and tokenizer...")
+    config = build_config(reader, arch, dtype)
+    with open(output_path / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    extract_tokenizer(reader, output_path, arch, config["max_position_embeddings"])
+
+    print("\n[direct-quant] Converting tensors with bounded memory...")
+    try:
+        extract_and_convert_weights_direct_quant(
+            reader,
+            arch,
+            output_path,
+            dtype=dtype,
+            q_bits=q_bits,
+            q_group_size=q_group_size,
+            q_mode=q_mode,
+        )
+    except Exception as error:  # noqa: BLE001
+        print(f"❌ Direct quantization failed: {error}")
+        return False
+
+    config["quantization"] = {
+        "bits": q_bits,
+        "group_size": q_group_size,
+        "mode": q_mode,
+        "scheme": "direct_affine_4bit_v1",
+    }
+    with open(output_path / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    return True
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
@@ -1667,6 +1907,7 @@ def convert(
     q_bits: int = 4,
     q_group_size: int = 64,
     q_mode: str = "affine",
+    direct_quant: bool = False,
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     if quantize and q_group_size not in SUPPORTED_MLX_LM_Q_GROUP_SIZES:
@@ -1687,32 +1928,50 @@ def convert(
     )
     fp_output_path = staging_path / "fp"
     quantized_output_path = staging_path / "quantized"
+    direct_quantized_output_path = staging_path / "direct-quantized"
 
     try:
-        try:
-            succeeded = _convert(gguf_path, str(fp_output_path), dtype)
-        except Exception as error:  # noqa: BLE001
-            print(f"❌ Conversion failed: {error}")
-            return False
-
-        if not succeeded:
-            return False
-
-        final_stage_path = fp_output_path
-        if quantize:
-            print("\n[mlx-lm] Quantizing converted output...")
+        if quantize and direct_quant:
             try:
-                _quantize_output_with_mlx_lm(
-                    fp_output_path,
-                    quantized_output_path,
+                succeeded = _convert_direct_quantized(
+                    gguf_path,
+                    str(direct_quantized_output_path),
+                    dtype=dtype,
                     q_bits=q_bits,
                     q_group_size=q_group_size,
                     q_mode=q_mode,
                 )
             except Exception as error:  # noqa: BLE001
-                print(f"❌ Quantization failed: {error}")
+                print(f"❌ Conversion failed: {error}")
                 return False
-            final_stage_path = quantized_output_path
+            if not succeeded:
+                return False
+            final_stage_path = direct_quantized_output_path
+        else:
+            try:
+                succeeded = _convert(gguf_path, str(fp_output_path), dtype)
+            except Exception as error:  # noqa: BLE001
+                print(f"❌ Conversion failed: {error}")
+                return False
+
+            if not succeeded:
+                return False
+
+            final_stage_path = fp_output_path
+            if quantize:
+                print("\n[mlx-lm] Quantizing converted output...")
+                try:
+                    _quantize_output_with_mlx_lm(
+                        fp_output_path,
+                        quantized_output_path,
+                        q_bits=q_bits,
+                        q_group_size=q_group_size,
+                        q_mode=q_mode,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    print(f"❌ Quantization failed: {error}")
+                    return False
+                final_stage_path = quantized_output_path
 
         if output_path.exists():
             output_path.rmdir()
@@ -1965,6 +2224,14 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
         help="Quantization mode for mlx-lm (default: affine)",
     )
     parser.add_argument(
+        "--direct-quant",
+        action="store_true",
+        help=(
+            "Experimental bounded-memory direct quantization path "
+            "(currently affine 4-bit, group size 64, llama/gemma only)"
+        ),
+    )
+    parser.add_argument(
         "--skip-weights",
         action="store_true",
         help="Skip weight extraction (metadata + tokenizer only, for inspection)",
@@ -1992,6 +2259,7 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         q_bits=args.q_bits,
         q_group_size=args.q_group_size,
         q_mode=args.q_mode,
+        direct_quant=args.direct_quant,
     )
     return 0 if success else 1
 
