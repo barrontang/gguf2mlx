@@ -85,6 +85,110 @@ def _write_tiny_mlx_llama_model(model_dir: Path) -> None:
     _write_tiny_tokenizer(model_dir)
 
 
+def _write_tiny_mlx_llama_model_quantized(model_dir: Path) -> None:
+    """Write a tiny direct-quant-style MLX llama model (packed int4 weights)."""
+    import mlx.core as mx
+    from mlx_lm.models.llama import Model, ModelArgs
+    from mlx_lm.utils import save_model
+    from mlx import nn
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    args = ModelArgs(
+        model_type="llama",
+        hidden_size=32,
+        num_hidden_layers=1,
+        intermediate_size=64,
+        num_attention_heads=4,
+        rms_norm_eps=1e-5,
+        vocab_size=32,
+        max_position_embeddings=32,
+        tie_word_embeddings=True,
+    )
+    model = Model(args)
+    nn.quantize(model, group_size=32, bits=4)
+    mx.eval(model.parameters())
+
+    save_model(model_dir, model)
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                **{
+                    "model_type": "llama",
+                    "hidden_size": 32,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 4,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 32,
+                    "max_position_embeddings": 32,
+                    "tie_word_embeddings": True,
+                    "torch_dtype": "float16",
+                },
+                "quantization": {"bits": 4, "group_size": 32, "mode": "affine"},
+            },
+            indent=2,
+        )
+    )
+    _write_tiny_tokenizer(model_dir)
+
+
+def test_direct_quant_output_loads_with_mlx_lm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """mlx_lm.load() must succeed on direct-quant output and produce finite logits."""
+    pytest.importorskip("mlx")
+    pytest.importorskip("mlx_lm")
+    pytest.importorskip("tokenizers")
+    pytest.importorskip("transformers")
+
+    import mlx.core as mx
+    from mlx import nn
+    from mlx.utils import tree_flatten
+    from mlx_lm import load
+
+    output_dir = tmp_path / "direct-quant-model"
+
+    def fake_direct_convert(
+        gguf_path: str,
+        output_path: str,
+        dtype: str,
+        q_bits: int,
+        q_group_size: int,
+        q_mode: str,
+    ) -> bool:
+        _write_tiny_mlx_llama_model_quantized(Path(output_path))
+        return True
+
+    monkeypatch.setattr(core, "_convert_direct_quantized", fake_direct_convert)
+
+    assert (
+        core.convert(
+            "dummy.gguf",
+            str(output_dir),
+            quantize=True,
+            q_bits=4,
+            q_group_size=32,
+            q_mode="affine",
+            direct_quant=True,
+        )
+        is True
+    )
+
+    model, tokenizer, config = load(str(output_dir), return_config=True)
+    assert config["quantization"]["bits"] == 4
+    assert tokenizer.encode("hello world", add_special_tokens=False) == [3, 4]
+
+    quantized_modules = tree_flatten(
+        model.leaf_modules(), is_leaf=lambda module: isinstance(module, nn.Module)
+    )
+    assert any(isinstance(module, nn.QuantizedLinear) for _, module in quantized_modules)
+
+    logits = model(mx.array([[3, 4]], dtype=mx.int32))
+    assert logits.shape == (1, 2, 32)
+    assert mx.isfinite(logits).all().item()
+
+
 def test_quantized_output_loads_with_mlx_lm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     pytest.importorskip("mlx")
     pytest.importorskip("mlx_lm")

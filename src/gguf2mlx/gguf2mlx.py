@@ -238,8 +238,21 @@ CONVERTIBLE_ARCHES = {
 STRICT_ADAPTER_ARCHES = {"gemma", "phi3"}
 
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
-DIRECT_QUANT_SUPPORTED_ARCHES = {"llama", "gemma"}
-DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES = {2, 7}  # Q4_0, Q8_0
+DIRECT_QUANT_SUPPORTED_ARCHES = {"llama", "gemma", "mistral", "qwen2", "stablelm"}
+DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES = {
+    2,   # Q4_0
+    3,   # Q4_1
+    6,   # Q5_0
+    7,   # Q5_1
+    8,   # Q8_0
+    10,  # Q2_K
+    11,  # Q3_K
+    12,  # Q4_K
+    13,  # Q5_K
+    14,  # Q6_K
+    15,  # Q8_K
+    30,  # BF16
+}
 DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES = 256 * 1024 * 1024
 
 # Popular GGUF naming patterns that do not directly include a GGUF architecture key.

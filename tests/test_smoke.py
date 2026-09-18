@@ -10,6 +10,7 @@ import zipfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from gguf2mlx import gguf2mlx as core
 from gguf2mlx.gguf2mlx import (
@@ -434,6 +435,43 @@ def test_quantize_affine_4bit_roundtrip_shape_and_dtype():
     assert scales.dtype == np.float16
     assert biases.shape == (2, 1)
     assert biases.dtype == np.float16
+
+
+@pytest.mark.parametrize("arch", ["llama", "gemma", "mistral", "qwen2", "stablelm"])
+def test_direct_quant_supported_arches_gate(arch):
+    assert arch in core.DIRECT_QUANT_SUPPORTED_ARCHES
+
+
+@pytest.mark.parametrize("qtype_val,name", [
+    (2, "Q4_0"),
+    (3, "Q4_1"),
+    (6, "Q5_0"),
+    (7, "Q5_1"),
+    (8, "Q8_0"),
+    (10, "Q2_K"),
+    (11, "Q3_K"),
+    (12, "Q4_K"),
+    (13, "Q5_K"),
+    (14, "Q6_K"),
+    (15, "Q8_K"),
+    (30, "BF16"),
+])
+def test_direct_quant_supported_source_qtypes_gate(qtype_val, name):
+    assert qtype_val in core.DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES, (
+        f"{name} (val={qtype_val}) missing from DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES"
+    )
+
+
+@pytest.mark.parametrize("qtype_val,name", [
+    (0, "F32"),
+    (1, "F16"),
+    (16, "IQ2_XXS"),
+    (19, "IQ1_S"),
+])
+def test_direct_quant_unsupported_qtypes_excluded(qtype_val, name):
+    assert qtype_val not in core.DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES, (
+        f"{name} (val={qtype_val}) should NOT be in DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES"
+    )
 
 
 def test_package_mlx_directory_creates_manifest_and_hashes(tmp_path: Path):
