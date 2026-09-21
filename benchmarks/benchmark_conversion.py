@@ -53,8 +53,82 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Use bounded-memory direct quantization path (--direct-quant)")
     parser.add_argument("--compare", action="store_true",
                         help="Run both standard and --direct-quant paths and print a comparison table")
+    parser.add_argument(
+        "--eval-ppl",
+        action="store_true",
+        help="After conversion, measure perplexity of each output with mlx_lm on a "
+        "fixed corpus (quality guardrail). Requires the mlx extra.",
+    )
+    parser.add_argument(
+        "--ppl-dataset",
+        default="wikitext",
+        help="HF dataset path passed to mlx_lm.perplexity.load_data (default: wikitext).",
+    )
+    parser.add_argument(
+        "--ppl-num-samples",
+        type=int,
+        default=32,
+        help="Number of sequences to sample for perplexity (default: 32).",
+    )
+    parser.add_argument(
+        "--ppl-seq-len",
+        type=int,
+        default=512,
+        help="Sequence length for perplexity evaluation (default: 512).",
+    )
     parser.add_argument("--result-json", type=Path)
     return parser
+
+
+def _eval_ppl_on_dir(
+    model_dir: Path,
+    dataset: str,
+    num_samples: int,
+    seq_len: int,
+) -> dict:
+    """Measure perplexity of a converted MLX model directory on a fixed corpus.
+
+    Reuses mlx_lm's own perplexity implementation so the number is directly
+    comparable to upstream MLX quality reporting. Returns a result dict; on any
+    failure (mlx-lm missing, dataset unavailable, load error) the dict carries
+    success=False and an error string rather than raising, so a benchmark run is
+    never aborted by the optional quality guardrail.
+    """
+    try:
+        from mlx_lm.perplexity import eval_ppl, load_data
+        from mlx_lm.utils import load
+    except ImportError as error:
+        return {
+            "success": False,
+            "error": f"mlx-lm not available for perplexity: {error}",
+            "model_dir": str(model_dir),
+        }
+
+    try:
+        model, tokenizer = load(str(model_dir))
+        data = load_data(
+            tokenizer,
+            data_path=dataset,
+            num_samples=num_samples,
+            sequence_length=seq_len,
+        )
+        ppl, std_err = eval_ppl(model, data)
+        return {
+            "success": True,
+            "model_dir": str(model_dir),
+            "perplexity": round(float(ppl), 4),
+            "std_error": round(float(std_err), 4),
+            "dataset": dataset,
+            "num_samples": num_samples,
+            "sequence_length": seq_len,
+        }
+    except Exception as error:  # noqa: BLE001 - guardrail must never abort the run
+        return {
+            "success": False,
+            "error": f"{type(error).__name__}: {error}",
+            "model_dir": str(model_dir),
+            "dataset": dataset,
+        }
 
 
 def _run_one(args, output: Path, direct_quant: bool) -> dict:
@@ -183,9 +257,60 @@ def main() -> int:
         if args.result_json:
             args.result_json.parent.mkdir(parents=True, exist_ok=True)
             args.result_json.write_text(rendered + "\n", encoding="utf-8")
+        if args.eval_ppl and std["success"] and dq["success"]:
+            print("\nMeasuring perplexity (standard path)...")
+            std_ppl = _eval_ppl_on_dir(
+                std_out, args.ppl_dataset, args.ppl_num_samples, args.ppl_seq_len
+            )
+            print("Measuring perplexity (--direct-quant path)...")
+            dq_ppl = _eval_ppl_on_dir(
+                dq_out, args.ppl_dataset, args.ppl_num_samples, args.ppl_seq_len
+            )
+            comparison["perplexity"] = {"standard": std_ppl, "direct_quant": dq_ppl}
+            if std_ppl["success"] and dq_ppl["success"]:
+                ppl_delta_pct = round(
+                    100.0
+                    * (dq_ppl["perplexity"] - std_ppl["perplexity"])
+                    / max(std_ppl["perplexity"], 1e-9),
+                    2,
+                )
+                comparison["perplexity"]["delta_pct"] = ppl_delta_pct
+                print(
+                    f"\n{'':=<60}\n"
+                    f"  Perplexity ({args.ppl_dataset}, "
+                    f"{args.ppl_num_samples}x{args.ppl_seq_len})\n"
+                    f"{'':=<60}\n"
+                    f"  standard     ={std_ppl['perplexity']:.4f} "
+                    f"(±{std_ppl['std_error']:.4f})\n"
+                    f"  direct-quant ={dq_ppl['perplexity']:.4f} "
+                    f"(±{dq_ppl['std_error']:.4f})\n"
+                    f"  delta        ={ppl_delta_pct:+.2f}%\n"
+                    f"{'':=<60}"
+                )
+            else:
+                for label, res in (("standard", std_ppl), ("direct-quant", dq_ppl)):
+                    if not res["success"]:
+                        print(f"  ⚠ perplexity ({label}) skipped: {res['error']}")
+            rendered = json.dumps(comparison, indent=2)
+            print(rendered)
+            if args.result_json:
+                args.result_json.write_text(rendered + "\n", encoding="utf-8")
         return 0 if (std["success"] and dq["success"]) else 1
 
     result = _run_one(args, args.output, direct_quant=args.direct_quant)
+    if args.eval_ppl and result["success"]:
+        print("\nMeasuring perplexity...")
+        result["perplexity"] = _eval_ppl_on_dir(
+            args.output, args.ppl_dataset, args.ppl_num_samples, args.ppl_seq_len
+        )
+        ppl = result["perplexity"]
+        if ppl["success"]:
+            print(
+                f"  Perplexity ({ppl['dataset']}): "
+                f"{ppl['perplexity']:.4f} (±{ppl['std_error']:.4f})"
+            )
+        else:
+            print(f"  ⚠ perplexity skipped: {ppl['error']}")
     rendered = json.dumps(result, indent=2)
     print(rendered)
     if args.result_json:

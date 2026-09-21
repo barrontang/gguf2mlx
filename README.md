@@ -285,6 +285,21 @@ Plain conversion output is dequantized and can be substantially larger than the
 original GGUF quantized file. Use `--quantize --q-bits 4 --q-group-size 64` when
 you want compact MLX-LM quantized output.
 
+To attach a quality guardrail, add `--eval-ppl`: after conversion the harness
+loads each output with `mlx_lm` and measures perplexity on a fixed corpus, so you
+can see how much accuracy the GGUF-to-MLX round trip costs relative to a baseline.
+Perplexity failures never abort the benchmark; they are recorded as
+`success: false` in the JSON.
+
+```bash
+uv run --extra mlx benchmarks/benchmark_conversion.py \
+  --input ./model-Q4_K_M.gguf \
+  --output ./benchmark-model-mlx-4bit \
+  --quantize --compare --eval-ppl \
+  --ppl-dataset wikitext --ppl-num-samples 32 --ppl-seq-len 512 \
+  --result-json ./benchmark-results/model-4bit.json
+```
+
 ## Choosing the right tool
 
 | Starting point | Goal | Recommended tool |
@@ -395,12 +410,16 @@ Completed:
 - StableLM conversion adapter (norm_eps, partial_rotary_factor, qk_layernorm, use_parallel_residual)
 - `mlx_lm.load()` parity validation test for `--direct-quant` output (`tests/test_e2e.py`)
 - opt-in real-GGUF convert + `mlx_lm.load()` finite-logit validation for gemma and phi3 fixtures (`tests/test_e2e.py`)
+- `--eval-ppl` perplexity guardrail in the benchmark harness (reuses `mlx_lm.perplexity`; reports standard vs `--direct-quant` PPL delta)
 
 Remaining areas for contributors:
 
-- extend the opt-in real-GGUF load test to remaining conversion-enabled architectures
-- publish fixed-corpus perplexity deltas comparing `--direct-quant` output against `mlx_lm.convert` baseline
+- publish fixed-corpus perplexity numbers from `--eval-ppl` (standard vs `--direct-quant` vs `mlx_lm.convert`) so users can judge round-trip accuracy loss
+- sensitivity-aware bit retention in `--direct-quant`: keep the source per-tensor precision from K-quant inputs (Q6_K/Q8_0 layers stay higher-bit) instead of flattening every layer to 4-bit — an information advantage `mlx_lm.convert` cannot replicate from GGUF
+- extend the opt-in real-GGUF load test to the remaining conversion-enabled architectures (several are declared supported but have no end-to-end coverage; the `safe_open` bug showed how those paths silently rot)
+- canonical chat-template fallback table for known model families when GGUF-embedded Jinja templates are missing or broken, plus post-conversion template render validation
 - publish peak RSS and output-size comparison results from `benchmarks/benchmark_conversion.py --compare`
+- evaluate GGUF→MLX conversion for high-demand non-text models (e.g. ASR/embedding) where competition is thin (pending verification that such models ship GGUF)
 - add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks
 - broader tokenizer fixture coverage for architecture-specific normalizers,
   byte fallback variants, and added-token edge cases
