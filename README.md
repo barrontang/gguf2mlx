@@ -394,10 +394,11 @@ Completed:
 - bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, llama/gemma/mistral/qwen2/stablelm, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K–Q8_K/BF16 source qtypes)
 - StableLM conversion adapter (norm_eps, partial_rotary_factor, qk_layernorm, use_parallel_residual)
 - `mlx_lm.load()` parity validation test for `--direct-quant` output (`tests/test_e2e.py`)
+- opt-in real-GGUF convert + `mlx_lm.load()` finite-logit validation for gemma and phi3 fixtures (`tests/test_e2e.py`)
 
 Remaining areas for contributors:
 
-- add opt-in real-GGUF load and logit validation for each fixture-backed adapter
+- extend the opt-in real-GGUF load test to remaining conversion-enabled architectures
 - publish fixed-corpus perplexity deltas comparing `--direct-quant` output against `mlx_lm.convert` baseline
 - publish peak RSS and output-size comparison results from `benchmarks/benchmark_conversion.py --compare`
 - add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks

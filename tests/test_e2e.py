@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+import numpy as np
+
 from gguf2mlx import gguf2mlx as core
 
 RUN_E2E = os.getenv("GGUF2MLX_RUN_E2E") == "1"
@@ -232,6 +234,122 @@ def test_quantized_output_loads_with_mlx_lm(tmp_path: Path, monkeypatch: pytest.
 
     logits = model(mx.array([[3, 4]], dtype=mx.int32))
     assert logits.shape == (1, 2, 32)
+
+
+def _build_tiny_gguf(path: Path, arch: str) -> None:
+    """Synthesize a minimal but structurally valid GGUF for a fixture-backed arch.
+
+    Weights are small random values; the goal is a file that survives the full
+    convert() pipeline and loads under mlx_lm with finite logits, not numerical
+    fidelity.
+    """
+    import gguf
+
+    vocab, hidden, heads, ffn = 32, 16, 4, 32
+    head_dim = hidden // heads
+
+    writer = gguf.GGUFWriter(str(path), arch)
+    writer.add_name(f"tiny-{arch}")
+    writer.add_block_count(1)
+    writer.add_embedding_length(hidden)
+    writer.add_feed_forward_length(ffn)
+    writer.add_head_count(heads)
+    writer.add_file_type(1)
+
+    tokens = [f"<t{i}>" for i in range(vocab)]
+    tokens[0], tokens[1], tokens[2] = "<unk>", "<s>", "</s>"
+    token_types = [1] * vocab
+    token_types[0], token_types[1], token_types[2] = 2, 3, 3
+    writer.add_tokenizer_model("llama")
+    writer.add_token_list(tokens)
+    writer.add_token_scores([0.0] * vocab)
+    writer.add_token_types(token_types)
+    writer.add_bos_token_id(1)
+    writer.add_eos_token_id(2)
+    writer.add_unk_token_id(0)
+
+    rng = np.random.default_rng(abs(hash(arch)) % (2**32))
+
+    def rand(*shape: int) -> "np.ndarray":
+        return (rng.standard_normal(shape) * 0.02).astype(np.float32)
+
+    if arch == "gemma":
+        kv_heads = 2
+        writer.add_head_count_kv(kv_heads)
+        writer.add_key_length(head_dim)
+        writer.add_value_length(head_dim)
+        writer.add_context_length(128)
+        writer.add_layer_norm_rms_eps(1e-6)
+        writer.add_tensor("token_embd.weight", rand(vocab, hidden))
+        writer.add_tensor("output_norm.weight", rand(hidden))
+        writer.add_tensor("blk.0.attn_q.weight", rand(heads * head_dim, hidden))
+        writer.add_tensor("blk.0.attn_k.weight", rand(kv_heads * head_dim, hidden))
+        writer.add_tensor("blk.0.attn_v.weight", rand(kv_heads * head_dim, hidden))
+        writer.add_tensor("blk.0.attn_output.weight", rand(hidden, heads * head_dim))
+        writer.add_tensor("blk.0.attn_norm.weight", rand(hidden))
+        writer.add_tensor("blk.0.ffn_norm.weight", rand(hidden))
+        writer.add_tensor("blk.0.ffn_gate.weight", rand(ffn, hidden))
+        writer.add_tensor("blk.0.ffn_up.weight", rand(ffn, hidden))
+        writer.add_tensor("blk.0.ffn_down.weight", rand(hidden, ffn))
+    elif arch == "phi3":
+        kv_heads = heads  # keep q/k/v head counts equal for the fused qkv path
+        writer.add_head_count_kv(kv_heads)
+        writer.add_context_length(4096)
+        writer.add_layer_norm_rms_eps(1e-5)
+        writer.add_rope_dimension_count(head_dim)
+        writer.add_tensor("token_embd.weight", rand(vocab, hidden))
+        writer.add_tensor("output.weight", rand(vocab, hidden))  # untied lm_head
+        writer.add_tensor("output_norm.weight", rand(hidden))
+        writer.add_tensor("blk.0.attn_q.weight", rand(heads * head_dim, hidden))
+        writer.add_tensor("blk.0.attn_k.weight", rand(kv_heads * head_dim, hidden))
+        writer.add_tensor("blk.0.attn_v.weight", rand(kv_heads * head_dim, hidden))
+        writer.add_tensor("blk.0.attn_output.weight", rand(hidden, heads * head_dim))
+        writer.add_tensor("blk.0.attn_norm.weight", rand(hidden))
+        writer.add_tensor("blk.0.ffn_norm.weight", rand(hidden))
+        writer.add_tensor("blk.0.ffn_up.weight", rand(2 * ffn, hidden))  # gate_up_proj
+        writer.add_tensor("blk.0.ffn_down.weight", rand(hidden, ffn))
+    else:  # pragma: no cover - guard against silent misuse
+        raise ValueError(f"No tiny-GGUF builder for arch {arch!r}")
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+@pytest.mark.parametrize("arch", ["gemma", "phi3"])
+def test_real_gguf_converts_and_loads_with_finite_logits(arch: str, tmp_path: Path):
+    """Convert a synthesized real GGUF end-to-end and validate mlx_lm forward pass.
+
+    This exercises the full pipeline (no monkeypatching): GGUFReader, tokenizer
+    extraction, tensor dequant/remap, safetensors shard finalization, then
+    mlx_lm.load() and a forward pass that must produce finite logits.
+    """
+    pytest.importorskip("gguf")
+    pytest.importorskip("mlx")
+    pytest.importorskip("mlx_lm")
+    pytest.importorskip("safetensors")
+    pytest.importorskip("tokenizers")
+    pytest.importorskip("transformers")
+
+    import mlx.core as mx
+    from mlx_lm import load
+
+    gguf_path = tmp_path / f"{arch}.gguf"
+    _build_tiny_gguf(gguf_path, arch)
+
+    output_dir = tmp_path / f"{arch}-mlx"
+    assert core.convert(str(gguf_path), str(output_dir), dtype="float16") is True
+
+    index_path = output_dir / "model.safetensors.index.json"
+    assert index_path.exists(), "conversion did not finalize a safetensors index"
+
+    model, tokenizer, config = load(str(output_dir), return_config=True)
+    assert config["model_type"] == arch
+
+    logits = model(mx.array([[1, 3, 4, 5]], dtype=mx.int32))
+    assert logits.shape == (1, 4, config["vocab_size"])
+    assert mx.isfinite(logits).all().item()
 
 
 @pytest.mark.parametrize("fixture_name", ["gemma", "phi3"])
