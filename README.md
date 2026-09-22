@@ -51,13 +51,13 @@ already-quantized GGUF file.
 
 ```bash
 # Base converter
-pip install "gguf2mlx @ git+https://github.com/barrontang/gguf2mlx.git"
+pip install gguf2mlx
 
 # Converter + MLX runtime for loading converted models
-pip install "gguf2mlx[mlx] @ git+https://github.com/barrontang/gguf2mlx.git"
+pip install "gguf2mlx[mlx]"
 
 # Or with uv
-uv add "gguf2mlx[mlx] @ git+https://github.com/barrontang/gguf2mlx.git"
+uv add "gguf2mlx[mlx]"
 ```
 
 The `mlx` extra installs both `mlx` and `mlx-lm`.
