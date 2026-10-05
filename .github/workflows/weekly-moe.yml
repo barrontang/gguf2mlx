@@ -15,7 +15,6 @@ jobs:
     env:
       GGUF2MLX_RUN_E2E: "1"
       GGUF2MLX_MOE_MODELS: ${{ vars.GGUF2MLX_MOE_MODELS }}
-      GGUF2MLX_ROUTER_LOGITS_DIR: ${{ vars.GGUF2MLX_ROUTER_LOGITS_DIR }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -23,6 +22,20 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -e ".[dev,mlx]"
+      - name: Require both configured model fixtures
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          models = json.loads(os.environ.get("GGUF2MLX_MOE_MODELS", "{}"))
+          required = {"qwen3moe", "deepseek2"}
+          missing = required - models.keys()
+          unavailable = [name for name in required if name in models and not Path(models[name]).is_file()]
+          if missing or unavailable:
+              raise SystemExit(f"MoE fixtures missing={sorted(missing)}, unavailable={sorted(unavailable)}")
+          PY
       - name: Run two-family MoE validation
         run: >-
           pytest tests/test_e2e.py

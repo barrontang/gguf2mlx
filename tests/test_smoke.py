@@ -434,6 +434,27 @@ def test_build_config_stablelm_overrides():
     assert config["tie_word_embeddings"] is False
 
 
+def test_build_config_glm4moe_includes_expert_metadata():
+    reader = _FakeReader(
+        {
+            "general.name": "glm4-moe-test",
+            "tokenizer.ggml.tokens": ["<unk>", "<s>", "</s>"],
+            "glm4moe.embedding_length": 64,
+            "glm4moe.block_count": 2,
+            "glm4moe.attention.head_count": 4,
+            "glm4moe.feed_forward_length": 128,
+            "glm4moe.expert_feed_forward_length": 32,
+            "glm4moe.expert_count": 8,
+            "glm4moe.expert_used_count": 2,
+        }
+    )
+    config = core.build_config(reader, "glm4moe", "float16")
+    assert config["model_type"] == "glm4_moe"
+    assert config["num_experts"] == 8
+    assert config["num_experts_per_tok"] == 2
+    assert config["moe_intermediate_size"] == 32
+
+
 def test_quantize_affine_4bit_roundtrip_shape_and_dtype():
     arr = np.arange(128, dtype=np.float32).reshape(2, 64)
     packed, scales, biases = core._quantize_affine_4bit(arr, 64)

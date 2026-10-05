@@ -526,7 +526,15 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
     ) or get_metadata_int(reader, f"{arch}.attention.head_count_kv") or num_heads
 
     # MoE: expert feed-forward length may differ from shared FFN
-    if arch in ("qwen2moe", "qwen3moe", "deepseek2", "deepseek3", "dbrx", "grok-1"):
+    if arch in (
+        "qwen2moe",
+        "qwen3moe",
+        "deepseek2",
+        "deepseek3",
+        "glm4moe",
+        "dbrx",
+        "grok-1",
+    ):
         ffn_size = get_metadata_int(
             reader, f"{arch}.expert_feed_forward_length"
         ) or get_metadata_int(reader, f"{arch}.feed_forward_length") or (hidden_size * 4)
@@ -612,7 +620,15 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
     }
 
     # --- Architecture-specific overrides ---
-    if arch in ("qwen2moe", "deepseek2", "deepseek3", "qwen3moe", "dbrx", "grok-1"):
+    if arch in (
+        "qwen2moe",
+        "deepseek2",
+        "deepseek3",
+        "qwen3moe",
+        "glm4moe",
+        "dbrx",
+        "grok-1",
+    ):
         num_experts = get_metadata_int(reader, f"{arch}.expert_count") or 8
         num_experts_per_tok = get_metadata_int(
             reader, f"{arch}.expert_used_count"
@@ -624,6 +640,7 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
             "qwen3moe": "qwen3_moe",
             "deepseek2": "deepseek_v2",
             "deepseek3": "deepseek_v3",
+            "glm4moe": "glm4_moe",
         }.get(arch, hf_model_type)
 
         # MoE-specific config fields

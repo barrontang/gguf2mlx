@@ -376,7 +376,6 @@ GGUF2MLX_RUN_E2E=1 pytest tests/test_e2e.py
 # Real MoE validation (two families, finite logits, router entropy, generation)
 GGUF2MLX_RUN_E2E=1 \
 GGUF2MLX_MOE_MODELS='{"qwen3moe":"/models/qwen3.gguf","deepseek2":"/models/deepseek2.gguf"}' \
-GGUF2MLX_ROUTER_LOGITS_DIR=/models/router-logits \
 pytest tests/test_e2e.py -k real_moe
 
 # Validate an embedded chat template against five conversation shapes

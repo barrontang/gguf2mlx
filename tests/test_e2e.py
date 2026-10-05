@@ -409,6 +409,18 @@ def _normalized_router_entropy(router_logits: np.ndarray) -> float:
     return float(np.mean(entropy / np.log(router_logits.shape[-1])))
 
 
+def _extract_router_logits(model, token_ids: list[int]) -> np.ndarray:
+    import mlx.core as mx
+
+    model_body = getattr(model, "model", model)
+    embeddings = model_body.embed_tokens(mx.array([token_ids], dtype=mx.int32))
+    for layer in model_body.layers:
+        gate = getattr(getattr(layer, "mlp", None), "gate", None)
+        if callable(gate):
+            return np.asarray(gate(embeddings))
+    raise AssertionError("Converted MoE model exposes no callable router gate")
+
+
 @pytest.mark.parametrize("arch", ["qwen3moe", "deepseek2"])
 def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
     arch: str, tmp_path: Path
@@ -421,10 +433,6 @@ def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
     source = model_paths.get(arch)
     if not source:
         pytest.skip(f"GGUF2MLX_MOE_MODELS does not provide {arch}")
-    router_logits_dir = os.getenv("GGUF2MLX_ROUTER_LOGITS_DIR")
-    if not router_logits_dir:
-        pytest.skip("GGUF2MLX_ROUTER_LOGITS_DIR is required for routing entropy validation")
-
     output_dir = tmp_path / f"{arch}-mixed"
     assert core.convert(
         source,
@@ -445,7 +453,7 @@ def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
     logits = model(mx.array([token_ids], dtype=mx.int32))
     assert mx.isfinite(logits).all().item()
 
-    router_logits = np.load(Path(router_logits_dir) / f"{arch}.npy")
+    router_logits = _extract_router_logits(model, token_ids)
     entropy = _normalized_router_entropy(router_logits)
     assert 0.05 < entropy < 0.95
 
