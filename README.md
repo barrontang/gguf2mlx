@@ -82,8 +82,15 @@ gguf2mlx --input model.gguf --output ./mlx-model
 # GGUF -> 4-bit MLX in one command
 gguf2mlx --input model-Q4.gguf --output ./mlx-model-4bit --quantize --q-bits 4 --q-group-size 64
 
-# Bounded-memory direct quantization (llama, gemma, mistral, qwen2, stablelm)
+# Bounded-memory direct quantization
 gguf2mlx --input model-Q4.gguf --output ./mlx-model-4bit-direct --quantize --direct-quant --q-bits 4 --q-group-size 64 --q-mode affine
+
+# Experimental MoE mixed precision: FP16 attention/router + 4-bit experts
+gguf2mlx --input qwen3-moe.gguf --output ./qwen3-moe-mixed \
+  --quantize --direct-quant --mixed-precision
+
+# Validate the mixed artifact contract before loading it in a compatible runtime
+python -m gguf2mlx.mixed_validation ./qwen3-moe-mixed
 
 # Float32 output
 gguf2mlx --input model.gguf --output ./mlx-model-f32 --dtype float32
@@ -192,16 +199,20 @@ enables conversion for 12 identifiers.
 
 ### Conversion-enabled architectures
 
-| Family | GGUF architecture IDs | Status |
-|---|---|---|
-| Llama | `llama`, `mistral` | Conversion enabled |
-| Qwen | `qwen2`, `qwen2moe`, `qwen3moe` | Conversion enabled |
-| DeepSeek | `deepseek2`, `deepseek3` | Conversion enabled |
-| GLM | `glm4moe` | Conversion enabled |
-| Gemma | `gemma` | Fixture-validated adapter |
-| Phi | `phi3` | Phi-3 4K fixture-validated adapter |
-| StableLM | `stablelm` | Conversion enabled |
-| GLM | `glm-dsa` | Experimental conversion only |
+| Family | GGUF architecture IDs | Conversion | End-to-end | MoE | VLM |
+|---|---|---|---|---|---|
+| Llama | `llama`, `mistral` | ✅ | ⚠️ direct-quant synthetic | ❌ | ❌ |
+| Qwen | `qwen2` | ✅ | ⚠️ direct-quant synthetic | ❌ | ❌ |
+| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ⚠️ scheduled opt-in | ✅ | ❌ |
+| DeepSeek | `deepseek2`, `deepseek3` | ✅ | ⚠️ scheduled opt-in | ✅ | ❌ |
+| GLM | `glm4moe` | ✅ | ❌ | ✅ | ❌ |
+| Gemma | `gemma` | ✅ fixture-validated | ✅ synthetic GGUF | ❌ | ❌ |
+| Phi | `phi3` | ✅ Phi-3 4K fixture-validated | ✅ synthetic GGUF | ❌ | ❌ |
+| StableLM | `stablelm` | ✅ | ❌ | ❌ | ❌ |
+| GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ❌ |
+
+“Conversion” means that a code path exists. “End-to-end” means a converted model
+has been loaded and exercised; ⚠️ rows still require the opt-in model fixtures.
 
 Gemma 2/3 and Phi-3 LongRoPE are different layouts and are not included in the
 basic Gemma or Phi-3 4K support claim.
@@ -249,6 +260,10 @@ This project is intentionally more honest about scope now:
 - **Performance claims depend on model, prompt, hardware, and MLX-LM version**
 - **Phi-3 LongRoPE is rejected** until its factor tensors are represented safely
   in the generated MLX configuration
+- **Mixed-precision MoE output is experimental.** It writes
+  `jang_config.json` and requires a JANG-compatible runtime. No specific JANG
+  runtime is claimed as verified yet; use uniform output when interoperability
+  validation is unavailable.
 
 If you need guaranteed support for a new family, open an issue with the exact
 GGUF architecture and source model.
@@ -358,6 +373,15 @@ pytest
 # Opt-in MLX-LM integration test (Apple Silicon)
 GGUF2MLX_RUN_E2E=1 pytest tests/test_e2e.py
 
+# Real MoE validation (two families, finite logits, router entropy, generation)
+GGUF2MLX_RUN_E2E=1 \
+GGUF2MLX_MOE_MODELS='{"qwen3moe":"/models/qwen3.gguf","deepseek2":"/models/deepseek2.gguf"}' \
+GGUF2MLX_ROUTER_LOGITS_DIR=/models/router-logits \
+pytest tests/test_e2e.py -k real_moe
+
+# Validate an embedded chat template against five conversation shapes
+python -m gguf2mlx.chat_validation ./converted-model --expect-marker '<|im_start|>'
+
 # Lint
 ruff check src/ tests/ benchmarks/
 ```
@@ -393,6 +417,9 @@ Recent regression coverage includes:
 - atomic staging cleanup on failed writes
 - MLX-LM quantization error handling
 - opt-in `mlx_lm.load()` validation of quantized output
+- fail-closed MoE router detection and per-tensor precision reports
+- tokenizer fixtures for 10 architectures, byte fallback, and 20 added tokens
+- chat-template rendering for single-turn, multi-turn, system, tool, and reasoning shapes
 
 ---
 
@@ -406,7 +433,9 @@ Completed:
 - fixture-backed Gemma and standard Phi-3 4K adapters
 - GGUF tokenizer flags and embedded tokenizer JSON preservation
 - reproducible conversion benchmark harness
-- bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, llama/gemma/mistral/qwen2/stablelm, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K–Q8_K/BF16 source qtypes)
+- bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, dense and declared MoE adapters, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K–Q8_K/BF16 source qtypes)
+- fail-closed MoE detection, default router protection, mixed-precision artifact output, and JSON conversion reports
+- required tokenizer/chat-template CI plus scheduled opt-in two-family MoE validation
 - StableLM conversion adapter (norm_eps, partial_rotary_factor, qk_layernorm, use_parallel_residual)
 - `mlx_lm.load()` parity validation test for `--direct-quant` output (`tests/test_e2e.py`)
 - opt-in real-GGUF convert + `mlx_lm.load()` finite-logit validation for gemma and phi3 fixtures (`tests/test_e2e.py`)
@@ -415,14 +444,13 @@ Completed:
 Remaining areas for contributors:
 
 - publish fixed-corpus perplexity numbers from `--eval-ppl` (standard vs `--direct-quant` vs `mlx_lm.convert`) so users can judge round-trip accuracy loss
-- sensitivity-aware bit retention in `--direct-quant`: keep the source per-tensor precision from K-quant inputs (Q6_K/Q8_0 layers stay higher-bit) instead of flattening every layer to 4-bit — an information advantage `mlx_lm.convert` cannot replicate from GGUF
+- verify `gguf2mlx-mixed-v1` with a named JANG runtime; until then the format remains experimental
 - extend the opt-in real-GGUF load test to the remaining conversion-enabled architectures (several are declared supported but have no end-to-end coverage; the `safe_open` bug showed how those paths silently rot)
-- canonical chat-template fallback table for known model families when GGUF-embedded Jinja templates are missing or broken, plus post-conversion template render validation
+- canonical chat-template fallback table for known model families when GGUF-embedded Jinja templates are missing or broken
 - publish peak RSS and output-size comparison results from `benchmarks/benchmark_conversion.py --compare`
 - evaluate GGUF→MLX conversion for high-demand non-text models (e.g. ASR/embedding) where competition is thin (pending verification that such models ship GGUF)
 - add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks
-- broader tokenizer fixture coverage for architecture-specific normalizers,
-  byte fallback variants, and added-token edge cases
+- publish additional architecture-specific tokenizer normalizer fixtures as upstream formats evolve
 
 ---
 

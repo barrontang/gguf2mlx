@@ -13,6 +13,7 @@ import pytest
 import numpy as np
 
 from gguf2mlx import gguf2mlx as core
+from gguf2mlx.mixed_validation import validate_mixed_artifacts
 
 RUN_E2E = os.getenv("GGUF2MLX_RUN_E2E") == "1"
 ARCH_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "architectures"
@@ -401,3 +402,57 @@ def test_adapter_fixture_matches_mlx_lm_parameter_contract(fixture_name: str):
     model_keys = {name for name, _ in tree_flatten(model.parameters())}
     expected_keys = set(fixture["tensor_map"].values())
     assert expected_keys <= model_keys
+
+
+def _normalized_router_entropy(router_logits: "np.ndarray") -> float:
+    shifted = router_logits - router_logits.max(axis=-1, keepdims=True)
+    probabilities = np.exp(shifted)
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    entropy = -(probabilities * np.log(probabilities + 1e-12)).sum(axis=-1)
+    return float(np.mean(entropy / np.log(router_logits.shape[-1])))
+
+
+@pytest.mark.parametrize("arch", ["qwen3moe", "deepseek2"])
+def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
+    arch: str, tmp_path: Path
+):
+    """Opt-in real-model contract used by the scheduled Apple Silicon workflow."""
+    pytest.importorskip("mlx")
+    pytest.importorskip("mlx_lm")
+
+    model_paths = json.loads(os.getenv("GGUF2MLX_MOE_MODELS", "{}"))
+    source = model_paths.get(arch)
+    if not source:
+        pytest.skip(f"GGUF2MLX_MOE_MODELS does not provide {arch}")
+    router_logits_dir = os.getenv("GGUF2MLX_ROUTER_LOGITS_DIR")
+    if not router_logits_dir:
+        pytest.skip("GGUF2MLX_ROUTER_LOGITS_DIR is required for routing entropy validation")
+
+    output_dir = tmp_path / f"{arch}-mixed"
+    assert core.convert(
+        source,
+        str(output_dir),
+        quantize=True,
+        direct_quant=True,
+        mixed_precision=True,
+    )
+    validate_mixed_artifacts(output_dir)
+
+    import mlx.core as mx
+    from mlx_lm import generate, load
+
+    uniform_dir = tmp_path / f"{arch}-uniform"
+    assert core.convert(source, str(uniform_dir), quantize=True, direct_quant=True)
+    model, tokenizer = load(str(uniform_dir))
+    token_ids = tokenizer.encode("Explain why the sky is blue.", add_special_tokens=False)
+    logits = model(mx.array([token_ids], dtype=mx.int32))
+    assert mx.isfinite(logits).all().item()
+
+    router_logits = np.load(Path(router_logits_dir) / f"{arch}.npy")
+    entropy = _normalized_router_entropy(router_logits)
+    assert 0.05 < entropy < 0.95
+
+    output = generate(model, tokenizer, prompt="Explain why the sky is blue.", max_tokens=32)
+    generated_tokens = tokenizer.encode(output, add_special_tokens=False)
+    assert output.isprintable()
+    assert len(set(generated_tokens)) >= max(2, len(generated_tokens) // 8)
