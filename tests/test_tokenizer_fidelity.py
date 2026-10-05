@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+import pytest
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
 from gguf2mlx import gguf2mlx as core
+
+TOKENIZER_FIXTURES = json.loads(
+    (Path(__file__).parent / "fixtures" / "tokenizer_cases.json").read_text(encoding="utf-8")
+)
 
 
 class _FakeField:
@@ -24,6 +30,35 @@ class _FakeReader:
     def get_field(self, key):
         value = self._mapping.get(key)
         return None if value is None else _FakeField(value)
+
+
+@pytest.mark.parametrize("fixture", TOKENIZER_FIXTURES, ids=lambda fixture: fixture["name"])
+def test_tokenizer_json_fixtures(fixture):
+    tokenizer_json = core._build_tokenizer_json(
+        fixture["tokens"],
+        fixture["token_types"],
+        [],
+        fixture["scores"],
+        fixture["model_type"],
+        bos_id=1,
+        eos_id=2,
+        pad_id=0,
+        arch=fixture["arch"],
+    )
+
+    assert tokenizer_json["normalizer"] == fixture["expected_normalizer"]
+    assert tokenizer_json["model"]["byte_fallback"] is fixture["expected_byte_fallback"]
+    Tokenizer.from_str(json.dumps(tokenizer_json))
+
+    if "expected_added_tokens" in fixture:
+        actual = [
+            {
+                key: added_token[key]
+                for key in ("id", "content", "normalized", "special")
+            }
+            for added_token in tokenizer_json["added_tokens"]
+        ]
+        assert actual == fixture["expected_added_tokens"]
 
 
 def test_wordpiece_tokenizer_json_encodes_reference_text():

@@ -1072,6 +1072,7 @@ def extract_tokenizer(
             pad_id,
             unk_id=unk_id,
             add_space_prefix=add_space_prefix,
+            arch=arch,
         )
     if tokenizer_json:
         with open(output_dir / "tokenizer.json", "w") as f:
@@ -1090,6 +1091,7 @@ def _build_tokenizer_json(
     pad_id: int,
     unk_id: int = 0,
     add_space_prefix: bool = True,
+    arch: str = "llama",
 ) -> dict:
     """Build a complete tokenizer.json for HuggingFace tokenizers."""
     vocab = {}
@@ -1120,6 +1122,11 @@ def _build_tokenizer_json(
             normal_tokens.append(token)
 
     normalized_model_type = model_type.lower()
+    has_byte_fallback = any(
+        (token_types[i] if i < len(token_types) else 1) == 6
+        or re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", token) is not None
+        for i, token in enumerate(tokens)
+    )
 
     # Build model block
     if normalized_model_type in ("bpe", "gpt2"):
@@ -1130,7 +1137,7 @@ def _build_tokenizer_json(
             "continuing_subword_prefix": "",
             "end_of_word_suffix": "",
             "fuse_unk": False,
-            "byte_fallback": False,
+            "byte_fallback": has_byte_fallback,
             "vocab": vocab,
             "merges": merges if merges else [],
         }
@@ -1143,7 +1150,7 @@ def _build_tokenizer_json(
             "type": "Unigram",
             "unk_id": unk_id,
             "vocab": vocab_scores,
-            "byte_fallback": any(token.startswith("<0x") and token.endswith(">") for token in tokens),
+            "byte_fallback": has_byte_fallback,
         }
     elif normalized_model_type == "wordpiece":
         model_block = {
@@ -1156,7 +1163,7 @@ def _build_tokenizer_json(
     else:
         raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
 
-    normalizer = {"type": "NFC"}
+    normalizer = {"type": "NFKC" if arch == "t5" else "NFC"}
     pre_tokenizer = {
         "type": "Sequence",
         "pretokenizers": [
@@ -1188,6 +1195,9 @@ def _build_tokenizer_json(
         "trim_offsets": False,
         "use_regex": False,
     }
+
+    if normalized_model_type in ("bpe", "gpt2"):
+        normalizer = None
 
     if normalized_model_type in ("spm", "sentencepiece", "unigram", "llama"):
         pre_tokenizer = {
