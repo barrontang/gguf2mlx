@@ -1551,7 +1551,7 @@ def _finalize_safetensor_shards(output_dir: Path, total_bytes_out: int) -> tuple
         new_path = output_dir / new_name
         old_path.rename(new_path)
         with safe_open(str(new_path), framework="np") as f:
-            for key in f.keys():
+            for key in f:
                 weight_map[key] = new_name
 
     index_json = {

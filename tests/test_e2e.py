@@ -8,9 +8,8 @@ import platform
 from dataclasses import asdict
 from pathlib import Path
 
-import pytest
-
 import numpy as np
+import pytest
 
 from gguf2mlx import gguf2mlx as core
 from gguf2mlx.mixed_validation import validate_mixed_artifacts
@@ -91,9 +90,9 @@ def _write_tiny_mlx_llama_model(model_dir: Path) -> None:
 def _write_tiny_mlx_llama_model_quantized(model_dir: Path) -> None:
     """Write a tiny direct-quant-style MLX llama model (packed int4 weights)."""
     import mlx.core as mx
+    from mlx import nn
     from mlx_lm.models.llama import Model, ModelArgs
     from mlx_lm.utils import save_model
-    from mlx import nn
 
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -116,18 +115,16 @@ def _write_tiny_mlx_llama_model_quantized(model_dir: Path) -> None:
     (model_dir / "config.json").write_text(
         json.dumps(
             {
-                **{
-                    "model_type": "llama",
-                    "hidden_size": 32,
-                    "num_hidden_layers": 1,
-                    "intermediate_size": 64,
-                    "num_attention_heads": 4,
-                    "rms_norm_eps": 1e-5,
-                    "vocab_size": 32,
-                    "max_position_embeddings": 32,
-                    "tie_word_embeddings": True,
-                    "torch_dtype": "float16",
-                },
+                "model_type": "llama",
+                "hidden_size": 32,
+                "num_hidden_layers": 1,
+                "intermediate_size": 64,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 32,
+                "max_position_embeddings": 32,
+                "tie_word_embeddings": True,
+                "torch_dtype": "float16",
                 "quantization": {"bits": 4, "group_size": 32, "mode": "affine"},
             },
             indent=2,
@@ -273,7 +270,7 @@ def _build_tiny_gguf(path: Path, arch: str) -> None:
 
     rng = np.random.default_rng(abs(hash(arch)) % (2**32))
 
-    def rand(*shape: int) -> "np.ndarray":
+    def rand(*shape: int) -> np.ndarray:
         return (rng.standard_normal(shape) * 0.02).astype(np.float32)
 
     if arch == "gemma":
@@ -347,7 +344,7 @@ def test_real_gguf_converts_and_loads_with_finite_logits(arch: str, tmp_path: Pa
     index_path = output_dir / "model.safetensors.index.json"
     assert index_path.exists(), "conversion did not finalize a safetensors index"
 
-    model, tokenizer, config = load(str(output_dir), return_config=True)
+    model, _tokenizer, config = load(str(output_dir), return_config=True)
     assert config["model_type"] == arch
 
     logits = model(mx.array([[1, 3, 4, 5]], dtype=mx.int32))
@@ -404,7 +401,7 @@ def test_adapter_fixture_matches_mlx_lm_parameter_contract(fixture_name: str):
     assert expected_keys <= model_keys
 
 
-def _normalized_router_entropy(router_logits: "np.ndarray") -> float:
+def _normalized_router_entropy(router_logits: np.ndarray) -> float:
     shifted = router_logits - router_logits.max(axis=-1, keepdims=True)
     probabilities = np.exp(shifted)
     probabilities /= probabilities.sum(axis=-1, keepdims=True)

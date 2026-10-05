@@ -8,7 +8,6 @@ from tokenizers.models import WordLevel
 
 from gguf2mlx import gguf2mlx as core
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "tokenizers" / "architectures.json"
 
 

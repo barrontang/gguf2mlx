@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 CONVERSATION_SHAPES: dict[str, list[dict[str, Any]]] = {
     "single_turn": [
         {"role": "user", "content": "Hello"},

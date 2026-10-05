@@ -4,7 +4,6 @@ import pytest
 
 from gguf2mlx.chat_validation import CONVERSATION_SHAPES, validate_chat_template
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "chat_templates" / "im_start.jinja"
 
 
