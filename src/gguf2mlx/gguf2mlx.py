@@ -1163,7 +1163,7 @@ def _build_tokenizer_json(
     else:
         raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
 
-    normalizer = {"type": "NFKC" if arch == "t5" else "NFC"}
+    normalizer = {"type": "NFKC" if arch.lower() == "t5" else "NFC"}
     pre_tokenizer = {
         "type": "Sequence",
         "pretokenizers": [
