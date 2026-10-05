@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
+from .rust_backend import classify_architecture as rust_classify_architecture
 from .rust_backend import detect_architecture as rust_detect_architecture
 
 # ---------------------------------------------------------------------------
@@ -238,7 +239,15 @@ CONVERTIBLE_ARCHES = {
 STRICT_ADAPTER_ARCHES = {"gemma", "phi3"}
 
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
-DIRECT_QUANT_SUPPORTED_ARCHES = {"llama", "gemma", "mistral", "qwen2", "stablelm"}
+MOE_ARCHES = {"qwen2moe", "qwen3moe", "deepseek2", "deepseek3", "glm4moe", "glm-dsa"}
+DIRECT_QUANT_SUPPORTED_ARCHES = {
+    "llama",
+    "gemma",
+    "mistral",
+    "qwen2",
+    "stablelm",
+    *MOE_ARCHES,
+}
 DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES = {
     2,   # Q4_0
     3,   # Q4_1
@@ -254,6 +263,28 @@ DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES = {
     30,  # BF16
 }
 DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES = 256 * 1024 * 1024
+
+_ROUTER_PATTERNS = (
+    "ffn_gate_inp.weight",
+    ".mlp.gate.weight",
+    ".router.weight",
+    "router.weight",
+)
+_EXPERT_PATTERNS = (
+    "ffn_gate_exps",
+    "ffn_up_exps",
+    "ffn_down_exps",
+    ".switch_mlp.",
+    ".experts.",
+)
+_ATTENTION_PATTERNS = (
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_output",
+    "attn_out",
+    ".self_attn.",
+)
 
 # Popular GGUF naming patterns that do not directly include a GGUF architecture key.
 # These are used only when `general.architecture` is missing.
@@ -295,6 +326,58 @@ def detect_architecture(reader: GGUFReader) -> str:
             if gguf_arch in name_lower:
                 return gguf_arch
     return "unknown"
+
+
+def classify_architecture(reader: GGUFReader, arch: str | None = None) -> str:
+    """Classify a GGUF tensor layout as dense, MoE, or hybrid."""
+    arch = arch or detect_architecture(reader)
+    tensor_names = [tensor.name for tensor in reader.tensors]
+    rust_kind = rust_classify_architecture(arch, tensor_names)
+    if rust_kind:
+        return rust_kind
+
+    has_experts = any(
+        any(pattern in name for pattern in _EXPERT_PATTERNS) for name in tensor_names
+    )
+    has_dense_mlp = any(
+        re.search(r"ffn_(gate|up|down)\.weight$", name) and "_exps" not in name
+        for name in tensor_names
+    )
+    if (arch in MOE_ARCHES or has_experts) and has_dense_mlp:
+        return "hybrid"
+    if arch in MOE_ARCHES or has_experts:
+        return "moe"
+    return "dense"
+
+
+def classify_tensor(gguf_name: str, hf_name: str | None = None) -> str:
+    """Return the precision-policy category for a tensor."""
+    names = (gguf_name, hf_name or "")
+    if any(pattern in name for name in names for pattern in _ROUTER_PATTERNS):
+        return "router"
+    if any(pattern in name for name in names for pattern in _EXPERT_PATTERNS):
+        return "expert_mlp"
+    if any(pattern in name for name in names for pattern in _ATTENTION_PATTERNS):
+        return "attention"
+    if gguf_name.startswith("blk.") and gguf_name.endswith(".weight"):
+        return "unknown"
+    return "other"
+
+
+def validate_moe_layout(reader: GGUFReader, arch: str, architecture_kind: str) -> None:
+    """Reject MoE layouts whose routing tensor cannot be identified."""
+    if architecture_kind not in {"moe", "hybrid"}:
+        return
+    router_names = [
+        tensor.name
+        for tensor in reader.tensors
+        if classify_tensor(tensor.name) == "router"
+    ]
+    if not router_names:
+        raise RuntimeError(
+            f"Detected {architecture_kind} architecture {arch!r}, but no recognized "
+            "router tensor was found; refusing conversion to avoid corrupt routing"
+        )
 
 
 def validate_architecture_variant(reader: GGUFReader, arch: str) -> str | None:
@@ -1122,7 +1205,17 @@ def _build_tokenizer_json(
     normalized_model_type = model_type.lower()
 
     # Build model block
+    has_byte_fallback = any(
+        (i < len(token_types) and token_types[i] == 6)
+        or (token.startswith("<0x") and token.endswith(">"))
+        for i, token in enumerate(tokens)
+    )
     if normalized_model_type in ("bpe", "gpt2"):
+        byte_fallback = any(
+            (i < len(token_types) and token_types[i] == 6)
+            or (token.startswith("<0x") and token.endswith(">"))
+            for i, token in enumerate(tokens)
+        )
         model_block = {
             "type": "BPE",
             "dropout": None,
@@ -1130,7 +1223,7 @@ def _build_tokenizer_json(
             "continuing_subword_prefix": "",
             "end_of_word_suffix": "",
             "fuse_unk": False,
-            "byte_fallback": False,
+            "byte_fallback": byte_fallback,
             "vocab": vocab,
             "merges": merges if merges else [],
         }
@@ -1188,6 +1281,19 @@ def _build_tokenizer_json(
         "trim_offsets": False,
         "use_regex": False,
     }
+    if normalized_model_type in ("bpe", "gpt2") and has_byte_fallback:
+        decoder = {
+            "type": "Sequence",
+            "decoders": [
+                {"type": "ByteFallback"},
+                {
+                    "type": "ByteLevel",
+                    "add_prefix_space": False,
+                    "trim_offsets": False,
+                    "use_regex": False,
+                },
+            ],
+        }
 
     if normalized_model_type in ("spm", "sentencepiece", "unigram", "llama"):
         pre_tokenizer = {
@@ -1393,23 +1499,25 @@ def _decode_tensor_to_array(
 
 
 def _is_direct_quantizable_linear_weight(hf_name: str, arr: np.ndarray) -> bool:
-    """Only quantize 2D linear projection weights in the first direct pipeline release."""
-    return arr.ndim == 2 and hf_name.endswith("_proj.weight")
+    """Quantize dense or stacked-expert linear projection weights."""
+    return arr.ndim >= 2 and hf_name.endswith("_proj.weight")
 
 
 def _quantize_affine_4bit(
     arr: np.ndarray, q_group_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Quantize a 2D array into affine 4-bit groups."""
-    if arr.ndim != 2:
-        raise ValueError(f"Direct quantization expects 2D tensors, got {arr.ndim}D")
-    rows, cols = arr.shape
+    """Quantize an array of linear weights into affine 4-bit groups."""
+    if arr.ndim < 2:
+        raise ValueError(f"Direct quantization expects at least 2D tensors, got {arr.ndim}D")
+    leading_shape, cols = arr.shape[:-1], arr.shape[-1]
     if cols % q_group_size != 0:
         raise ValueError(
             f"Column size {cols} is not divisible by q_group_size={q_group_size}"
         )
 
-    grouped = arr.astype(np.float32).reshape(rows, cols // q_group_size, q_group_size)
+    grouped = arr.astype(np.float32).reshape(
+        *leading_shape, cols // q_group_size, q_group_size
+    )
     mins = grouped.min(axis=-1)
     maxs = grouped.max(axis=-1)
     scales = (maxs - mins) / 15.0
@@ -1423,7 +1531,7 @@ def _quantize_affine_4bit(
 
     low = q[..., 0::2]
     high = q[..., 1::2] << 4
-    packed = (low | high).reshape(rows, cols // 2).astype(np.uint8)
+    packed = (low | high).reshape(*leading_shape, cols // 2).astype(np.uint8)
     return packed, safe_scales.astype(np.float16), mins.astype(np.float16)
 
 
@@ -1607,7 +1715,10 @@ def extract_and_convert_weights_direct_quant(
     q_bits: int,
     q_group_size: int,
     q_mode: str,
-) -> None:
+    architecture_kind: str = "dense",
+    moe_router_protect: bool = True,
+    mixed_precision: bool = False,
+) -> dict[str, Any]:
     """Bounded-memory direct quantization path for supported linear weights."""
     if q_bits != 4 or q_group_size != 64 or q_mode != "affine":
         raise RuntimeError(
@@ -1623,6 +1734,10 @@ def extract_and_convert_weights_direct_quant(
     skipped = 0
     quantized_tensors = 0
     fallback_tensors = 0
+    decisions: list[dict[str, Any]] = []
+    protected_routers: list[dict[str, Any]] = []
+    compressed_experts: list[dict[str, Any]] = []
+    unknown_tensors: list[str] = []
     max_shard_bytes = DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES
 
     pbar = tqdm(total=len(reader.tensors), desc="  Direct quantizing", unit="tensor")
@@ -1665,7 +1780,17 @@ def extract_and_convert_weights_direct_quant(
             )
             qtype_val = int(tensor.tensor_type)
             for hf_name, out_arr in emit_pairs:
-                if _is_direct_quantizable_linear_weight(hf_name, out_arr):
+                category = classify_tensor(gguf_name, hf_name)
+                protected = (
+                    architecture_kind in {"moe", "hybrid"}
+                    and moe_router_protect
+                    and category == "router"
+                ) or (mixed_precision and category in {"router", "attention"})
+                quantizable = _is_direct_quantizable_linear_weight(hf_name, out_arr)
+                should_quantize = quantizable and not protected
+                precision: int | str = 4 if should_quantize else dtype
+
+                if should_quantize:
                     if qtype_val not in DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES:
                         raise RuntimeError(
                             f"Unsupported source quantization for direct quantization: "
@@ -1689,6 +1814,21 @@ def extract_and_convert_weights_direct_quant(
                     total_bytes_out += out_arr.nbytes
                     current_shard_bytes += out_arr.nbytes
                     fallback_tensors += 1
+
+                decision = {
+                    "source_name": gguf_name,
+                    "output_name": hf_name,
+                    "category": category,
+                    "precision": precision,
+                    "protected": protected,
+                }
+                decisions.append(decision)
+                if category == "router" and protected:
+                    protected_routers.append(decision)
+                if category == "expert_mlp" and should_quantize:
+                    compressed_experts.append(decision)
+                if category == "unknown":
+                    unknown_tensors.append(gguf_name)
 
                 if current_shard_bytes >= max_shard_bytes:
                     _flush_shard(weights, shard_idx)
@@ -1725,6 +1865,22 @@ def extract_and_convert_weights_direct_quant(
     print(f"    Fallback non-projection tensors: {fallback_tensors}")
     print(f"    Total input:  {total_bytes_in / 1e9:.2f} GB (GGUF)")
     print(f"    Total output: {total_bytes_out / 1e9:.2f} GB (safetensors)")
+    if unknown_tensors:
+        print(
+            "    ⚠ Unclassified block tensors retained without policy assumptions: "
+            + ", ".join(sorted(set(unknown_tensors)))
+        )
+    return {
+        "schema_version": 1,
+        "architecture": arch,
+        "architecture_kind": architecture_kind,
+        "mixed_precision": mixed_precision,
+        "router_protection": moe_router_protect,
+        "protected_router_tensors": protected_routers,
+        "compressed_expert_tensors": compressed_experts,
+        "unknown_tensors": sorted(set(unknown_tensors)),
+        "tensor_decisions": decisions,
+    }
 
 
 def _convert_direct_quantized(
@@ -1734,6 +1890,8 @@ def _convert_direct_quantized(
     q_bits: int,
     q_group_size: int,
     q_mode: str,
+    moe_router_protect: bool = True,
+    mixed_precision: bool = False,
 ) -> bool:
     """Convert GGUF directly into quantized MLX-LM-compatible shards."""
     gguf_file = Path(gguf_path)
@@ -1752,6 +1910,15 @@ def _convert_direct_quantized(
             f"{', '.join(sorted(DIRECT_QUANT_SUPPORTED_ARCHES))}. Detected: {arch}"
         )
         return False
+    architecture_kind = classify_architecture(reader, arch)
+    try:
+        validate_moe_layout(reader, arch, architecture_kind)
+    except RuntimeError as error:
+        print(f"❌ {error}")
+        return False
+    if mixed_precision and architecture_kind == "dense":
+        print("❌ --mixed-precision currently requires a detected MoE or hybrid architecture")
+        return False
     variant_error = validate_architecture_variant(reader, arch)
     if variant_error:
         print(f"❌ {variant_error}")
@@ -1765,7 +1932,7 @@ def _convert_direct_quantized(
 
     print("\n[direct-quant] Converting tensors with bounded memory...")
     try:
-        extract_and_convert_weights_direct_quant(
+        report = extract_and_convert_weights_direct_quant(
             reader,
             arch,
             output_path,
@@ -1773,17 +1940,42 @@ def _convert_direct_quantized(
             q_bits=q_bits,
             q_group_size=q_group_size,
             q_mode=q_mode,
+            architecture_kind=architecture_kind,
+            moe_router_protect=moe_router_protect,
+            mixed_precision=mixed_precision,
         )
     except Exception as error:  # noqa: BLE001
         print(f"❌ Direct quantization failed: {error}")
         return False
 
-    config["quantization"] = {
-        "bits": q_bits,
-        "group_size": q_group_size,
-        "mode": q_mode,
-        "scheme": "direct_affine_4bit_v1",
-    }
+    if mixed_precision:
+        jang_config = {
+            "format": "gguf2mlx-mixed-v1",
+            "group_size": q_group_size,
+            "mode": q_mode,
+            "default_bits": q_bits,
+            "high_precision_categories": ["attention", "router"],
+            "low_precision_categories": ["expert_mlp"],
+            "tensor_decisions": {
+                item["output_name"]: item["precision"]
+                for item in report["tensor_decisions"]
+            },
+        }
+        with open(output_path / "jang_config.json", "w") as f:
+            json.dump(jang_config, f, indent=2)
+        config["gguf2mlx_mixed_precision"] = {
+            "format": "gguf2mlx-mixed-v1",
+            "runtime": "JANG-compatible runtime required",
+        }
+    else:
+        config["quantization"] = {
+            "bits": q_bits,
+            "group_size": q_group_size,
+            "mode": q_mode,
+            "scheme": "direct_affine_4bit_v1",
+        }
+    with open(output_path / "conversion_report.json", "w") as f:
+        json.dump(report, f, indent=2)
     with open(output_path / "config.json", "w") as f:
         json.dump(config, f, indent=2)
     return True
@@ -1827,13 +2019,19 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     if arch not in CONVERTIBLE_ARCHES:
         print(f"❌ Unsupported GGUF architecture: {arch}")
         return False
+    architecture_kind = classify_architecture(reader, arch)
+    try:
+        validate_moe_layout(reader, arch, architecture_kind)
+    except RuntimeError as error:
+        print(f"❌ {error}")
+        return False
     variant_error = validate_architecture_variant(reader, arch)
     if variant_error:
         print(f"❌ {variant_error}")
         return False
     hf_type = ARCH_MAP.get(arch, arch)
     model_name_full = get_metadata_str(reader, "general.name") or model_name
-    print(f"  Architecture: {arch} (HF type: {hf_type})")
+    print(f"  Architecture: {arch} ({architecture_kind}; HF type: {hf_type})")
     print(f"  Model name:   {model_name_full}")
 
     config = build_config(reader, arch, dtype)
@@ -1960,6 +2158,8 @@ def convert(
     q_group_size: int = 64,
     q_mode: str = "affine",
     direct_quant: bool = False,
+    moe_router_protect: bool = True,
+    mixed_precision: bool = False,
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     if quantize and q_group_size not in SUPPORTED_MLX_LM_Q_GROUP_SIZES:
@@ -1983,6 +2183,9 @@ def convert(
     direct_quantized_output_path = staging_path / "direct-quantized"
 
     try:
+        if mixed_precision and not (quantize and direct_quant):
+            print("❌ --mixed-precision requires --quantize and --direct-quant")
+            return False
         if quantize and direct_quant:
             try:
                 succeeded = _convert_direct_quantized(
@@ -1992,6 +2195,8 @@ def convert(
                     q_bits=q_bits,
                     q_group_size=q_group_size,
                     q_mode=q_mode,
+                    moe_router_protect=moe_router_protect,
+                    mixed_precision=mixed_precision,
                 )
             except Exception as error:  # noqa: BLE001
                 print(f"❌ Conversion failed: {error}")
@@ -2284,6 +2489,17 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--moe-router-protect",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep recognized MoE router tensors at FP16 (default: enabled)",
+    )
+    parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="Use FP16 attention/router tensors and 4-bit expert MLP tensors (experimental)",
+    )
+    parser.add_argument(
         "--skip-weights",
         action="store_true",
         help="Skip weight extraction (metadata + tokenizer only, for inspection)",
@@ -2312,6 +2528,8 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         q_group_size=args.q_group_size,
         q_mode=args.q_mode,
         direct_quant=args.direct_quant,
+        moe_router_protect=args.moe_router_protect,
+        mixed_precision=args.mixed_precision,
     )
     return 0 if success else 1
 

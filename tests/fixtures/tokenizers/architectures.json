@@ -1,0 +1,37 @@
+{
+  "architectures": [
+    "llama",
+    "gemma",
+    "mistral",
+    "qwen2",
+    "qwen2moe",
+    "qwen3moe",
+    "deepseek2",
+    "deepseek3",
+    "stablelm",
+    "glm4moe"
+  ],
+  "normalizer": "NFC",
+  "special_tokens": [
+    "<|special_00|>",
+    "<|special_01|>",
+    "<|special_02|>",
+    "<|special_03|>",
+    "<|special_04|>",
+    "<|special_05|>",
+    "<|special_06|>",
+    "<|special_07|>",
+    "<|special_08|>",
+    "<|special_09|>",
+    "<|special_10|>",
+    "<|special_11|>",
+    "<|special_12|>",
+    "<|special_13|>",
+    "<|special_14|>",
+    "<|special_15|>",
+    "<|special_16|>",
+    "<|special_17|>",
+    "<|special_18|>",
+    "<|special_19|>"
+  ]
+}

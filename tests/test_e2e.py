@@ -158,6 +158,8 @@ def test_direct_quant_output_loads_with_mlx_lm(
         q_bits: int,
         q_group_size: int,
         q_mode: str,
+        moe_router_protect: bool = True,
+        mixed_precision: bool = False,
     ) -> bool:
         _write_tiny_mlx_llama_model_quantized(Path(output_path))
         return True

@@ -94,9 +94,43 @@ pub fn detect_architecture(
     "unknown".to_string()
 }
 
+const MOE_ARCHES: [&str; 6] = [
+    "qwen2moe",
+    "qwen3moe",
+    "deepseek2",
+    "deepseek3",
+    "glm4moe",
+    "glm-dsa",
+];
+
+pub fn classify_architecture(architecture: &str, tensor_names: &[String]) -> String {
+    let has_experts = tensor_names.iter().any(|name| {
+        name.contains("ffn_gate_exps")
+            || name.contains("ffn_up_exps")
+            || name.contains("ffn_down_exps")
+            || name.contains(".experts.")
+            || name.contains("switch_mlp")
+    });
+    let has_dense_mlp = tensor_names.iter().any(|name| {
+        (name.contains("ffn_gate.weight")
+            || name.contains("ffn_up.weight")
+            || name.contains("ffn_down.weight"))
+            && !name.contains("_exps")
+    });
+    let declared_moe = MOE_ARCHES.contains(&architecture);
+
+    if (declared_moe || has_experts) && has_dense_mlp {
+        "hybrid".to_string()
+    } else if declared_moe || has_experts {
+        "moe".to_string()
+    } else {
+        "dense".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::detect_architecture;
+    use super::{classify_architecture, detect_architecture};
 
     #[test]
     fn respects_more_specific_substrings_first() {
@@ -124,5 +158,21 @@ mod tests {
         );
         assert_eq!(detect_architecture(None, Some("Yi-34B-Chat")), "llama");
         assert_eq!(detect_architecture(None, None), "unknown");
+    }
+
+    #[test]
+    fn classifies_moe_and_hybrid_layouts() {
+        assert_eq!(classify_architecture("llama", &[]), "dense");
+        assert_eq!(classify_architecture("qwen3moe", &[]), "moe");
+        assert_eq!(
+            classify_architecture(
+                "qwen3moe",
+                &[
+                    "blk.0.ffn_gate_exps.weight".to_string(),
+                    "blk.1.ffn_gate.weight".to_string(),
+                ],
+            ),
+            "hybrid"
+        );
     }
 }

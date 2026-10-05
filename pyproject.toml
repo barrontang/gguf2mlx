@@ -42,7 +42,7 @@ Issues = "https://github.com/barrontang/gguf2mlx/issues"
 
 [project.optional-dependencies]
 mlx = ["mlx>=0.18.0", "mlx-lm>=0.29.0"]
-dev = ["pytest", "pytest-cov", "ruff", "mypy", "tokenizers>=0.20"]
+dev = ["pytest", "pytest-cov", "ruff", "mypy", "tokenizers>=0.20", "jinja2>=3.1.6"]
 
 [project.scripts]
 gguf2mlx = "gguf2mlx:main"

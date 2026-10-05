@@ -353,7 +353,16 @@ def test_convert_uses_direct_quant_pipeline_when_requested(tmp_path: Path, monke
     output_dir = tmp_path / "model"
     calls = []
 
-    def fake_direct_convert(gguf_path, output_path, dtype, q_bits, q_group_size, q_mode):
+    def fake_direct_convert(
+        gguf_path,
+        output_path,
+        dtype,
+        q_bits,
+        q_group_size,
+        q_mode,
+        moe_router_protect=True,
+        mixed_precision=False,
+    ):
         calls.append((gguf_path, output_path, dtype, q_bits, q_group_size, q_mode))
         out = Path(output_path)
         out.mkdir(parents=True, exist_ok=True)
