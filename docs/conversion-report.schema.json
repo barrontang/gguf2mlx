@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/barrontang/gguf2mlx/conversion-report.schema.json",
+  "title": "gguf2mlx conversion report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "architecture",
+    "architecture_kind",
+    "router_protection",
+    "tensor_decisions"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "architecture": {"type": "string"},
+    "architecture_kind": {"enum": ["dense", "moe", "hybrid"]},
+    "mixed_precision": {"type": "boolean"},
+    "router_protection": {"type": "boolean"},
+    "protected_router_tensors": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
+    "compressed_expert_tensors": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
+    "unknown_tensors": {"type": "array", "items": {"type": "string"}},
+    "tensor_decisions": {"type": "array", "items": {"$ref": "#/$defs/decision"}}
+  },
+  "$defs": {
+    "decision": {
+      "type": "object",
+      "required": ["source_name", "output_name", "category", "precision", "protected"],
+      "properties": {
+        "source_name": {"type": "string"},
+        "output_name": {"type": "string"},
+        "category": {
+          "enum": ["router", "expert_mlp", "attention", "unknown", "other"]
+        },
+        "precision": {"oneOf": [{"type": "integer"}, {"type": "string"}]},
+        "protected": {"type": "boolean"}
+      }
+    }
+  }
+}

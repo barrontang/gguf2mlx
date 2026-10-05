@@ -353,7 +353,16 @@ def test_convert_uses_direct_quant_pipeline_when_requested(tmp_path: Path, monke
     output_dir = tmp_path / "model"
     calls = []
 
-    def fake_direct_convert(gguf_path, output_path, dtype, q_bits, q_group_size, q_mode):
+    def fake_direct_convert(
+        gguf_path,
+        output_path,
+        dtype,
+        q_bits,
+        q_group_size,
+        q_mode,
+        moe_router_protect=True,
+        mixed_precision=False,
+    ):
         calls.append((gguf_path, output_path, dtype, q_bits, q_group_size, q_mode))
         out = Path(output_path)
         out.mkdir(parents=True, exist_ok=True)
@@ -423,6 +432,27 @@ def test_build_config_stablelm_overrides():
     assert config["use_parallel_residual"] is False
     assert abs(config["partial_rotary_factor"] - 0.25) < 1e-6
     assert config["tie_word_embeddings"] is False
+
+
+def test_build_config_glm4moe_includes_expert_metadata():
+    reader = _FakeReader(
+        {
+            "general.name": "glm4-moe-test",
+            "tokenizer.ggml.tokens": ["<unk>", "<s>", "</s>"],
+            "glm4moe.embedding_length": 64,
+            "glm4moe.block_count": 2,
+            "glm4moe.attention.head_count": 4,
+            "glm4moe.feed_forward_length": 128,
+            "glm4moe.expert_feed_forward_length": 32,
+            "glm4moe.expert_count": 8,
+            "glm4moe.expert_used_count": 2,
+        }
+    )
+    config = core.build_config(reader, "glm4moe", "float16")
+    assert config["model_type"] == "glm4_moe"
+    assert config["num_experts"] == 8
+    assert config["num_experts_per_tok"] == 2
+    assert config["moe_intermediate_size"] == 32
 
 
 def test_quantize_affine_4bit_roundtrip_shape_and_dtype():

@@ -8,11 +8,11 @@ import platform
 from dataclasses import asdict
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-import numpy as np
-
 from gguf2mlx import gguf2mlx as core
+from gguf2mlx.mixed_validation import validate_mixed_artifacts
 
 RUN_E2E = os.getenv("GGUF2MLX_RUN_E2E") == "1"
 ARCH_FIXTURE_DIR = Path(__file__).parent / "fixtures" / "architectures"
@@ -90,9 +90,9 @@ def _write_tiny_mlx_llama_model(model_dir: Path) -> None:
 def _write_tiny_mlx_llama_model_quantized(model_dir: Path) -> None:
     """Write a tiny direct-quant-style MLX llama model (packed int4 weights)."""
     import mlx.core as mx
+    from mlx import nn
     from mlx_lm.models.llama import Model, ModelArgs
     from mlx_lm.utils import save_model
-    from mlx import nn
 
     model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -115,18 +115,16 @@ def _write_tiny_mlx_llama_model_quantized(model_dir: Path) -> None:
     (model_dir / "config.json").write_text(
         json.dumps(
             {
-                **{
-                    "model_type": "llama",
-                    "hidden_size": 32,
-                    "num_hidden_layers": 1,
-                    "intermediate_size": 64,
-                    "num_attention_heads": 4,
-                    "rms_norm_eps": 1e-5,
-                    "vocab_size": 32,
-                    "max_position_embeddings": 32,
-                    "tie_word_embeddings": True,
-                    "torch_dtype": "float16",
-                },
+                "model_type": "llama",
+                "hidden_size": 32,
+                "num_hidden_layers": 1,
+                "intermediate_size": 64,
+                "num_attention_heads": 4,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 32,
+                "max_position_embeddings": 32,
+                "tie_word_embeddings": True,
+                "torch_dtype": "float16",
                 "quantization": {"bits": 4, "group_size": 32, "mode": "affine"},
             },
             indent=2,
@@ -158,6 +156,8 @@ def test_direct_quant_output_loads_with_mlx_lm(
         q_bits: int,
         q_group_size: int,
         q_mode: str,
+        moe_router_protect: bool = True,
+        mixed_precision: bool = False,
     ) -> bool:
         _write_tiny_mlx_llama_model_quantized(Path(output_path))
         return True
@@ -270,7 +270,7 @@ def _build_tiny_gguf(path: Path, arch: str) -> None:
 
     rng = np.random.default_rng(abs(hash(arch)) % (2**32))
 
-    def rand(*shape: int) -> "np.ndarray":
+    def rand(*shape: int) -> np.ndarray:
         return (rng.standard_normal(shape) * 0.02).astype(np.float32)
 
     if arch == "gemma":
@@ -344,7 +344,7 @@ def test_real_gguf_converts_and_loads_with_finite_logits(arch: str, tmp_path: Pa
     index_path = output_dir / "model.safetensors.index.json"
     assert index_path.exists(), "conversion did not finalize a safetensors index"
 
-    model, tokenizer, config = load(str(output_dir), return_config=True)
+    model, _tokenizer, config = load(str(output_dir), return_config=True)
     assert config["model_type"] == arch
 
     logits = model(mx.array([[1, 3, 4, 5]], dtype=mx.int32))
@@ -399,3 +399,65 @@ def test_adapter_fixture_matches_mlx_lm_parameter_contract(fixture_name: str):
     model_keys = {name for name, _ in tree_flatten(model.parameters())}
     expected_keys = set(fixture["tensor_map"].values())
     assert expected_keys <= model_keys
+
+
+def _normalized_router_entropy(router_logits: np.ndarray) -> float:
+    shifted = router_logits - router_logits.max(axis=-1, keepdims=True)
+    probabilities = np.exp(shifted)
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    entropy = -(probabilities * np.log(probabilities + 1e-12)).sum(axis=-1)
+    return float(np.mean(entropy / np.log(router_logits.shape[-1])))
+
+
+def _extract_router_logits(model, token_ids: list[int]) -> np.ndarray:
+    import mlx.core as mx
+
+    model_body = getattr(model, "model", model)
+    embeddings = model_body.embed_tokens(mx.array([token_ids], dtype=mx.int32))
+    for layer in model_body.layers:
+        gate = getattr(getattr(layer, "mlp", None), "gate", None)
+        if callable(gate):
+            return np.asarray(gate(embeddings))
+    raise AssertionError("Converted MoE model exposes no callable router gate")
+
+
+@pytest.mark.parametrize("arch", ["qwen3moe", "deepseek2"])
+def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
+    arch: str, tmp_path: Path
+):
+    """Opt-in real-model contract used by the scheduled Apple Silicon workflow."""
+    pytest.importorskip("mlx")
+    pytest.importorskip("mlx_lm")
+
+    model_paths = json.loads(os.getenv("GGUF2MLX_MOE_MODELS", "{}"))
+    source = model_paths.get(arch)
+    if not source:
+        pytest.skip(f"GGUF2MLX_MOE_MODELS does not provide {arch}")
+    output_dir = tmp_path / f"{arch}-mixed"
+    assert core.convert(
+        source,
+        str(output_dir),
+        quantize=True,
+        direct_quant=True,
+        mixed_precision=True,
+    )
+    validate_mixed_artifacts(output_dir)
+
+    import mlx.core as mx
+    from mlx_lm import generate, load
+
+    uniform_dir = tmp_path / f"{arch}-uniform"
+    assert core.convert(source, str(uniform_dir), quantize=True, direct_quant=True)
+    model, tokenizer = load(str(uniform_dir))
+    token_ids = tokenizer.encode("Explain why the sky is blue.", add_special_tokens=False)
+    logits = model(mx.array([token_ids], dtype=mx.int32))
+    assert mx.isfinite(logits).all().item()
+
+    router_logits = _extract_router_logits(model, token_ids)
+    entropy = _normalized_router_entropy(router_logits)
+    assert 0.05 < entropy < 0.95
+
+    output = generate(model, tokenizer, prompt="Explain why the sky is blue.", max_tokens=32)
+    generated_tokens = tokenizer.encode(output, add_special_tokens=False)
+    assert output.isprintable()
+    assert len(set(generated_tokens)) >= max(2, len(generated_tokens) // 8)
