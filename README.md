@@ -199,20 +199,25 @@ enables conversion for 12 identifiers.
 
 ### Conversion-enabled architectures
 
-| Family | GGUF architecture IDs | Conversion | End-to-end | MoE | VLM |
-|---|---|---|---|---|---|
-| Llama | `llama`, `mistral` | ✅ | ⚠️ direct-quant synthetic | ❌ | ❌ |
-| Qwen | `qwen2` | ✅ | ⚠️ direct-quant synthetic | ❌ | ❌ |
-| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ⚠️ scheduled opt-in | ✅ | ❌ |
-| DeepSeek | `deepseek2`, `deepseek3` | ✅ | ⚠️ scheduled opt-in | ✅ | ❌ |
-| GLM | `glm4moe` | ✅ | ❌ | ✅ | ❌ |
-| Gemma | `gemma` | ✅ fixture-validated | ✅ synthetic GGUF | ❌ | ❌ |
-| Phi | `phi3` | ✅ Phi-3 4K fixture-validated | ✅ synthetic GGUF | ❌ | ❌ |
-| StableLM | `stablelm` | ✅ | ❌ | ❌ | ❌ |
-| GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ❌ |
+| Family | GGUF architecture IDs | Conversion | End-to-end | MoE | Mixed precision | `.mlx` bundle | VLM |
+|---|---|---|---|---|---|---|---|
+| Llama | `llama`, `mistral` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
+| Qwen | `qwen2` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
+| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ⚠️ scheduled opt-in | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| DeepSeek | `deepseek2`, `deepseek3` | ✅ | ⚠️ scheduled opt-in | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| GLM | `glm4moe` | ✅ | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| Gemma | `gemma` | ✅ fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
+| Phi | `phi3` | ✅ Phi-3 4K fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
+| StableLM | `stablelm` | ✅ | ❌ | ❌ | — | ✅ generic package/verify | ❌ |
+| GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 
 “Conversion” means that a code path exists. “End-to-end” means a converted model
 has been loaded and exercised; ⚠️ rows still require the opt-in model fixtures.
+The mixed-precision contract validator checks agreement between
+`conversion_report.json` and `jang_config.json`; this is not a substitute for
+loading the result in a JANG-compatible runtime. `.mlx` bundle packaging and
+integrity verification are architecture-independent operations on emitted model
+directories and do not assert runtime compatibility.
 
 Gemma 2/3 and Phi-3 LongRoPE are different layouts and are not included in the
 basic Gemma or Phi-3 4K support claim.
