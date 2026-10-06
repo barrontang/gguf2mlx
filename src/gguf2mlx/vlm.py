@@ -348,6 +348,11 @@ def _validate_tokenizer(reader: Any, root: Path, text: dict, config: dict) -> No
         if index in by_id and by_id[index] != token:
             raise ValueError("HF tokenizer has duplicate token IDs")
         by_id[index] = token
+    if any(index >= text["vocab_size"] for index in by_id):
+        raise ValueError(
+            "HF tokenizer IDs exceed the actual GGUF/HF text vocab_size; "
+            "supply matching checkpoints with compatibly resized text embeddings."
+        )
     tokens = core.get_metadata_array_str(reader, "tokenizer.ggml.tokens")
     if len(tokens) != text["vocab_size"]:
         raise ValueError("GGUF tokenizer vocabulary must match HF text embedding vocab_size")

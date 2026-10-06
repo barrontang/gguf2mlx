@@ -150,9 +150,9 @@ gguf2mlx convert --input language.gguf --mmproj mmproj.gguf \
   tensor shapes/completeness and tokenizer compatibility, then copies processor
   and tokenizer assets without executing remote code or loading pickle files.
   Not every GGUF/HF release pair is compatible; vocabulary/config mismatches
-  fail rather than fabricating weights. Use a checkpoint whose image token is
-  covered by the language embedding vocabulary; older unresized exports are
-  not repaired by synthesizing embedding rows.
+  fail rather than fabricating weights. All tokenizer IDs, including image and
+  padding tokens, must fit the language embedding vocabulary; older unresized
+  exports are not repaired by synthesizing embedding rows.
 - Direct conversion requires a complete supported CLIP layout. Some mmproj
   releases omit unused vision layers or normalization tensors: use the hybrid
   path when direct completeness validation fails.

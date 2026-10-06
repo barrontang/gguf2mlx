@@ -493,6 +493,28 @@ def test_image_token_outside_actual_embeddings_rejected(model):
         convert(model)
 
 
+@pytest.mark.parametrize("token", ["<pad>", "<im_start>", "extra-word"])
+def test_any_hf_tokenizer_id_outside_actual_embeddings_rejected(model, token):
+    tokenizer = json.loads((model.root / "tokenizer.json").read_text())
+    tokenizer["added_tokens"].append({
+        "id": model.config["text_config"]["vocab_size"], "content": token, "special": True,
+    })
+    write_json(model.root / "tokenizer.json", tokenizer)
+    with pytest.raises(ValueError, match="HF tokenizer IDs exceed"):
+        convert(model)
+
+
+def test_valid_hf_added_pad_token_inside_embeddings(model):
+    tokenizer = json.loads((model.root / "tokenizer.json").read_text())
+    del tokenizer["model"]["vocab"]["word"]
+    tokenizer["added_tokens"].append({"id": 3, "content": "<pad>", "special": True})
+    write_json(model.root / "tokenizer.json", tokenizer)
+    model.reader.metadata["tokenizer.ggml.tokens"][3] = "<pad>"
+    convert(model)
+    output = load_file(str(model.output / "model.safetensors"))
+    assert np.isfinite(output["language_model.model.embed_tokens.weight"]).all()
+
+
 def test_missing_vision_fails_with_hybrid_suggestion(model):
     model.reader.tensors = [t for t in model.reader.tensors if t.name != "v.post_ln.weight"]
     with pytest.raises(ValueError, match="hf-fallback-vision"):
