@@ -133,6 +133,8 @@ the same token IDs; requested BOS IDs and vocabulary sizes must also match.
 Contiguous windows are shared, contexts reset between windows, and every next
 token is scored with batch size 1. `--add-bos` prepends BOS to each window;
 without it no special tokens are inserted. Trailing unused tokens are reported.
+The report path must be new and outside the model directory; existing files
+and aliases are never overwritten.
 The source must contain Q4_0 tensors and may also contain F32, F16, or Q8_0;
 K-quants and all other types are rejected at this MVP stage.
 
@@ -231,12 +233,15 @@ remain future work.
 
 ### Upstream contracts
 
-- [llama.cpp block definitions](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h)
-  and [reference decoding](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-quants.c).
+- [llama.cpp block definitions](https://github.com/ggml-org/llama.cpp/blob/5e03bdd8700948b9c41c54dd1b00f28a2aebc03f/ggml/src/ggml-common.h)
+  and [reference decoding](https://github.com/ggml-org/llama.cpp/blob/5e03bdd8700948b9c41c54dd1b00f28a2aebc03f/ggml/src/ggml-quants.c).
 - [MLX quantize/dequantize/quantized_matmul API](https://ml-explore.github.io/mlx/build/html/reference/quantization.html)
-  and [QuantizedLinear implementation](https://github.com/ml-explore/mlx/blob/main/python/mlx/nn/layers/quantized.py).
-- [MLX-LM PPL scoring](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/perplexity.py)
-  and [llama-perplexity scoring/storage](https://github.com/ggml-org/llama.cpp/blob/master/tools/perplexity/perplexity.cpp).
+  and [QuantizedLinear implementation](https://github.com/ml-explore/mlx/blob/264c14fe650e1dd9bb0c3902dc06b08033d8f89c/python/mlx/nn/layers/quantized.py).
+- [MLX native GGUF repacking](https://github.com/ml-explore/mlx/blob/264c14fe650e1dd9bb0c3902dc06b08033d8f89c/mlx/io/gguf_quants.cpp):
+  already implements the Q4_0 nibble reorder and Q8_0 sign-bit flip; prefer
+  studying/reusing this mechanism over inventing a second quantizer.
+- [MLX-LM PPL scoring](https://github.com/ml-explore/mlx-lm/blob/5cfec4cb39deba54210b3ff4d86f2337c7bc10b5/mlx_lm/perplexity.py)
+  and [llama-perplexity scoring/storage](https://github.com/ggml-org/llama.cpp/blob/5e03bdd8700948b9c41c54dd1b00f28a2aebc03f/tools/perplexity/perplexity.cpp).
 - [Pinned native binding evaluation contract](https://github.com/abetlen/llama-cpp-python/blob/v0.3.36/llama_cpp/llama.py):
   `reset()`, `eval()`, `scores`, and `logits_all`.
 

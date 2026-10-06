@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import os
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -127,3 +129,102 @@ def test_report_cannot_overwrite_corpus(tmp_path):
         "--mlx-model", str(model), "--result-json", str(corpus),
     ]) == 1
     assert corpus.read_text() == "keep me"
+
+
+@pytest.mark.parametrize("alias", ["hardlink", "symlink"])
+def test_report_cannot_overwrite_filesystem_alias(tmp_path, alias):
+    source, corpus, model = tmp_path / "input.gguf", tmp_path / "text.txt", tmp_path / "mlx"
+    source.touch()
+    corpus.write_text("keep me", encoding="utf-8")
+    model.mkdir()
+    report = tmp_path / "report.json"
+    if alias == "hardlink":
+        os.link(corpus, report)
+    else:
+        report.symlink_to(corpus)
+    assert benchmark.main([
+        "--eval-ppl", "--input", str(source), "--corpus", str(corpus),
+        "--mlx-model", str(model), "--result-json", str(report),
+    ]) == 1
+    assert corpus.read_text() == "keep me"
+
+
+def test_evaluator_uses_native_public_contract_and_shared_scoring(tmp_path, monkeypatch):
+    source, corpus, model = tmp_path / "input.gguf", tmp_path / "text.txt", tmp_path / "mlx"
+    source.touch()
+    corpus.write_text("fixed corpus", encoding="utf-8")
+    model.mkdir()
+    (model / "model.safetensors").touch()
+    calls = []
+
+    class Reference:
+        def __init__(self, **kwargs):
+            assert kwargs["logits_all"] is True
+            self.scores = np.zeros((4, 8), dtype=np.float32)
+            self.closed = False
+            calls.append(self)
+
+        def tokenize(self, text, **kwargs):
+            assert kwargs == {"add_bos": False, "special": False}
+            return list(range(8))
+
+        def reset(self):
+            calls.append("reset")
+
+        def eval(self, tokens):
+            calls.append(tokens)
+
+        def n_vocab(self):
+            return 8
+
+        def close(self):
+            self.closed = True
+
+    class TokenizerWrapper:
+        # Mirrors MLX-LM wrappers with no __len__ special method.
+        def encode(self, text, **kwargs):
+            return list(range(8))
+
+        def get_vocab(self):
+            return {str(i): i for i in range(8)}
+
+    mx = ModuleType("mlx.core")
+    mx.array, mx.float32, mx.eval = np.asarray, np.float32, lambda *a: None
+    mlx = ModuleType("mlx")
+    mlx.core = mx
+    native = ModuleType("llama_cpp")
+    native.Llama = Reference
+    native.llama_print_system_info = lambda: b"test backend"
+    utils = ModuleType("mlx_lm.utils")
+    utils.load = lambda path: (
+        lambda batch: np.zeros((*batch.shape, 8), dtype=np.float32), TokenizerWrapper()
+    )
+    perplexity = ModuleType("mlx_lm.perplexity")
+
+    def eval_ppl(evaluator, data, batch_size):
+        assert batch_size == 1
+        assert data.tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
+        for row in data:
+            logits = evaluator(row[None, :-1])
+            assert logits.shape == (1, 3, 8)
+        return 8.0, 0.0
+
+    perplexity.eval_ppl = eval_ppl
+    for name, module in {
+        "mlx": mlx, "mlx.core": mx, "llama_cpp": native,
+        "mlx_lm": ModuleType("mlx_lm"), "mlx_lm.utils": utils,
+        "mlx_lm.perplexity": perplexity,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(benchmark, "_validate_source", lambda path: {"Q4_0": 1})
+    monkeypatch.setattr(benchmark.importlib.metadata, "version", lambda name: "test")
+    result = benchmark._evaluate(SimpleNamespace(
+        input=source, corpus=corpus, mlx_model=model, sequence_length=4,
+        num_samples=2, n_gpu_layers=0, add_bos=False,
+    ))
+    assert calls[0].closed
+    assert calls[1:] == ["reset", [0, 1, 2], "reset", [4, 5, 6]]
+    assert result["success"] and result["comparison"]["logits_identical"]
+    assert result["scored_tokens"] == 6
+    assert result["unused_corpus_tokens"] == 0
+    assert not result["bit_exact_transpacking_proven"]

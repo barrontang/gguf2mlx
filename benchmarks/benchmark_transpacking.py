@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.metadata
 import json
@@ -129,17 +130,17 @@ def _evaluate(args) -> dict:
 
     text = args.corpus.read_text(encoding="utf-8")
     model, tokenizer = load(str(args.mlx_model))
-    with Llama(
+    with contextlib.closing(Llama(
         model_path=str(args.input), n_ctx=args.sequence_length,
         n_batch=args.sequence_length, logits_all=True,
         n_gpu_layers=args.n_gpu_layers, seed=0, verbose=False,
-    ) as reference:
+    )) as reference:
         tokens = _shared_tokens(reference, tokenizer, text, args.add_bos)
         data = _windows(
             tokens, args.sequence_length, args.num_samples,
             reference.token_bos() if args.add_bos else None,
         )
-        if len(tokenizer) != reference.n_vocab():
+        if len(tokenizer.get_vocab()) != reference.n_vocab():
             raise ValueError("GGUF and MLX vocabulary sizes disagree")
         native = _LlamaLogits(reference, mx)
         converted = _MlxLogits(model, mx, reference.n_vocab())
@@ -214,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("sequence length must be >= 2 and sample count must be >= 1")
         if not args.input.is_file() or not args.corpus.is_file() or not args.mlx_model.is_dir():
             raise ValueError("Input, corpus, and local MLX model must exist")
+        if args.result_json.exists():
+            raise ValueError("Result path must be new; existing files will not be overwritten")
         if (
             args.result_json in {args.input, args.corpus}
             or args.result_json.is_relative_to(args.mlx_model)
@@ -224,11 +227,18 @@ def main(argv: list[str] | None = None) -> int:
         result = {"success": False, "error": f"{type(error).__name__}: {error}"}
     rendered = json.dumps(result, indent=2, allow_nan=False)
     print(rendered)
+    if args.result_json.exists():
+        return 1
     if args.result_json not in {args.input, args.corpus} and not args.result_json.is_relative_to(
         args.mlx_model
     ):
-        args.result_json.parent.mkdir(parents=True, exist_ok=True)
-        args.result_json.write_text(rendered + "\n", encoding="utf-8")
+        try:
+            args.result_json.parent.mkdir(parents=True, exist_ok=True)
+            with args.result_json.open("x", encoding="utf-8") as stream:
+                stream.write(rendered + "\n")
+        except OSError as error:
+            print(f"Cannot write report: {error}", file=sys.stderr)
+            return 1
     return 0 if result["success"] else 1
 
 
