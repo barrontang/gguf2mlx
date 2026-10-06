@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Convert supported GGUF language models into MLX-LM-compatible safetensors on Apple Silicon Macs.**
+**Convert supported GGUF language models and LLaVA VLMs into MLX-compatible safetensors on Apple Silicon Macs.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
@@ -102,6 +102,78 @@ gguf2mlx --input model.gguf --skip-weights
 gguf2mlx convert --input model.gguf --output ./mlx-model
 ```
 
+### VLM conversion: architecture-specific direct or hybrid paths
+
+VLM conversion is separate from MLX-LM conversion. The initial adapter targets
+**LLaVA (`model_type: llava`) with a Llama language model, CLIP vision tower and
+two-layer MLP projector**, producing an HF-style directory for `mlx-vlm`.
+Qwen2/2.5-VL, LLaVA-NeXT, SigLIP and other layouts are detected or explicitly
+requested but **rejected**, not converted using guessed LLaVA tensor names.
+This adapter is offline-fixture tested; real-model Apple Silicon image inference
+is not yet end-to-end verified.
+
+```bash
+# Optional HF download support; local sources need only the base converter
+pip install "gguf2mlx[vlm]"
+
+# Path A: language + vision + projector weights from GGUF.
+# HF supplies matching full VLM config/tokenizer/image processor, not weights.
+gguf2mlx convert --type vlm \
+  --input language.gguf --mmproj mmproj.gguf \
+  --hf-model llava-hf/llava-1.5-7b-hf --output ./llava-direct
+
+# Path B (recommended): language + projector from GGUF, original vision weights
+# and matching config/tokenizer/processor from the full HF VLM checkpoint.
+gguf2mlx convert --type vlm \
+  --input language.gguf --mmproj mmproj.gguf \
+  --hf-fallback-vision llava-hf/llava-1.5-7b-hf --output ./llava-hybrid
+
+# Offline hybrid conversion from a matching local HF safetensors checkpoint
+gguf2mlx convert --input language.gguf --mmproj mmproj.gguf \
+  --hf-fallback-vision /absolute/path/to/hf-llava --offline \
+  --output ./llava-offline
+```
+
+- `--type auto` (default) detects multimodal architecture metadata and tensors.
+  A language-only GGUF cannot identify a separately distributed vision tower:
+  pass `--mmproj`, HF source options or `--type vlm`. `--type llm` rejects
+  detected multimodal inputs instead of silently discarding vision weights.
+- Omit `--mmproj` for a combined GGUF. Both paths require GGUF projector
+  weights; hybrid conversion never replaces the language model or projector
+  with HF weights.
+- `--hf-model` must describe the **matching full VLM**, not a bare CLIP model.
+  `--hf-fallback-vision` also supplies that source's assets; if both options are
+  specified, they must reference the same source. Pin `--hf-revision` to a HF
+  commit for reproducible downloads. `--offline` uses local/cached assets only.
+- Matching `config.json`, `tokenizer.json`, `tokenizer_config.json` and
+  `preprocessor_config.json` are required. The converter validates architecture,
+  tensor shapes/completeness and tokenizer compatibility, then copies processor
+  and tokenizer assets without executing remote code or loading pickle files.
+  Not every GGUF/HF release pair is compatible; vocabulary/config mismatches
+  fail rather than fabricating weights. All tokenizer IDs, including image and
+  padding tokens, must fit the language embedding vocabulary; older unresized
+  exports are not repaired by synthesizing embedding rows.
+- Direct conversion requires a complete supported CLIP layout. Some mmproj
+  releases omit unused vision layers or normalization tensors: use the hybrid
+  path when direct completeness validation fails.
+- Hybrid conversion reads only vision tensors from safetensors. Indexed HF
+  checkpoints download only shards containing vision weights (a shared shard
+  can also contain language weights); an unsharded checkpoint requires fetching
+  that file. Direct conversion does not download HF weight files.
+- Output includes `config.json`, tokenizer/processor assets, safetensors shards,
+  an index and `vlm_conversion_report.json`. Validation failures clean staging
+  files and never overwrite an existing nonempty output directory.
+- VLM output currently supports `--dtype float16` or `float32` only.
+  `--quantize`, `--direct-quant` and `--mixed-precision` are LLM-only options.
+  Install `mlx-vlm` separately on Apple Silicon to load this output; the `vlm`
+  extra provides downloads, not the inference runtime.
+
+GGUF vision quantization is not inherently unusable: quality depends on the
+source quantization and model. Hybrid conversion avoids that vision
+quantization loss but does not recover language/projector information already
+lost in GGUF. Prefer direct HF-to-MLX-VLM conversion when all original weights
+are available.
+
 ### Package an MLX model directory into `.mlx`
 
 `gguf2mlx` can now package an MLX model directory into a single `.mlx` bundle,
@@ -184,6 +256,7 @@ print('loaded')
 | Gemma and Phi-3 architecture fixtures | Supported |
 | Bounded-memory direct quantization (`--direct-quant`) | Supported |
 | StableLM conversion adapter | Supported |
+| LLaVA Llama + CLIP direct/hybrid VLM adapter | Offline fixture-validated; real image inference unverified |
 
 ---
 
@@ -194,8 +267,9 @@ print('loaded')
 1. **recognized for inspection** via GGUF metadata, and
 2. **conversion enabled** through an explicit tensor adapter.
 
-The current code recognizes 48 architecture identifiers for inspection and
-enables conversion for 12 identifiers.
+The language-model path recognizes 48 architecture identifiers for inspection
+and enables conversion for 12 identifiers. VLM detection and conversion use a
+separate registry; only the LLaVA Llama + CLIP adapter is currently enabled.
 
 ### Conversion-enabled architectures
 
@@ -210,6 +284,7 @@ enables conversion for 12 identifiers.
 | Phi | `phi3` | ✅ Phi-3 4K fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
 | StableLM | `stablelm` | ✅ | ❌ | ❌ | — | ✅ generic package/verify | ❌ |
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | ❌ real image inference unverified | ❌ | — | ✅ generic package/verify | ✅ Llama + CLIP only |
 
 “Conversion” means that a code path exists. “End-to-end” means a converted model
 has been loaded and exercised; ⚠️ rows still require the opt-in model fixtures.
