@@ -459,12 +459,50 @@ def test_quantize_affine_4bit_roundtrip_shape_and_dtype():
     arr = np.arange(128, dtype=np.float32).reshape(2, 64)
     packed, scales, biases = core._quantize_affine_4bit(arr, 64)
 
-    assert packed.shape == (2, 32)
-    assert packed.dtype == np.uint8
+    assert packed.shape == (2, 8)
+    assert packed.dtype == np.uint32
     assert scales.shape == (2, 1)
     assert scales.dtype == np.float16
     assert biases.shape == (2, 1)
     assert biases.dtype == np.float16
+    shifts = np.arange(8, dtype=np.uint32) * 4
+    codes = ((packed[..., None] >> shifts) & 15).reshape(arr.shape)
+    reconstructed = codes * np.repeat(scales.astype(np.float32), 64, axis=-1)
+    reconstructed += np.repeat(biases.astype(np.float32), 64, axis=-1)
+    np.testing.assert_allclose(reconstructed, arr, atol=2.2, rtol=0)
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_qwen2_moe_infers_legacy_expert_sizes_from_tensor_shapes(mismatch):
+    class Tensor:
+        def __init__(self, name, shape):
+            self.name, self.shape = name, shape
+
+    mapping = {
+        "qwen2moe.embedding_length": 64,
+        "qwen2moe.block_count": 1,
+        "qwen2moe.attention.head_count": 4,
+        "qwen2moe.feed_forward_length": 128,
+        "qwen2moe.context_length": 128,
+        "qwen2moe.expert_count": 4,
+        "qwen2moe.expert_used_count": 2,
+        "tokenizer.ggml.tokens": ["a", "b"],
+    }
+    if mismatch:
+        mapping["qwen2moe.expert_feed_forward_length"] = 128
+    reader = _FakeReader(mapping, tensors=[
+        Tensor("blk.0.ffn_gate_exps.weight", [64, 32, 4]),
+        Tensor("blk.0.ffn_down_exps.weight", [32, 64, 4]),
+        Tensor("blk.0.ffn_gate_shexp.weight", [64, 128]),
+        Tensor("blk.0.ffn_down_shexp.weight", [128, 64]),
+    ])
+    if mismatch:
+        with pytest.raises(ValueError, match="disagrees with tensor shapes"):
+            core.build_config(reader, "qwen2moe")
+    else:
+        config = core.build_config(reader, "qwen2moe")
+        assert config["moe_intermediate_size"] == 32
+        assert config["shared_expert_intermediate_size"] == 128
 
 
 @pytest.mark.parametrize("arch", ["llama", "gemma", "mistral", "qwen2", "stablelm"])
@@ -484,6 +522,7 @@ def test_direct_quant_supported_arches_gate(arch):
     (13, "Q5_K"),
     (14, "Q6_K"),
     (15, "Q8_K"),
+    (20, "IQ4_NL"),
     (30, "BF16"),
 ])
 def test_direct_quant_supported_source_qtypes_gate(qtype_val, name):

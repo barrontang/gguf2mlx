@@ -260,6 +260,7 @@ DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES = {
     13,  # Q5_K
     14,  # Q6_K
     15,  # Q8_K
+    20,  # IQ4_NL (also used in mixed Q2_K GGUF files)
     30,  # BF16
 }
 DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES = 256 * 1024 * 1024
@@ -657,10 +658,33 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
             config["head_dim"] = head_dim
 
         # Shared expert config (Qwen3MoE, DeepSeek-V3)
-        if arch in ("qwen3moe", "deepseek3"):
+        if arch in ("qwen2moe", "qwen3moe", "deepseek3"):
             config["shared_expert_intermediate_size"] = shared_ffn_size
             config["output_router_logits"] = False
             config["router_aux_loss_coef"] = 0.001
+
+        if arch == "qwen2moe":
+            for suffix, config_key, metadata_key, stacked in (
+                ("exps", "moe_intermediate_size", "expert_feed_forward_length", True),
+                ("shexp", "shared_expert_intermediate_size", "expert_shared_feed_forward_length", False),
+            ):
+                dimensions = set()
+                for tensor in reader.tensors:
+                    match = re.fullmatch(rf"blk\.\d+\.ffn_(gate|up|down)_{suffix}\.weight", tensor.name)
+                    if match is None:
+                        continue
+                    shape = tuple(int(dim) for dim in tensor.shape)
+                    if len(shape) != (3 if stacked else 2):
+                        raise ValueError(f"Invalid Qwen2MoE tensor shape: {tensor.name}: {shape}")
+                    dimensions.add(shape[0] if match.group(1) == "down" else shape[1])
+                if len(dimensions) > 1:
+                    raise ValueError(f"Inconsistent Qwen2MoE {config_key}: {sorted(dimensions)}")
+                if dimensions:
+                    inferred = dimensions.pop()
+                    declared = get_metadata_int(reader, f"{arch}.{metadata_key}")
+                    if declared is not None and declared != inferred:
+                        raise ValueError(f"Qwen2MoE {metadata_key} disagrees with tensor shapes")
+                    config[config_key] = inferred
 
     if arch == "gemma":
         config["head_dim"] = (
@@ -959,6 +983,15 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
             return mapped
     if arch == "phi3":
         mapped = _map_phi3_tensor_name(gguf_name)
+    elif arch == "qwen2moe" and (
+        match := re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down|gate_inp)_shexp\.weight", gguf_name)
+    ):
+        layer, projection = match.groups()
+        suffix = (
+            "shared_expert_gate.weight" if projection == "gate_inp"
+            else f"shared_expert.{projection}_proj.weight"
+        )
+        mapped = f"model.layers.{layer}.mlp.{suffix}"
     else:
         mapped = _map_llama_tensor_name(gguf_name)
     if arch in STRICT_ADAPTER_ARCHES and mapped == gguf_name:
@@ -997,6 +1030,7 @@ def extract_tokenizer(
     bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id")
     eos_id = get_metadata_int(reader, "tokenizer.ggml.eos_token_id")
     unk_id = get_metadata_int(reader, "tokenizer.ggml.unknown_token_id")
+    bpe_without_unknown = unk_id is None and model_type == "gpt2"
     pad_id = get_metadata_int(reader, "tokenizer.ggml.padding_token_id")
     bos_was_missing = bos_id is None
     eos_was_missing = eos_id is None
@@ -1090,8 +1124,10 @@ def extract_tokenizer(
     }
     if tokenizer_pre:
         tokenizer_config["gguf_tokenizer_pre"] = tokenizer_pre
+    if bpe_without_unknown:
+        tokenizer_config.pop("unk_token")
 
-    if model_type == "llama" or model_type == "bpe":
+    if arch != "gemma" and (model_type == "llama" or model_type == "bpe"):
         tokenizer_config.update(
             {
                 "model_type": "bpe",
@@ -1119,6 +1155,8 @@ def extract_tokenizer(
         "eos_token": tokens[eos_id] if eos_id < vocab_size else "</s>",
         "unk_token": tokens[unk_id] if unk_id < vocab_size else "<unk>",
     }
+    if bpe_without_unknown:
+        special_tokens.pop("unk_token")
     if pad_id < vocab_size and tokens[pad_id]:
         special_tokens["pad_token"] = tokens[pad_id]
 
@@ -1172,11 +1210,58 @@ def extract_tokenizer(
             pad_id,
             unk_id=unk_id,
             add_space_prefix=add_space_prefix,
+            arch=arch,
         )
+        if bpe_without_unknown:
+            tokenizer_json["model"]["unk_token"] = None
+        if arch == "gemma":
+            special_ids = [
+                (tokens[token_id], token_id)
+                for enabled, token_id in ((add_bos_token, bos_id), (add_eos_token, eos_id))
+                if enabled
+            ]
+            prefix = [{"SpecialToken": {"id": tokens[bos_id], "type_id": 0}}] if add_bos_token else []
+            suffix = [{"SpecialToken": {"id": tokens[eos_id], "type_id": 0}}] if add_eos_token else []
+            tokenizer_json["post_processor"] = {
+                "type": "TemplateProcessing",
+                "single": prefix + [{"Sequence": {"id": "A", "type_id": 0}}] + suffix,
+                "pair": (
+                    prefix + [{"Sequence": {"id": "A", "type_id": 0}}] + suffix
+                    + prefix + [{"Sequence": {"id": "B", "type_id": 1}}] + suffix
+                ),
+                "special_tokens": {
+                    token: {"id": token, "ids": [token_id], "tokens": [token]}
+                    for token, token_id in special_ids
+                },
+            }
     if tokenizer_json:
         with open(output_dir / "tokenizer.json", "w") as f:
             json.dump(tokenizer_json, f, indent=2, ensure_ascii=False)
         print("  ✓ Saved tokenizer.json")
+
+
+def _sentencepiece_bpe_merges(
+    tokens: list[str], token_types: list[int], scores: list[float],
+) -> list[list[str]]:
+    if len(scores) != len(tokens) or not np.isfinite(scores).all():
+        raise ValueError("Gemma SentencePiece BPE requires a finite score for every token")
+    if token_types and len(token_types) != len(tokens):
+        raise ValueError("Gemma SentencePiece BPE requires a type for every token")
+    vocab = {
+        token: i for i, token in enumerate(tokens)
+        if not token_types or token_types[i] == 1
+    }
+    candidates = []
+    for token, token_id in vocab.items():
+        splits = [
+            (token[:i], token[i:]) for i in range(1, len(token))
+            if token[:i] in vocab and token[i:] in vocab
+        ]
+        splits.sort(key=lambda pair: (vocab[pair[0]], vocab[pair[1]]))
+        candidates.extend((left, right, scores[token_id]) for left, right in splits)
+    # SentencePiece selects the highest-scored adjacent piece, not Unigram's best path.
+    candidates.sort(key=lambda item: (item[2], len(item[0]), len(item[1])), reverse=True)
+    return [[left, right] for left, right, _ in candidates]
 
 
 def _build_tokenizer_json(
@@ -1190,6 +1275,7 @@ def _build_tokenizer_json(
     pad_id: int,
     unk_id: int = 0,
     add_space_prefix: bool = True,
+    arch: str = "llama",
 ) -> dict:
     """Build a complete tokenizer.json for HuggingFace tokenizers."""
     vocab = {}
@@ -1227,7 +1313,19 @@ def _build_tokenizer_json(
         or (token.startswith("<0x") and token.endswith(">"))
         for i, token in enumerate(tokens)
     )
-    if normalized_model_type in ("bpe", "gpt2"):
+    gemma_spm = arch == "gemma" and normalized_model_type in (
+        "llama", "spm", "sentencepiece", "unigram",
+    )
+    if gemma_spm:
+        model_block = {
+            "type": "BPE",
+            "vocab": vocab,
+            "merges": _sentencepiece_bpe_merges(tokens, token_types, scores),
+            "unk_token": tokens[unk_id],
+            "byte_fallback": has_byte_fallback,
+            "fuse_unk": True,
+        }
+    elif normalized_model_type in ("bpe", "gpt2"):
         byte_fallback = any(
             (i < len(token_types) and token_types[i] == 6)
             or (token.startswith("<0x") and token.endswith(">"))
@@ -1266,7 +1364,7 @@ def _build_tokenizer_json(
     else:
         raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
 
-    normalizer = {"type": "NFC"}
+    normalizer = None if arch in {"qwen2", "qwen2moe", "qwen3moe"} else {"type": "NFC"}
     pre_tokenizer = {
         "type": "Sequence",
         "pretokenizers": [
@@ -1329,6 +1427,15 @@ def _build_tokenizer_json(
                 {"type": "Strip", "content": " ", "start": 1, "stop": 0},
             ],
         }
+        if gemma_spm:
+            normalizers = []
+            if add_space_prefix:
+                normalizers.append({"type": "Prepend", "prepend": "▁"})
+            normalizers.append({"type": "Replace", "pattern": {"String": " "}, "content": "▁"})
+            normalizer = {"type": "Sequence", "normalizers": normalizers}
+            pre_tokenizer = None
+            if not add_space_prefix:
+                decoder["decoders"].pop()
     elif normalized_model_type == "wordpiece":
         normalizer = {
             "type": "BertNormalizer",
@@ -1413,6 +1520,8 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
     Returns [] when the tensor is buffered (waiting for its kv_b pair).
     """
     arr = _restore_architecture_tensor(gguf_name, arr, arch)
+    if arch == "qwen2moe" and re.fullmatch(r"blk\.\d+\.ffn_gate_inp_shexp\.weight", gguf_name):
+        arr = arr.reshape(1, -1)
 
     # --- Phi-3 split Q/K/V -> fused qkv_proj ---
     match = re.fullmatch(r"blk\.(\d+)\.attn_(q|k|v)\.weight", gguf_name)
@@ -1476,32 +1585,24 @@ def _decode_tensor_to_array(
     np_dtype = np.float16 if dtype == "float16" else np.float32
     qtype = tensor.tensor_type
     qtype_val = int(qtype)
-    logical_shape = tuple(tensor.shape)
+    logical_shape = tuple(reversed(tensor.shape))
     raw_data = tensor.data
 
     if qtype_val == 0:  # F32
         arr = np.array(raw_data, dtype=np.float32).reshape(logical_shape)
         if dtype == "float16":
             arr = arr.astype(np.float16)
-        if arr.ndim == 2:
-            arr = arr.T
         return arr
     if qtype_val == 1:  # F16
         arr = np.array(raw_data, dtype=np.float16).reshape(logical_shape)
-        if arr.ndim == 2:
-            arr = arr.T
         return arr.astype(np_dtype)
     if qtype_val == 28:  # F64
         arr = np.array(raw_data, dtype=np.float64).reshape(logical_shape)
-        if arr.ndim == 2:
-            arr = arr.T
         return arr.astype(np_dtype)
     if qtype_val in (24, 25, 26, 27):  # I8, I16, I32, I64
         int_dtype_map = {24: np.int8, 25: np.int16, 26: np.int32, 27: np.int64}
         arr = np.array(raw_data, dtype=int_dtype_map.get(qtype_val, np.int32))
         arr = arr.reshape(logical_shape).astype(np_dtype)
-        if arr.ndim == 2:
-            arr = arr.T
         return arr
 
     try:
@@ -1546,9 +1647,9 @@ def _quantize_affine_4bit(
     q = np.clip(q, 0, 15).astype(np.uint8)
     q[zero_scale[..., None].repeat(q_group_size, axis=-1)] = 0
 
-    low = q[..., 0::2]
-    high = q[..., 1::2] << 4
-    packed = (low | high).reshape(*leading_shape, cols // 2).astype(np.uint8)
+    codes = q.reshape(*leading_shape, cols // 8, 8).astype(np.uint32)
+    shifts = np.arange(8, dtype=np.uint32) * 4
+    packed = np.bitwise_or.reduce(codes << shifts, axis=-1)
     return packed, safe_scales.astype(np.float16), mins.astype(np.float16)
 
 
@@ -1568,8 +1669,7 @@ def _finalize_safetensor_shards(output_dir: Path, total_bytes_out: int) -> tuple
         new_path = output_dir / new_name
         old_path.rename(new_path)
         with safe_open(str(new_path), framework="np") as f:
-            for key in f:
-                weight_map[key] = new_name
+            weight_map.update(dict.fromkeys(f.keys(), new_name))
 
     index_json = {
         "metadata": {"total_size": total_bytes_out},
@@ -1900,6 +2000,13 @@ def extract_and_convert_weights_direct_quant(
     }
 
 
+def _write_runtime_adapter(output_path: Path, arch: str, config: dict[str, Any]) -> None:
+    if arch == "gemma":
+        filename = "gemma_model.py"
+        shutil.copyfile(Path(__file__).parent / "data" / filename, output_path / filename)
+        config["model_file"] = filename
+
+
 def _convert_direct_quantized(
     gguf_path: str,
     output_dir: str,
@@ -1943,6 +2050,7 @@ def _convert_direct_quantized(
 
     print("\n[direct-quant] Building config and tokenizer...")
     config = build_config(reader, arch, dtype)
+    _write_runtime_adapter(output_path, arch, config)
     with open(output_path / "config.json", "w") as f:
         json.dump(config, f, indent=2)
     extract_tokenizer(reader, output_path, arch, config["max_position_embeddings"])
@@ -2076,6 +2184,7 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
         print("  ⚠ Could not read source quantization metadata")
 
     # Save config
+    _write_runtime_adapter(output_path, arch, config)
     with open(output_path / "config.json", "w") as f:
         json.dump(config, f, indent=2)
     print("  ✓ Saved config.json")

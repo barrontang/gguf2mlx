@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -236,7 +238,7 @@ def test_quantized_output_loads_with_mlx_lm(tmp_path: Path, monkeypatch: pytest.
     assert logits.shape == (1, 2, 32)
 
 
-def _build_tiny_gguf(path: Path, arch: str) -> None:
+def _build_tiny_gguf(path: Path, arch: str, hidden: int = 16, quantized: bool = False) -> None:
     """Synthesize a minimal but structurally valid GGUF for a fixture-backed arch.
 
     Weights are small random values; the goal is a file that survives the full
@@ -245,7 +247,9 @@ def _build_tiny_gguf(path: Path, arch: str) -> None:
     """
     import gguf
 
-    vocab, hidden, heads, ffn = 32, 16, 4, 32
+    vocab, heads, ffn = 32, 4, max(32, hidden)
+    if arch == "qwen2moe":
+        ffn = 2 * hidden
     head_dim = hidden // heads
 
     writer = gguf.GGUFWriter(str(path), arch)
@@ -254,7 +258,7 @@ def _build_tiny_gguf(path: Path, arch: str) -> None:
     writer.add_embedding_length(hidden)
     writer.add_feed_forward_length(ffn)
     writer.add_head_count(heads)
-    writer.add_file_type(1)
+    writer.add_file_type(2 if quantized else 1)
 
     tokens = [f"<t{i}>" for i in range(vocab)]
     tokens[0], tokens[1], tokens[2] = "<unk>", "<s>", "</s>"
@@ -273,6 +277,15 @@ def _build_tiny_gguf(path: Path, arch: str) -> None:
     def rand(*shape: int) -> np.ndarray:
         return (rng.standard_normal(shape) * 0.02).astype(np.float32)
 
+    def add_tensor(name: str, array: np.ndarray) -> None:
+        if quantized and array.ndim >= 2:
+            from gguf.quants import quantize
+
+            qtype = gguf.GGMLQuantizationType.Q4_0
+            writer.add_tensor(name, quantize(array, qtype), raw_dtype=qtype)
+        else:
+            writer.add_tensor(name, array)
+
     if arch == "gemma":
         kv_heads = 2
         writer.add_head_count_kv(kv_heads)
@@ -280,17 +293,39 @@ def _build_tiny_gguf(path: Path, arch: str) -> None:
         writer.add_value_length(head_dim)
         writer.add_context_length(128)
         writer.add_layer_norm_rms_eps(1e-6)
-        writer.add_tensor("token_embd.weight", rand(vocab, hidden))
-        writer.add_tensor("output_norm.weight", rand(hidden))
-        writer.add_tensor("blk.0.attn_q.weight", rand(heads * head_dim, hidden))
-        writer.add_tensor("blk.0.attn_k.weight", rand(kv_heads * head_dim, hidden))
-        writer.add_tensor("blk.0.attn_v.weight", rand(kv_heads * head_dim, hidden))
-        writer.add_tensor("blk.0.attn_output.weight", rand(hidden, heads * head_dim))
-        writer.add_tensor("blk.0.attn_norm.weight", rand(hidden))
-        writer.add_tensor("blk.0.ffn_norm.weight", rand(hidden))
-        writer.add_tensor("blk.0.ffn_gate.weight", rand(ffn, hidden))
-        writer.add_tensor("blk.0.ffn_up.weight", rand(ffn, hidden))
-        writer.add_tensor("blk.0.ffn_down.weight", rand(hidden, ffn))
+        add_tensor("token_embd.weight", rand(vocab, hidden))
+        add_tensor("output_norm.weight", rand(hidden))
+        add_tensor("blk.0.attn_q.weight", rand(heads * head_dim, hidden))
+        add_tensor("blk.0.attn_k.weight", rand(kv_heads * head_dim, hidden))
+        add_tensor("blk.0.attn_v.weight", rand(kv_heads * head_dim, hidden))
+        add_tensor("blk.0.attn_output.weight", rand(hidden, heads * head_dim))
+        add_tensor("blk.0.attn_norm.weight", rand(hidden))
+        add_tensor("blk.0.ffn_norm.weight", rand(hidden))
+        add_tensor("blk.0.ffn_gate.weight", rand(ffn, hidden))
+        add_tensor("blk.0.ffn_up.weight", rand(ffn, hidden))
+        add_tensor("blk.0.ffn_down.weight", rand(hidden, ffn))
+    elif arch == "qwen2moe":
+        writer.add_head_count_kv(heads)
+        writer.add_context_length(128)
+        writer.add_layer_norm_rms_eps(1e-6)
+        writer.add_expert_count(4)
+        writer.add_expert_used_count(2)
+        add_tensor("token_embd.weight", rand(vocab, hidden))
+        add_tensor("output.weight", rand(vocab, hidden))
+        add_tensor("output_norm.weight", rand(hidden))
+        for projection in ("q", "k", "v", "output"):
+            add_tensor(f"blk.0.attn_{projection}.weight", rand(hidden, hidden))
+            if projection != "output":
+                add_tensor(f"blk.0.attn_{projection}.bias", rand(hidden))
+        add_tensor("blk.0.attn_norm.weight", rand(hidden))
+        add_tensor("blk.0.ffn_norm.weight", rand(hidden))
+        add_tensor("blk.0.ffn_gate_inp.weight", rand(4, hidden))
+        add_tensor("blk.0.ffn_gate_inp_shexp.weight", rand(hidden))
+        for projection in ("gate", "up", "down"):
+            expert_shape = (4, hidden, hidden)
+            shared_shape = (hidden, 2 * hidden) if projection == "down" else (2 * hidden, hidden)
+            add_tensor(f"blk.0.ffn_{projection}_exps.weight", rand(*expert_shape))
+            add_tensor(f"blk.0.ffn_{projection}_shexp.weight", rand(*shared_shape))
     elif arch == "phi3":
         kv_heads = heads  # keep q/k/v head counts equal for the fused qkv path
         writer.add_head_count_kv(kv_heads)
@@ -346,10 +381,66 @@ def test_real_gguf_converts_and_loads_with_finite_logits(arch: str, tmp_path: Pa
 
     model, _tokenizer, config = load(str(output_dir), return_config=True)
     assert config["model_type"] == arch
+    if arch == "gemma":
+        from mlx import nn
+
+        assert config["model_file"] == "gemma_model.py"
+        values = mx.array([-2.0, -0.5, 0.5, 2.0])
+        np.testing.assert_array_equal(
+            np.asarray(model.layers[0].mlp.activation(values)),
+            np.asarray(nn.gelu_approx(values)),
+        )
 
     logits = model(mx.array([[1, 3, 4, 5]], dtype=mx.int32))
     assert logits.shape == (1, 4, config["vocab_size"])
     assert mx.isfinite(logits).all().item()
+
+
+@pytest.mark.parametrize("direct_quant", [False, True])
+def test_gemma_quantized_conversion_preserves_activation_adapter(tmp_path, direct_quant):
+    import mlx.core as mx
+    from mlx import nn
+    from mlx_lm import load
+
+    source, output = tmp_path / "gemma.gguf", tmp_path / "quantized"
+    _build_tiny_gguf(source, "gemma", hidden=64, quantized=True)
+    assert core.convert(
+        str(source), str(output), quantize=True, direct_quant=direct_quant, q_group_size=64,
+    )
+    config = json.loads((output / "config.json").read_text())
+    assert config["model_file"] == "gemma_model.py"
+    assert (output / "gemma_model.py").read_bytes() == (
+        Path(core.__file__).parent / "data" / "gemma_model.py"
+    ).read_bytes()
+    assert config["hidden_activation"] == "gelu_pytorch_tanh"
+    model, _ = load(str(output))
+    values = mx.array([-2.0, -0.5, 0.5, 2.0])
+    np.testing.assert_array_equal(
+        np.asarray(model.layers[0].mlp.activation(values)), np.asarray(nn.gelu_approx(values)),
+    )
+    assert mx.isfinite(model(mx.array([[3, 4]], dtype=mx.int32))).all().item()
+
+
+@pytest.mark.parametrize("direct_quant", [False, True])
+def test_tiny_qwen2_moe_shared_experts_load_and_run(tmp_path, direct_quant):
+    import mlx.core as mx
+    from mlx_lm import load
+
+    source, output = tmp_path / "qwen.gguf", tmp_path / "qwen-mlx"
+    _build_tiny_gguf(source, "qwen2moe", hidden=64, quantized=True)
+    assert core.convert(
+        str(source), str(output), quantize=True, direct_quant=direct_quant,
+    )
+    model, _, config = load(str(output), return_config=True)
+    assert config["moe_intermediate_size"] == 64
+    assert config["shared_expert_intermediate_size"] == 128
+    assert model.layers[0].mlp.shared_expert_gate(mx.zeros((1, 64), dtype=mx.float16)).shape == (1, 1)
+    logits = model(mx.array([[3, 4]], dtype=mx.int32))
+    assert logits.shape == (1, 2, 32)
+    assert mx.isfinite(logits).all().item()
+    router_logits = _extract_router_logits(model, [3, 4])
+    assert router_logits.shape == (1, 2, 4)
+    assert np.isfinite(router_logits).all()
 
 
 @pytest.mark.parametrize("fixture_name", ["gemma", "phi3"])
@@ -413,15 +504,29 @@ def _extract_router_logits(model, token_ids: list[int]) -> np.ndarray:
     import mlx.core as mx
 
     model_body = getattr(model, "model", model)
-    embeddings = model_body.embed_tokens(mx.array([token_ids], dtype=mx.int32))
+    gate = None
     for layer in model_body.layers:
         gate = getattr(getattr(layer, "mlp", None), "gate", None)
         if callable(gate):
-            return np.asarray(gate(embeddings))
-    raise AssertionError("Converted MoE model exposes no callable router gate")
+            break
+    assert callable(gate), "Converted MoE model exposes no callable router gate"
+    captured = []
+    original_call = type(gate).__call__
+
+    def capture(module, *args, **kwargs):
+        result = original_call(module, *args, **kwargs)
+        if module is gate:
+            captured.append(result)
+        return result
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(type(gate), "__call__", capture)
+        mx.eval(model(mx.array([token_ids], dtype=mx.int32)))
+    assert len(captured) == 1, "Expected exactly one first-layer router evaluation"
+    return np.asarray(captured[0])
 
 
-@pytest.mark.parametrize("arch", ["qwen3moe", "deepseek2"])
+@pytest.mark.parametrize("arch", ["qwen2moe", "qwen3moe", "deepseek2"])
 def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
     arch: str, tmp_path: Path
 ):
@@ -433,7 +538,8 @@ def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
     source = model_paths.get(arch)
     if not source:
         pytest.skip(f"GGUF2MLX_MOE_MODELS does not provide {arch}")
-    output_dir = tmp_path / f"{arch}-mixed"
+    output_root = Path(os.getenv("GGUF2MLX_MOE_OUTPUT_ROOT", str(tmp_path)))
+    output_dir = output_root / f"{arch}-mixed"
     assert core.convert(
         source,
         str(output_dir),
@@ -441,12 +547,12 @@ def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
         direct_quant=True,
         mixed_precision=True,
     )
-    validate_mixed_artifacts(output_dir)
+    mixed_report = validate_mixed_artifacts(output_dir)
 
     import mlx.core as mx
     from mlx_lm import generate, load
 
-    uniform_dir = tmp_path / f"{arch}-uniform"
+    uniform_dir = output_root / f"{arch}-uniform"
     assert core.convert(source, str(uniform_dir), quantize=True, direct_quant=True)
     model, tokenizer = load(str(uniform_dir))
     token_ids = tokenizer.encode("Explain why the sky is blue.", add_special_tokens=False)
@@ -457,7 +563,48 @@ def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
     entropy = _normalized_router_entropy(router_logits)
     assert 0.05 < entropy < 0.95
 
-    output = generate(model, tokenizer, prompt="Explain why the sky is blue.", max_tokens=32)
+    prompt = "Explain why the sky is blue."
+    if tokenizer.chat_template:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True,
+        )
+    output = generate(model, tokenizer, prompt=prompt, max_tokens=32)
     generated_tokens = tokenizer.encode(output, add_special_tokens=False)
     assert output.isprintable()
     assert len(set(generated_tokens)) >= max(2, len(generated_tokens) // 8)
+    if report_dir := os.getenv("GGUF2MLX_MOE_REPORT_DIR"):
+        directory = Path(report_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        with Path(source).open("rb") as handle:
+            source_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+        result = {
+            "success": True,
+            "architecture": arch,
+            "source": source,
+            "source_sha256": source_hash,
+            "source_bytes": Path(source).stat().st_size,
+            "mixed_model_directory": str(output_dir),
+            "uniform_model_directory": str(uniform_dir),
+            "mixed_artifacts_valid": True,
+            "mixed_protected_routers": len(mixed_report["protected_router_tensors"]),
+            "mixed_compressed_experts": len(mixed_report["compressed_expert_tensors"]),
+            "uniform_model_loaded": True,
+            "logits_shape": list(logits.shape),
+            "logits_finite": bool(mx.isfinite(logits).all().item()),
+            "first_layer_router_logits_shape": list(router_logits.shape),
+            "normalized_router_entropy": entropy,
+            "router_entropy_bounds": [0.05, 0.95],
+            "generation_prompt": prompt,
+            "generated_text": output,
+            "generated_token_count": len(generated_tokens),
+            "generated_unique_tokens": len(set(generated_tokens)),
+            "generation_checks": "printable and non-degenerate; not a semantic-quality proof",
+            "platform": platform.platform(),
+            "packages": {
+                name: importlib.metadata.version(name)
+                for name in ("gguf", "mlx", "mlx-lm", "numpy")
+            },
+        }
+        (directory / f"{arch}-real-validation.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )

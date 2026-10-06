@@ -29,6 +29,33 @@ def test_gate_never_rounds_or_uses_tolerance():
     assert round(5.0, 4) == round(close, 4)
 
 
+@pytest.mark.parametrize(
+    "kinds,control,accepted",
+    [
+        (["F16", "F32"], True, True),
+        (["F32"], True, True),
+        (["Q4_0"], True, False),
+        (["Q8_0"], True, False),
+        (["F16"], False, False),
+        (["Q4_0", "F32"], False, True),
+        ([], True, False),
+    ],
+)
+def test_unquantized_control_is_explicit_and_rejects_quantized_sources(monkeypatch, kinds, control, accepted):
+    import gguf
+
+    reader = SimpleNamespace(tensors=[
+        SimpleNamespace(tensor_type=gguf.GGMLQuantizationType[kind], name=str(i))
+        for i, kind in enumerate(kinds)
+    ])
+    monkeypatch.setattr(gguf, "GGUFReader", lambda path: reader)
+    if accepted:
+        assert benchmark._validate_source(Path("control.gguf"), control)
+    else:
+        with pytest.raises(ValueError):
+            benchmark._validate_source(Path("control.gguf"), control)
+
+
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, -1.0, 0.5])
 def test_invalid_ppl_fails(bad):
     with pytest.raises(ValueError):

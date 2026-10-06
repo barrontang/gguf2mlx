@@ -23,7 +23,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_source(path: Path) -> dict[str, int]:
+def _validate_source(path: Path, unquantized_control: bool = False) -> dict[str, int]:
     from gguf import GGMLQuantizationType, GGUFReader
 
     reader = GGUFReader(str(path))
@@ -37,7 +37,10 @@ def _validate_source(path: Path) -> dict[str, int]:
         if kind not in allowed:
             raise ValueError(f"MVP benchmark does not support {kind.name}: {tensor.name}")
         counts[kind.name] = counts.get(kind.name, 0) + 1
-    if not counts.get("Q4_0"):
+    if unquantized_control:
+        if not counts or set(counts) - {"F32", "F16"}:
+            raise ValueError("An unquantized control must contain only F32/F16 tensors")
+    elif not counts.get("Q4_0"):
         raise ValueError("The reference model must contain Q4_0 tensors")
     return counts
 
@@ -122,7 +125,11 @@ class _MlxLogits:
 
 
 def _evaluate(args) -> dict:
-    counts = _validate_source(args.input)
+    control = getattr(args, "unquantized_control", False)
+    counts = (
+        _validate_source(args.input, unquantized_control=True)
+        if control else _validate_source(args.input)
+    )
     import mlx.core as mx
     from llama_cpp import Llama, llama_print_system_info
     from mlx_lm.perplexity import eval_ppl
@@ -160,7 +167,7 @@ def _evaluate(args) -> dict:
     })
     artifacts = [
         path for path in args.mlx_model.rglob("*")
-        if path.is_file() and path.suffix in {".safetensors", ".json", ".model", ".jinja"}
+        if path.is_file() and path.suffix in {".safetensors", ".json", ".model", ".jinja", ".py"}
     ]
     if not any(path.suffix == ".safetensors" for path in artifacts):
         raise ValueError("MLX model directory contains no safetensors weights")
@@ -170,6 +177,7 @@ def _evaluate(args) -> dict:
         "input": str(args.input),
         "input_sha256": _sha256(args.input),
         "source_tensor_types": counts,
+        "unquantized_control": control,
         "mlx_model": str(args.mlx_model),
         "mlx_artifacts_sha256": {
             str(path.relative_to(args.mlx_model)): _sha256(path) for path in sorted(artifacts)
@@ -200,6 +208,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--eval-ppl", action="store_true", required=True)
     parser.add_argument("--input", type=Path, required=True, help="Original Q4_0 GGUF")
+    parser.add_argument(
+        "--unquantized-control", action="store_true",
+        help="Evaluate an explicitly labeled F16/F32-only control; equality remains exact",
+    )
     parser.add_argument("--mlx-model", type=Path, required=True, help="Converted local MLX model")
     parser.add_argument("--corpus", type=Path, required=True, help="Fixed UTF-8 text, no downloads")
     parser.add_argument("--result-json", type=Path, required=True)

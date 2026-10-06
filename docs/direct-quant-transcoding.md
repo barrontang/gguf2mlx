@@ -249,8 +249,182 @@ remain future work.
 
 - Step 1: strict runner and portable failure/equality tests established.
 - Step 2: MVP layout fixtures and opt-in packed-array consumer tests established.
-- Real-model zero-delta acceptance and Apple Silicon consumer execution must be
-  run on a Mac with the original model and fixed corpus; no real-model parity
-  result is claimed from Linux-only tests.
+- Mac validation executed in the `conda` environment `gguf2mlx`:
+  Apple Silicon and real Gemma/Qwen1.5 MoE tests enabled -> 319 passed / 2 skipped,
+  `ruff check src/ tests/ benchmarks/` passes, and Rust unit tests ->
+  3 passed (on macOS these tests require
+  `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`).
+  Remaining skips need external Qwen3-MoE and DeepSeek2 models, not Gemma or
+  packed-array hardware support.
+- Q4_0/Q8_0 layout fixtures and external packed-array checks are now covered by
+  `tests/test_transpacking_layout.py` (portable + Apple-Silicon opt-in paths).
+- Gemma tokenizer identity and unpatched local conversion now pass. The
+  real-model strict PPL evaluation has executed, but fails the zero-delta
+  requirement; see the recorded results below. No numerical parity is claimed.
+- Security scan status depends on scope: dependency audit in this environment
+  reports the known `diskcache` advisory (`PYSEC-2026-2447`), while source-level
+  static scan findings are pre-existing and unrelated to transpacking research.
+- The tokenizer follow-up fixed reconstruction and safetensors shard indexing.
+  Subsequent numerical diagnosis also corrected dense GGUF row-major decoding
+  and added a Gemma tanh-GELU runtime adapter. Q4_0/Q8_0 dequantization formulas
+  and quantization algorithms remain unchanged.
 - Core native transpacking implementation and K-quant support are intentionally
   not part of steps 1–2.
+
+### Gemma Mac validation (2026-10-06)
+
+Source: `mlabonne/gemma-2b-it-GGUF/gemma-2b-it.Q4_0.gguf` (first-generation
+Gemma, not Gemma 2). SHA-256:
+`1047c37fc64926600e08db71f49c86bbdbfb6d4a6af9ab05a2c3d651bf453ea5`.
+The GGUF contains 127 Q4_0 and 37 F32 tensors. The standard local conversion
+produces FP16 safetensors from this exact GGUF, not independently quantized
+community MLX weights.
+
+The original mismatch had two tokenizer reconstruction problems: Gemma's
+SentencePiece vocabulary scores encode BPE merge priorities, not Unigram
+probabilities, and the GGUF's default space-prefix behavior must be preserved.
+The rebuilt tokenizer uses score-ranked BPE merges, preserves whitespace and
+combining Unicode characters without NFC normalization, and uses the generic
+fast tokenizer loader rather than a Llama-specific loader. Explicit BOS/EOS
+flags and token IDs remain intact. The separate `safe_open` indexing crash is
+fixed by reading its public `keys()` API.
+
+The opt-in native regression checks vocabulary size, BOS, English, leading and
+repeated spaces, tabs, newlines, composed/decomposed Unicode, Chinese, emoji,
+and the complete README against llama.cpp. To reproduce:
+
+```sh
+GGUF2MLX_RUN_E2E=1 GGUF2MLX_GEMMA_GGUF=/absolute/path/gemma-2b-it.Q4_0.gguf \
+  conda run -n gguf2mlx python -m pytest -q -rs tests/
+conda run -n gguf2mlx python -m gguf2mlx \
+  --input /absolute/path/gemma-2b-it.Q4_0.gguf \
+  --output /absolute/path/new-gemma-mlx
+conda run -n gguf2mlx python benchmarks/benchmark_transpacking.py --eval-ppl \
+  --input /absolute/path/gemma-2b-it.Q4_0.gguf \
+  --mlx-model /absolute/path/new-gemma-mlx \
+  --corpus /absolute/path/fixed-corpus.txt \
+  --sequence-length 128 --num-samples 8 --add-bos --n-gpu-layers 0 \
+  --result-json /absolute/path/new-ppl-result.json
+```
+
+The evaluated corpus is a frozen README snapshot, SHA-256
+`25e7e6231689abdb31a825f184ded778ea347b9f34d2698469a06dbaf441a581`;
+both tokenizers produced the same 6,748 IDs. Eight contiguous windows of 128
+tokens (BOS included) score 1,016 next tokens. This small repository-text corpus
+is a reproducibility check, not a standard language-quality benchmark.
+
+| Measurement | llama.cpp (CPU) | MLX (FP16 conversion) |
+|---|---|---|
+| Unrounded PPL | 143.58573263274607 | 143.17148969720395 |
+| PPL hexadecimal | `0x1.1f2be525cbb05p+7` | `0x1.1e57cd7f622f1p+7` |
+| Standard error | 34.199934274650985 | 34.08338813547865 |
+
+Absolute delta is **0.41424293554212**, tolerance is **0.0**, exit status is
+**1**, and raw logit hashes differ. Both evaluations completed; the failure is
+no longer a tokenizer precondition failure. Cross-runtime numerical parity
+remains unproven and the gate has not been relaxed.
+
+Environment: macOS 27.0.1 arm64, conda `gguf2mlx`, Python 3.11.13, gguf 0.18.0,
+NumPy 2.3.3, MLX 0.31.2, MLX-LM 0.31.3, llama-cpp-python 0.3.36.
+`bit_exact_transpacking_proven` remains false.
+
+### Numerical isolation and precision controls
+
+All runs below use the same frozen corpus, identical token windows and scoring
+protocol above. Strict tolerance remains **0.0**; every PPL comparison below
+returns exit status **1**, with differing raw-logit hashes.
+
+| Control after activation alignment | llama.cpp PPL | MLX PPL | Absolute delta |
+|---|---|---|---|
+| Original Q4_0, native CPU / dense MLX FP16 | 143.58573263274607 | 143.14397973754745 | 0.4417528951986185 |
+| Original Q4_0, native CPU / dense MLX FP32 | 143.58573263274607 | 143.14732433867772 | 0.4384082940683527 |
+| Same decoded Q4 weights, dense F32 GGUF CPU / MLX FP32 | 143.1465735030501 | 143.14732433867772 | 0.0007508356276275663 |
+| Original Q4_0, native Metal (`n_gpu_layers=-1`) / MLX FP32 | 143.15920171702348 | 143.14732433867772 | 0.011877378345758416 |
+| Unquantized HF mirror cast to FP16, native CPU / MLX FP16 | 117.02195028668703 | 117.10903131716553 | 0.08708103047850102 |
+
+The final row uses public `alpindale/gemma-2b-it` **BF16** HF weights cast to
+FP16, with source GGUF tokenizer/config metadata retained on both sides. It
+is not an authenticated download of Google's official FP16 checkpoint, nor
+proof that the mirror and community Q4_0 share the same original weights.
+Compare each row's two engines, not the absolute PPL across different weight
+sources. F32 norm vectors are retained for native Gemma CPU compatibility;
+making them F16 causes a native unsupported-type abort before scoring.
+
+Verified causes and boundaries:
+
+1. **Q4 decode is exact.** `benchmarks/audit_q4_decode.py` compares every value
+   against the actual loaded library's `dequantize_row_q4_0`. All **127**
+   Q4_0 tensors, **2,506,096,640** values have **zero bit differences**.
+   FP32 -> FP16 -> FP32 round trips also have zero bit differences for these
+   decoded values. This does not audit every arbitrary future Q4 model.
+2. **Scales are not native MLX packed arrays in the standard path.** GGUF `d`
+   is stored as FP16, promoted exactly to FP32 by the reference decoder, then
+   decoded dense weights are cast to the requested output dtype. Changing
+   this exact FP16-to-FP32 promotion cannot explain the measured drift.
+3. **Gemma norm restoration is not missing or doubled here.** All **75,776**
+   norm values restore/reapply the `-1`/`+1` convention exactly in both tested
+   FP16 and FP32 paths, relative to their corresponding dtype input.
+4. **Native Q4 CPU and dense execution are different computations.** The
+   loaded native library reports ggml `0.25.3`, commit `0c1e570-dirty`.
+   Its `ggml_get_type_traits_cpu(Q4_0).vec_dot_type` is **Q8_0**: Q4 dot
+   products use quantized activation operands, while dense MLX matmul does
+   not. Even native CPU alone changes from **143.58573263274607** to
+   **143.1465735030501** with identical decoded weights stored as F32.
+   Metal offload greatly reduces but does not eliminate the cross-engine gap.
+5. **A real graph discrepancy was repaired.** Installed MLX-LM 0.31.3 Gemma
+   uses erf GELU while the converter config requests `gelu_pytorch_tanh` and
+   native Gemma uses tanh GELU. A bundled local `gemma_model.py` honors this
+   config using MLX-LM's supported `model_file` loader. With the same dense
+   F32 weights, the PPL gap falls from **0.05256800605832268** to
+   **0.0007508356276275663**. The smaller residual is still a strict failure;
+   its individual contributing kernels have not been isolated.
+6. **Dense GGUF layout was repaired independently.** Reader tensor shapes
+   are in GGML axis order but data is NumPy row-major. Reshaping to GGML
+   order and then transposing scrambled dense F16/F32 matrices. Regressions
+   cover non-square matrices and every supported dense scalar dtype. This
+   bug affected clean dense controls, not the original Q4 block decoder.
+
+Reproduce controls without overwriting any source:
+
+```sh
+conda run --no-capture-output -n gguf2mlx python benchmarks/audit_q4_decode.py \
+  --input /absolute/path/gemma-2b-it.Q4_0.gguf \
+  --result-json /absolute/path/q4-decode-audit.json
+conda run --no-capture-output -n gguf2mlx python benchmarks/materialize_precision_control.py \
+  --input /absolute/path/gemma-2b-it.Q4_0.gguf \
+  --output /absolute/path/new-decoded-f32.gguf --dtype float32
+# Optional unquantized mirror control instead of decoded Q4 weights:
+conda run --no-capture-output -n gguf2mlx python benchmarks/materialize_precision_control.py \
+  --input /absolute/path/gemma-2b-it.Q4_0.gguf \
+  --hf-model /absolute/path/local-unquantized-hf-mirror \
+  --output /absolute/path/new-hf-f16.gguf --dtype float16
+conda run --no-capture-output -n gguf2mlx python -m gguf2mlx \
+  --input /absolute/path/new-decoded-f32.gguf \
+  --output /absolute/path/new-decoded-f32-mlx --dtype float32
+conda run --no-capture-output -n gguf2mlx python benchmarks/benchmark_transpacking.py \
+  --eval-ppl --unquantized-control --input /absolute/path/new-decoded-f32.gguf \
+  --mlx-model /absolute/path/new-decoded-f32-mlx \
+  --corpus /absolute/path/fixed-corpus.txt \
+  --sequence-length 128 --num-samples 8 --add-bos --n-gpu-layers 0 \
+  --result-json /absolute/path/new-dense-control-ppl.json
+```
+
+Use matching control/input paths and `--dtype float16` for the HF-derived
+FP16 row. `--unquantized-control` explicitly permits only F16/F32 weights; it
+does not disable tokenizer checks, logit checks or the strict equality gate.
+Reports hash the local executable model adapter as well as weights/config.
+The adapter is included in built wheels and preserved by standard
+`--quantize`/MLX-LM conversion. Direct-quant adapter publication is covered
+separately; it does not certify direct-quant numerical or loader parity.
+An additional probe found the direct path emitted byte-packed uint8 weights,
+while MLX-LM 0.31.3 expects uint32-packed weights. The subsequent Qwen MoE
+validation fixes this contract: eight 4-bit codes per uint32 word, low code in
+the low nibble, and a 64-column projection has shape `(rows, 8)`. Synthetic
+Gemma and Qwen2MoE standard/direct outputs now load and produce finite logits.
+This is affine re-quantization, not a source-bit-preserving transpack.
+
+Status: diagnosis and real-model evaluations completed; **zero-tolerance
+acceptance remains blocked**, not passed. Exact decode bytes and corrected
+formulas do not guarantee identical floating-point execution across these
+backends. No corpus selection, result rounding, tolerance increase or
+same-engine substitution was used.

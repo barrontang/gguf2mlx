@@ -60,7 +60,8 @@ def test_moe_layout_without_router_fails_closed():
 def test_affine_4bit_supports_stacked_expert_weights():
     weights = np.arange(2 * 3 * 64, dtype=np.float32).reshape(2, 3, 64)
     packed, scales, biases = core._quantize_affine_4bit(weights, 64)
-    assert packed.shape == (2, 3, 32)
+    assert packed.shape == (2, 3, 8)
+    assert packed.dtype == np.uint32
     assert scales.shape == (2, 3, 1)
     assert biases.shape == (2, 3, 1)
 

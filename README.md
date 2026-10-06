@@ -277,7 +277,7 @@ separate registry; only the LLaVA Llama + CLIP adapter is currently enabled.
 |---|---|---|---|---|---|---|---|
 | Llama | `llama`, `mistral` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen | `qwen2` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
-| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ⚠️ scheduled opt-in | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 real GGUF; Qwen3 opt-in pending | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | DeepSeek | `deepseek2`, `deepseek3` | ✅ | ⚠️ scheduled opt-in | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | GLM | `glm4moe` | ✅ | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | Gemma | `gemma` | ✅ fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
@@ -453,10 +453,18 @@ pytest
 # Opt-in MLX-LM integration test (Apple Silicon)
 GGUF2MLX_RUN_E2E=1 pytest tests/test_e2e.py
 
-# Real MoE validation (two families, finite logits, router entropy, generation)
+# Real MoE validation (finite logits, actual router entropy, generation)
 GGUF2MLX_RUN_E2E=1 \
 GGUF2MLX_MOE_MODELS='{"qwen3moe":"/models/qwen3.gguf","deepseek2":"/models/deepseek2.gguf"}' \
 pytest tests/test_e2e.py -k real_moe
+
+# Smaller Qwen1.5 MoE fixture (Q2_K GGUF, about 5.89 GB)
+# Output paths must be new; omit OUTPUT_ROOT to use pytest temporary directories.
+GGUF2MLX_RUN_E2E=1 \
+GGUF2MLX_MOE_MODELS='{"qwen2moe":"/models/Qwen1.5-MoE-A2.7B-Chat.Q2_K.gguf"}' \
+GGUF2MLX_MOE_OUTPUT_ROOT=/models/new-qwen-moe-validation \
+GGUF2MLX_MOE_REPORT_DIR=/reports/qwen-moe \
+pytest -q 'tests/test_e2e.py::test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output[qwen2moe]'
 
 # Validate an embedded chat template against five conversation shapes
 python -m gguf2mlx.chat_validation ./converted-model --expect-marker '<|im_start|>'
@@ -512,7 +520,7 @@ Completed:
 - fixture-backed Gemma and standard Phi-3 4K adapters
 - GGUF tokenizer flags and embedded tokenizer JSON preservation
 - reproducible conversion benchmark harness
-- bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, dense and declared MoE adapters, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K–Q8_K/BF16 source qtypes)
+- bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, dense and declared MoE adapters, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K–Q8_K/IQ4_NL/BF16 source qtypes)
 - fail-closed MoE detection, default router protection, mixed-precision artifact output, and JSON conversion reports
 - required tokenizer/chat-template CI plus scheduled opt-in two-family MoE validation
 - StableLM conversion adapter (norm_eps, partial_rotary_factor, qk_layernorm, use_parallel_residual)
@@ -530,6 +538,70 @@ Remaining areas for contributors:
 - evaluate GGUF→MLX conversion for high-demand non-text models (e.g. ASR/embedding) where competition is thin (pending verification that such models ship GGUF)
 - add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks
 - publish additional architecture-specific tokenizer normalizer fixtures as upstream formats evolve
+
+### Mac validation snapshot (2026-10-06)
+
+- Environment: `conda` env `gguf2mlx` on Apple Silicon.
+- Validation with Apple Silicon tests enabled and public Gemma/Qwen1.5 MoE GGUFs supplied:
+  **319 passed, 2 skipped**; the remaining skips require external Qwen3-MoE
+  and DeepSeek2 models. Rust unit tests => **3 passed** (macOS link flags required:
+  `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`).
+- Research guardrails now include:
+  - fail-closed, zero-tolerance, unrounded llama.cpp vs MLX perplexity runner
+    (`benchmarks/benchmark_transpacking.py`)
+  - Q4_0/Q8_0 memory-layout and external packed-array contract tests
+    (`tests/test_transpacking_layout.py`)
+- Fixed Gemma SentencePiece BPE reconstruction and the safetensors shard-index
+  iteration failure. The public `mlabonne/gemma-2b-it-GGUF` Q4_0 model now
+  converts locally without monkeypatches, and token IDs match native llama.cpp.
+- Real-model PPL evaluation completed on a fixed README snapshot (8 windows of
+  128 tokens, BOS per window, 1,016 scored tokens, llama.cpp on CPU):
+  llama.cpp **143.58573263274607**, converted FP16 MLX **143.17148969720395**,
+  absolute delta **0.41424293554212**. The zero-tolerance gate correctly
+  **fails**; tokenizer parity is fixed, but numerical parity is not established.
+  See [the research protocol and results](docs/direct-quant-transcoding.md#gemma-mac-validation-2026-10-06).
+- Numerical diagnosis found a dense GGUF row-major decoding bug and a stock
+  MLX-LM Gemma erf/tanh GELU mismatch; both are corrected. All 2,506,096,640
+  decoded Q4_0 values match native llama.cpp bit-for-bit. Same-weight dense
+  FP32 PPL delta is now **0.0007508356276275663**, but the original Q4_0 CPU
+  comparison still fails: native Q4_0 matmul uses Q8_0 activation operands,
+  unlike dense MLX. The HF-mirror-derived FP16 control also fails
+  (**0.08708103047850102**). No gate tolerance was changed.
+- Important boundary: equal perplexity is a quality gate only; it does **not**
+  by itself prove bit-identical tensors/logits.
+
+### Qwen1.5 MoE real-model validation (2026-10-06)
+
+- Source: [RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf](https://huggingface.co/RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf),
+  revision `947580e7b3904cd4081810d0efec4520a75609c7`,
+  `Qwen1.5-MoE-A2.7B-Chat.Q2_K.gguf`: **5,890,163,424 bytes**.
+  SHA-256 `43d1dbd226e1321fd3638c8294022df2906c0ab158a7a2a8bd022b442e8b98bf`
+  matches the Hugging Face LFS metadata.
+- This smaller Qwen MoE family has about 14.3B total / 2.7B active parameters,
+  24 layers and 60 experts, selecting 4 per token. Q2_K is the smallest
+  compatible variant among the inspected sources; smaller IQ1/IQ2 variants
+  are not supported by the direct-quant path. The file mixes Q2_K, Q3_K,
+  IQ4_NL and Q6_K weights rather than exclusively containing Q2_K.
+- Both mixed and uniform affine 4-bit conversions complete. The mixed
+  artifact validator confirms **24 protected routers** and **72 compressed
+  expert tensors**; a JANG mixed-runtime load is still not certified.
+- Uniform MLX-LM load and forward pass succeed: logits shape
+  **`[1, 8, 151936]`**, all finite. First-layer router logits are captured
+  from the actual forward pass, shape **`[1, 8, 60]`**; normalized entropy
+  **0.9375427467178497**, within the test's `(0.05, 0.95)` bounds.
+- Chat-template generation produces 32 tokens / 26 distinct token IDs,
+  beginning: “The blue color of the sky is due to a combination of factors,
+  primarily the scattering of sunlight and the Earth's atmosphere.”
+  The automated check certifies printable, non-degenerate text, not general
+  semantic quality.
+- Native tokenizer parity passes for English, whitespace, Chinese/emoji,
+  decomposed Unicode and all **6,237 tokens** of the frozen evaluation corpus.
+  Fixed accidental registration of ordinary `!` as a missing unknown token
+  and Qwen GGUF's unintended NFC normalization.
+- Real validation also exposed and repaired uint8/uint32 packed-weight
+  incompatibility, missing Qwen2MoE shared-expert mappings/gate shape and
+  legacy expert-dimension metadata handling. These are conversion fixes,
+  not source-preserving transpacking or a zero-tolerance PPL pass.
 
 ---
 

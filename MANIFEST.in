@@ -4,3 +4,4 @@ include llms.txt
 recursive-include benchmarks *.py
 recursive-include docs *.md
 recursive-include tests/fixtures *.json
+recursive-include src/gguf2mlx/data *.py *.jinja
