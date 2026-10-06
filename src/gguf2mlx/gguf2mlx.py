@@ -2177,6 +2177,12 @@ def convert(
     direct_quant: bool = False,
     moe_router_protect: bool = True,
     mixed_precision: bool = False,
+    model_type: str = "auto",
+    mmproj: str | None = None,
+    hf_model: str | None = None,
+    hf_fallback_vision: str | None = None,
+    hf_revision: str = "main",
+    offline: bool = False,
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     if quantize and q_group_size not in SUPPORTED_MLX_LM_Q_GROUP_SIZES:
@@ -2200,6 +2206,49 @@ def convert(
     direct_quantized_output_path = staging_path / "direct-quantized"
 
     try:
+        from .vlm import convert_vlm, is_vlm
+
+        if model_type not in {"auto", "llm", "vlm"}:
+            print(f"❌ Unsupported conversion type: {model_type}")
+            return False
+        vlm_options = bool(mmproj or hf_model or hf_fallback_vision)
+        if model_type == "llm" and vlm_options:
+            print("❌ VLM source options cannot be used with --type llm")
+            return False
+        detected_vlm = False
+        if Path(gguf_path).is_file():
+            try:
+                reader = GGUFReader(gguf_path)
+                detected_vlm = is_vlm(reader)
+                del reader
+            except Exception as error:  # noqa: BLE001
+                print(f"❌ Could not inspect GGUF: {error}")
+                return False
+        if model_type == "llm" and detected_vlm:
+            print("❌ Multimodal GGUF detected; use --type vlm with HF assets")
+            return False
+        if model_type == "vlm" or vlm_options or detected_vlm:
+            if quantize or direct_quant or mixed_precision:
+                print("❌ VLM conversion currently supports FP16/FP32 only, not LLM quantization")
+                return False
+            try:
+                convert_vlm(
+                    gguf_path,
+                    fp_output_path,
+                    dtype,
+                    mmproj=mmproj,
+                    hf_model=hf_model,
+                    hf_fallback_vision=hf_fallback_vision,
+                    hf_revision=hf_revision,
+                    offline=offline,
+                )
+            except Exception as error:  # noqa: BLE001
+                print(f"❌ VLM conversion failed: {error}")
+                return False
+            if output_path.exists():
+                output_path.rmdir()
+            fp_output_path.replace(output_path)
+            return True
         if mixed_precision and not (quantize and direct_quant):
             print("❌ --mixed-precision requires --quantize and --direct-quant")
             return False
@@ -2461,6 +2510,26 @@ def verify_mlx_bundle(bundle_path: str) -> bool:
 
 def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--type", dest="model_type", choices=["auto", "llm", "vlm"], default="auto",
+        help="Conversion family (default: auto-detect multimodal metadata/tensors)",
+    )
+    parser.add_argument(
+        "--mmproj", help="Companion vision/projector GGUF for split VLM releases",
+    )
+    parser.add_argument(
+        "--hf-model", help="Matching full HF VLM repository or local directory for config/assets",
+    )
+    parser.add_argument(
+        "--hf-fallback-vision",
+        help="Use original vision weights from this matching HF VLM repository/local directory",
+    )
+    parser.add_argument(
+        "--hf-revision", default="main", help="HF source revision; pin a commit for reproducibility",
+    )
+    parser.add_argument(
+        "--offline", action="store_true", help="Use only local/cached HF VLM assets",
+    )
+    parser.add_argument(
         "--input", "-i", required=True, help="Input GGUF file path"
     )
     parser.add_argument(
@@ -2528,8 +2597,11 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         args.output = Path(args.input).stem + "-mlx"
 
     if args.skip_weights:
+        from .vlm import is_vlm
+
         reader = GGUFReader(args.input)
         print(f"Architecture: {detect_architecture(reader)}")
+        print(f"Conversion type: {'vlm' if is_vlm(reader) else 'llm'}")
         print(f"Tensors: {len(reader.tensors)}")
         print(f"Fields: {len(reader.fields)}")
         for name in sorted(reader.fields.keys()):
@@ -2547,6 +2619,12 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         direct_quant=args.direct_quant,
         moe_router_protect=args.moe_router_protect,
         mixed_precision=args.mixed_precision,
+        model_type=args.model_type,
+        mmproj=args.mmproj,
+        hf_model=args.hf_model,
+        hf_fallback_vision=args.hf_fallback_vision,
+        hf_revision=args.hf_revision,
+        offline=args.offline,
     )
     return 0 if success else 1
 
