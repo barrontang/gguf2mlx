@@ -134,6 +134,37 @@ def test_existing_destination_never_overwritten(routing):
     assert not state["calls"]
 
 
+def test_inspection_error_cleans_staging(routing, monkeypatch):
+    source, output, state, _ = routing
+
+    def unreadable(path):
+        raise ValueError("invalid GGUF header")
+
+    monkeypatch.setattr(core, "GGUFReader", unreadable)
+    assert not core.convert(str(source), str(output))
+    assert not state["calls"]
+    assert not output.exists()
+    assert not list(output.parent.glob(".out.*"))
+
+
+def test_invalid_conversion_type_is_rejected(routing):
+    source, output, state, _ = routing
+    assert not core.convert(str(source), str(output), model_type="universal-vlm")
+    assert not state["calls"]
+    assert not output.exists()
+
+
+def test_skip_weights_reports_family_without_hf_downloads(routing, monkeypatch, capsys):
+    source, output, state, _ = routing
+    state["detected"] = True
+    monkeypatch.setattr(core, "GGUFReader", lambda path: SimpleNamespace(tensors=[], fields={}))
+    monkeypatch.setattr(core, "detect_architecture", lambda reader: "llava")
+    core.main(["--input", str(source), "--output", str(output), "--skip-weights"])
+    assert "Conversion type: vlm" in capsys.readouterr().out
+    assert not state["calls"]
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("command", [[], ["convert"]])
 def test_both_cli_forms_forward_vlm_flags(monkeypatch, command):
     calls = []

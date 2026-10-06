@@ -2248,6 +2248,7 @@ def convert(
             if output_path.exists():
                 output_path.rmdir()
             fp_output_path.replace(output_path)
+            print(f"✅ VLM conversion complete: {output_path}")
             return True
         if mixed_precision and not (quantize and direct_quant):
             print("❌ --mixed-precision requires --quantize and --direct-quant")

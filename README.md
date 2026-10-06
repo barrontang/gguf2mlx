@@ -150,7 +150,9 @@ gguf2mlx convert --input language.gguf --mmproj mmproj.gguf \
   tensor shapes/completeness and tokenizer compatibility, then copies processor
   and tokenizer assets without executing remote code or loading pickle files.
   Not every GGUF/HF release pair is compatible; vocabulary/config mismatches
-  fail rather than fabricating weights.
+  fail rather than fabricating weights. Use a checkpoint whose image token is
+  covered by the language embedding vocabulary; older unresized exports are
+  not repaired by synthesizing embedding rows.
 - Direct conversion requires a complete supported CLIP layout. Some mmproj
   releases omit unused vision layers or normalization tensors: use the hybrid
   path when direct completeness validation fails.
@@ -265,8 +267,9 @@ print('loaded')
 1. **recognized for inspection** via GGUF metadata, and
 2. **conversion enabled** through an explicit tensor adapter.
 
-The current code recognizes 48 architecture identifiers for inspection and
-enables conversion for 12 identifiers.
+The language-model path recognizes 48 architecture identifiers for inspection
+and enables conversion for 12 identifiers. VLM detection and conversion use a
+separate registry; only the LLaVA Llama + CLIP adapter is currently enabled.
 
 ### Conversion-enabled architectures
 
@@ -281,6 +284,7 @@ enables conversion for 12 identifiers.
 | Phi | `phi3` | ✅ Phi-3 4K fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
 | StableLM | `stablelm` | ✅ | ❌ | ❌ | — | ✅ generic package/verify | ❌ |
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | ❌ real image inference unverified | ❌ | — | ✅ generic package/verify | ✅ Llama + CLIP only |
 
 “Conversion” means that a code path exists. “End-to-end” means a converted model
 has been loaded and exercised; ⚠️ rows still require the opt-in model fixtures.
