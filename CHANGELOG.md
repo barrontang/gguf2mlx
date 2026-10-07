@@ -4,6 +4,9 @@
 
 ### Fixes
 
+- Keep dev-only CI portable: skip HF precision-control tests when optional
+  MLX is absent, and run the Qwen BPE regression with `tokenizers` independently
+  of the optional `transformers` loader integration.
 - Rebuild first-generation Gemma SentencePiece tokenizers as score-ranked BPE,
   preserving GGUF whitespace-prefix behavior, Unicode, token IDs and BOS/EOS flags.
 - Use the public safetensors `keys()` API when finalizing shard indexes, with a
