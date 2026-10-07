@@ -125,9 +125,11 @@ def test_qwen_bpe_without_unknown_does_not_register_normal_character(tmp_path, l
     if loader == "transformers":
         tokenizer = transformers.AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
         assert tokenizer.encode("!a", add_special_tokens=False) == [2]
+        assert tokenizer.encode("!", add_special_tokens=False) == [0]
     else:
         tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
         assert tokenizer.encode("!a", add_special_tokens=False).ids == [2]
+        assert tokenizer.encode("!", add_special_tokens=False).ids == [0]
 
 
 @pytest.mark.skipif(
