@@ -44,7 +44,7 @@ Issues = "https://github.com/barrontang/gguf2mlx/issues"
 mlx = ["mlx>=0.18.0", "mlx-lm>=0.29.0"]
 ppl = ["llama-cpp-python==0.3.36"]
 vlm = ["huggingface-hub>=1.0.1"]
-dev = ["pytest", "pytest-cov", "ruff", "mypy", "tokenizers>=0.20", "jinja2>=3.1.6"]
+dev = ["pytest", "pytest-cov", "ruff", "mypy", "tokenizers>=0.20", "jinja2>=3.1.6", "transformers>=5.19.0"]
 
 [project.scripts]
 gguf2mlx = "gguf2mlx:main"

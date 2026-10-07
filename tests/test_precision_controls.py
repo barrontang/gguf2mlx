@@ -61,6 +61,8 @@ def test_gemma_runtime_adapter_is_written_with_config(tmp_path):
 
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
 def test_precision_control_hf_norm_restore_and_shape(tmp_path, dtype):
+    pytest.importorskip("mlx.core")
+
     import json
 
     path = Path(__file__).parents[1] / "benchmarks" / "materialize_precision_control.py"
