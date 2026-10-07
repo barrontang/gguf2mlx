@@ -101,9 +101,12 @@ def test_extract_tokenizer_preserves_embedded_huggingface_json(tmp_path):
     assert Tokenizer.from_file(str(tmp_path / "tokenizer.json")).encode("hello").ids == [1]
 
 
-def test_qwen_bpe_without_unknown_does_not_register_normal_character(tmp_path):
-    from transformers import AutoTokenizer
-
+@pytest.mark.parametrize("loader", ["tokenizers", "transformers"])
+def test_qwen_bpe_without_unknown_does_not_register_normal_character(tmp_path, loader):
+    if loader == "transformers":
+        transformers = pytest.importorskip(
+            "transformers", reason="HF loader integration requires optional transformers",
+        )
     reader = _FakeReader({
         "tokenizer.ggml.model": "gpt2",
         "tokenizer.ggml.tokens": ["!", "a", "!a", "<s>", "</s>", "<pad>"],
@@ -119,8 +122,12 @@ def test_qwen_bpe_without_unknown_does_not_register_normal_character(tmp_path):
     assert "unk_token" not in config
     assert tokenizer_json["model"]["unk_token"] is None
     assert tokenizer_json["normalizer"] is None
-    tokenizer = AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
-    assert tokenizer.encode("!a", add_special_tokens=False) == [2]
+    if loader == "transformers":
+        tokenizer = transformers.AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
+        assert tokenizer.encode("!a", add_special_tokens=False) == [2]
+    else:
+        tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+        assert tokenizer.encode("!a", add_special_tokens=False).ids == [2]
 
 
 @pytest.mark.skipif(
