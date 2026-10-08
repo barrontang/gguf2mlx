@@ -46,6 +46,50 @@ def _research_pack(raw: np.ndarray, bits: int) -> tuple[np.ndarray, np.ndarray, 
     return packed, scales, biases
 
 
+def _q4_k_fixture(num_blocks: int = 3) -> np.ndarray:
+    rng = np.random.default_rng(41)
+    blocks = np.empty((num_blocks, 144), dtype=np.uint8)
+    half_scales = np.stack(
+        (
+            np.linspace(0.125, 0.5, num_blocks, dtype=np.float16),
+            np.linspace(0.25, 0.75, num_blocks, dtype=np.float16),
+        ),
+        axis=1,
+    ).astype("<f2")
+    blocks[:, :4] = half_scales.view(np.uint8).reshape(num_blocks, 4)
+    blocks[:, 4:16] = rng.integers(0, 256, size=(num_blocks, 12), dtype=np.uint8)
+    blocks[:, 16:] = rng.integers(0, 256, size=(num_blocks, 128), dtype=np.uint8)
+    return blocks
+
+
+def _dequantize_q4_k_numpy(raw: np.ndarray) -> np.ndarray:
+    blocks = np.asarray(raw, dtype=np.uint8).reshape(-1, 144)
+    d_and_dmin = blocks[:, :4].copy().view("<f2").astype(np.float32)
+    d = d_and_dmin[:, 0:1]
+    dmin = d_and_dmin[:, 1:2]
+
+    packed_scales = blocks[:, 4:16]
+    scales = np.empty((len(blocks), 8), dtype=np.uint8)
+    mins = np.empty_like(scales)
+    scales[:, :4] = packed_scales[:, :4] & 0x3F
+    mins[:, :4] = packed_scales[:, 4:8] & 0x3F
+    scales[:, 4:] = (packed_scales[:, 8:12] & 0x0F) | (
+        (packed_scales[:, :4] >> 6) << 4
+    )
+    mins[:, 4:] = (packed_scales[:, 8:12] >> 4) | (
+        (packed_scales[:, 4:8] >> 6) << 4
+    )
+
+    packed_qs = blocks[:, 16:].reshape(-1, 4, 32)
+    qs = np.stack((packed_qs & 0x0F, packed_qs >> 4), axis=2).reshape(-1, 256)
+    block_scales = np.repeat(scales.astype(np.float32), 32, axis=1)
+    block_mins = np.repeat(mins.astype(np.float32), 32, axis=1)
+    return (
+        d * block_scales * qs.astype(np.float32)
+        - dmin * block_mins
+    )
+
+
 @pytest.mark.parametrize("kind,bits,block_bytes", [("Q4_0", 4, 18), ("Q8_0", 8, 34)])
 def test_layout_against_gguf_oracle(kind: str, bits: int, block_bytes: int):
     raw, codes, expected_scales, expected_biases = _fixture(kind)
@@ -78,6 +122,18 @@ def test_layout_against_gguf_oracle(kind: str, bits: int, block_bytes: int):
     else:
         assert packed[0, 0] == 0x03020100
         assert unpacked.min() == 0 and unpacked.max() == 255
+
+
+def test_q4_k_numpy_decode_matches_gguf_oracle():
+    raw = _q4_k_fixture()
+
+    decoded = _dequantize_q4_k_numpy(raw)
+    oracle = dequantize(raw, GGMLQuantizationType.Q4_K)
+
+    assert raw.shape == (3, 144)
+    assert decoded.shape == (3, 256)
+    np.testing.assert_array_equal(decoded, oracle)
+    np.testing.assert_array_equal(decoded.astype(np.float16), oracle.astype(np.float16))
 
 
 @pytest.mark.parametrize("bits", [4, 8])
