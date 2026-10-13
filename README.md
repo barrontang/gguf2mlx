@@ -366,9 +366,7 @@ The VLM path still requires matching processor/tokenizer assets as documented ab
 Metadata semantics follow the
 [llama.cpp GGUF definitions](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/constants.py)
 and [tokenizer implementation](https://github.com/ggml-org/llama.cpp/blob/master/src/llama-vocab.cpp).
-The requested [REA repository](https://github.com/morluto/rea) is a general
-reverse-engineering tool, not a GGUF tokenizer exporter; it is not a runtime
-dependency.
+
 
 ---
 
