@@ -1226,10 +1226,9 @@ def extract_tokenizer(
             strip_accents=get_metadata_bool(reader, "tokenizer.ggml.normalizer.strip_accents"),
             precompiled_charsmap=encoded_charsmap,
             special_token_ids=[
-                token_id for role in ("seperator", "separator", "mask")
-                if (token_id := get_metadata_int(
-                    reader, f"tokenizer.ggml.{role}_token_id",
-                )) is not None
+                token_id for token_id in (
+                    sep_id, get_metadata_int(reader, "tokenizer.ggml.mask_token_id"),
+                ) if token_id is not None
             ],
             remove_extra_whitespaces=get_metadata_bool(
                 reader, "tokenizer.ggml.remove_extra_whitespaces",
@@ -1539,6 +1538,31 @@ def _build_tokenizer_json(
                     {"type": "Strip", "strip_left": True, "strip_right": True},
                 ],
             }
+        if model_type == "t5":
+            normalizers = []
+            if precompiled_charsmap:
+                normalizers = [{
+                    "type": "Precompiled", "precompiled_charsmap": precompiled_charsmap,
+                }]
+            if remove_extra_whitespaces:
+                normalizers.extend([
+                    {"type": "Replace", "pattern": {"Regex": " +"}, "content": " "},
+                    {"type": "Replace", "pattern": {"Regex": "^ | $"}, "content": ""},
+                    {
+                        "type": "Replace", "pattern": {"Regex": "^(?=[\\s\\S])"},
+                        "content": "▁",
+                    },
+                ])
+            elif add_space_prefix:
+                normalizers.append({
+                    "type": "Replace", "pattern": {"Regex": "^(?=[\\s\\S]*[^ ])"},
+                    "content": "▁",
+                })
+            normalizers.append({
+                "type": "Replace", "pattern": {"String": " "}, "content": "▁",
+            })
+            normalizer = {"type": "Sequence", "normalizers": normalizers}
+            pre_tokenizer = None
         if sentencepiece_bpe:
             normalizers = []
             if remove_extra_whitespaces:

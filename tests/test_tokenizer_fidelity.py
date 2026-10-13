@@ -89,8 +89,8 @@ def test_t5_unigram_scores_whitespace_and_eos_are_preserved(tmp_path):
     data = json.loads((tmp_path / "tokenizer.json").read_text())
     assert data["model"]["type"] == "Unigram"
     assert data["model"]["vocab"][3] == ["▁hello", -0.1]
-    assert tokenizer.encode("  hello\t ").ids == [4, 1]
-    assert tokenizer.encode("hello", add_special_tokens=False).ids == [4]
+    assert tokenizer.encode("  hello  ").ids == [3, 1]
+    assert tokenizer.encode("hello", add_special_tokens=False).ids == [3]
     assert tokenizer.decode([3]) == " hello"
 
 
@@ -107,6 +107,63 @@ def test_llama_model_reconstructs_score_ranked_bpe_not_unigram(tmp_path):
     assert data["model"]["type"] == "BPE"
     assert tokenizer.encode("ab").ids == [1, 7]
     assert tokenizer.encode("ab", add_special_tokens=False).ids == [7]
+
+
+@pytest.mark.parametrize("prefix,remove", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("text", ["", "hello", "  hello", "hello  world ", "  ", "\thello\t"])
+def test_t5_normalization_matches_native_ascii_space_rules(prefix, remove, text):
+    data = core._build_tokenizer_json(
+        ["<unk>", "▁", "hello", "world", "\t"], [2, 1, 1, 1, 1], [],
+        [0.0, -1.0, -1.0, -1.0, -1.0], "t5", -1, -1, -1,
+        add_space_prefix=prefix, remove_extra_whitespaces=remove,
+    )
+    tokenizer = Tokenizer.from_str(json.dumps(data))
+    if remove:
+        expected = "▁" + "▁".join(part for part in text.split(" ") if part) if text.strip(" ") else ""
+    else:
+        expected = ("▁" if prefix and text.strip(" ") else "") + text.replace(" ", "▁")
+    assert tokenizer.normalizer.normalize_str(text) == expected
+
+
+def test_inferred_wordpiece_separator_is_special_without_token_types(tmp_path):
+    core.extract_tokenizer(_FakeReader({
+        "tokenizer.ggml.model": "wordpiece",
+        "tokenizer.ggml.tokens": ["[UNK]", "[CLS]", "[SEP]", "hello"],
+    }), tmp_path)
+    tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+    assert tokenizer.encode("hello").ids == [1, 3, 2]
+    assert tokenizer.decode([1, 3, 2]) == "hello"
+
+
+def test_t5_character_map_bytes_are_serialized_for_precompiled_normalizer(tmp_path):
+    import base64
+
+    charsmap = [1, 2, 3, 128, 255]
+    core.extract_tokenizer(_FakeReader({
+        "tokenizer.ggml.model": "t5",
+        "tokenizer.ggml.tokens": ["<unk>", "hello"],
+        "tokenizer.ggml.scores": [0.0, -1.0],
+        "tokenizer.ggml.unknown_token_id": 0,
+        "tokenizer.ggml.precompiled_charsmap": charsmap,
+    }), tmp_path)
+    document = json.loads((tmp_path / "tokenizer.json").read_text())
+    normalizer = document["normalizer"]["normalizers"][0]
+    assert normalizer["type"] == "Precompiled"
+    assert base64.b64decode(normalizer["precompiled_charsmap"]) == bytes(charsmap)
+
+
+def test_embedded_tokenizer_with_wrong_ids_is_rebuilt(tmp_path):
+    tokenizer = Tokenizer(WordLevel({"a": 1, "b": 0}, unk_token="a"))
+    reader = _FakeReader({
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.tokens": ["a", "b"],
+        "tokenizer.huggingface.json": tokenizer.to_str(),
+    })
+    with pytest.warns(UserWarning, match="does not match GGUF token IDs"):
+        core.extract_tokenizer(reader, tmp_path)
+    rebuilt = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+    assert rebuilt.encode("a").ids == [0]
+    assert rebuilt.encode("b").ids == [1]
 
 
 @pytest.mark.parametrize("metadata,message", [
