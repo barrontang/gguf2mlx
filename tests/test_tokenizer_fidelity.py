@@ -15,6 +15,131 @@ from tokenizers.pre_tokenizers import Whitespace
 from gguf2mlx import gguf2mlx as core
 
 
+@pytest.mark.parametrize(
+    "pre,expected", [("gpt-2", [6]), ("llama-bpe", [5, 3]), ("qwen2", [0, 1, 2, 3])],
+)
+def test_bpe_pre_metadata_controls_number_splitting_offline(tmp_path, monkeypatch, pre, expected):
+    import socket
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("Tokenizer reconstruction must not access the network")
+
+    monkeypatch.setattr(socket, "create_connection", no_network)
+    reader = _FakeReader({
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": pre,
+        "tokenizer.ggml.tokens": ["1", "2", "3", "4", "12", "123", "1234"],
+        "tokenizer.ggml.merges": ["1 2", "12 3", "123 4"],
+    })
+    core.extract_tokenizer(reader, tmp_path)
+    tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+    config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+    assert tokenizer.encode("1234", add_special_tokens=False).ids == expected
+    assert not any(role in config for role in ("unk_token", "pad_token", "bos_token", "eos_token"))
+
+
+@pytest.mark.parametrize("lowercase,strip_accents,text", [
+    (False, False, "Héllos"), (True, False, "héllos"), (True, True, "hellos"),
+])
+def test_real_bert_gguf_header_reverses_wordpiece_vocab(tmp_path, lowercase, strip_accents, text):
+    from gguf import GGUFReader, GGUFWriter
+
+    source = tmp_path / "bert.gguf"
+    writer = GGUFWriter(str(source), "bert")
+    writer.add_tokenizer_model("bert")
+    writer.add_token_list(["[UNK]", "[CLS]", "[SEP]", "[PAD]", "▁" + text[:-1], "s"])
+    writer.add_token_types([2, 3, 3, 3, 1, 1])
+    writer.add_uint32("tokenizer.ggml.unknown_token_id", 0)
+    writer.add_uint32("tokenizer.ggml.bos_token_id", 1)
+    writer.add_uint32("tokenizer.ggml.seperator_token_id", 2)
+    writer.add_uint32("tokenizer.ggml.padding_token_id", 3)
+    writer.add_bool("tokenizer.ggml.normalizer.lowercase", lowercase)
+    writer.add_bool("tokenizer.ggml.normalizer.strip_accents", strip_accents)
+    writer.add_tensor("token_embd.weight", np.zeros((6, 4), dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    output = tmp_path / "tokenizer"
+    output.mkdir()
+    core.extract_tokenizer(GGUFReader(str(source)), output, arch="bert")
+    tokenizer = Tokenizer.from_file(str(output / "tokenizer.json"))
+    assert tokenizer.token_to_id(text[:-1]) == 4
+    assert tokenizer.token_to_id("##s") == 5
+    assert tokenizer.encode("Héllos").ids == [1, 4, 5, 2]
+    pair = tokenizer.encode("Héllos", "Héllos")
+    assert pair.ids == [1, 4, 5, 2, 4, 5, 2]
+    assert pair.type_ids == [0, 0, 0, 0, 1, 1, 1]
+    assert tokenizer.decode([4, 5]) == text
+
+
+def test_t5_unigram_scores_whitespace_and_eos_are_preserved(tmp_path):
+    reader = _FakeReader({
+        "tokenizer.ggml.model": "t5",
+        "tokenizer.ggml.tokens": ["<pad>", "</s>", "<unk>", "▁hello", "hello", "▁"],
+        "tokenizer.ggml.token_type": [3, 3, 2, 1, 1, 1],
+        "tokenizer.ggml.scores": [0.0, 0.0, 0.0, -0.1, -0.2, -2.0],
+        "tokenizer.ggml.eos_token_id": 1,
+        "tokenizer.ggml.unknown_token_id": 2,
+        "tokenizer.ggml.padding_token_id": 0,
+        "tokenizer.ggml.remove_extra_whitespaces": True,
+    })
+    core.extract_tokenizer(reader, tmp_path)
+    tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+    data = json.loads((tmp_path / "tokenizer.json").read_text())
+    assert data["model"]["type"] == "Unigram"
+    assert data["model"]["vocab"][3] == ["▁hello", -0.1]
+    assert tokenizer.encode("  hello\t ").ids == [4, 1]
+    assert tokenizer.encode("hello", add_special_tokens=False).ids == [4]
+    assert tokenizer.decode([3]) == " hello"
+
+
+def test_llama_model_reconstructs_score_ranked_bpe_not_unigram(tmp_path):
+    reader = _FakeReader({
+        "tokenizer.ggml.model": "llama",
+        "tokenizer.ggml.tokens": ["<unk>", "<s>", "</s>", "▁", "a", "b", "ab", "▁ab"],
+        "tokenizer.ggml.token_type": [2, 3, 3, 1, 1, 1, 1, 1],
+        "tokenizer.ggml.scores": [0.0] * 3 + [-1.0] * 3 + [-10.0] * 2,
+    })
+    core.extract_tokenizer(reader, tmp_path)
+    data = json.loads((tmp_path / "tokenizer.json").read_text())
+    tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
+    assert data["model"]["type"] == "BPE"
+    assert tokenizer.encode("ab").ids == [1, 7]
+    assert tokenizer.encode("ab", add_special_tokens=False).ids == [7]
+
+
+@pytest.mark.parametrize("metadata,message", [
+    ({}, "no tokenizer.ggml.tokens"),
+    ({"tokenizer.ggml.tokens": ["a", "a"]}, "duplicate"),
+    ({"tokenizer.ggml.tokens": ["a"], "tokenizer.ggml.bos_token_id": -1}, "outside"),
+    ({"tokenizer.ggml.tokens": ["a"], "tokenizer.ggml.eos_token_id": 2}, "outside"),
+    ({"tokenizer.ggml.tokens": ["a"], "tokenizer.ggml.token_type": [1, 1]}, "type"),
+    ({"tokenizer.ggml.tokens": ["a"], "tokenizer.ggml.scores": [float("nan")]}, "finite"),
+    ({
+        "tokenizer.ggml.model": "t5", "tokenizer.ggml.tokens": ["<unk>", "a"],
+        "tokenizer.ggml.unknown_token_id": 0,
+    }, "finite score"),
+    ({
+        "tokenizer.ggml.tokens": ["a", "b"], "tokenizer.ggml.merges": ["a b"],
+    }, "merge result"),
+])
+def test_invalid_metadata_fails_before_writing_assets(tmp_path, metadata, message):
+    with pytest.raises(ValueError, match=message):
+        core.extract_tokenizer(_FakeReader(metadata), tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_unknown_bpe_pre_reports_reconstruction_limit(tmp_path):
+    reader = _FakeReader({
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "future-tokenizer",
+        "tokenizer.ggml.tokens": ["a"],
+    })
+    with pytest.warns(UserWarning, match="parity is not guaranteed"):
+        core.extract_tokenizer(reader, tmp_path)
+
+
 class _FakeField:
     def __init__(self, value):
         self._value = value
