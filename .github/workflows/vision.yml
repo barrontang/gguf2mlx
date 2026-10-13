@@ -1,0 +1,52 @@
+name: Vision conversion
+
+on:
+  pull_request:
+    paths:
+      - "src/gguf2mlx/**"
+      - "tests/test_vlm*.py"
+      - "tests/requirements-vlm.txt"
+      - "benchmarks/validate_vlm.py"
+      - "pyproject.toml"
+      - ".github/workflows/vision.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/gguf2mlx/**"
+      - "tests/test_vlm*.py"
+      - "tests/requirements-vlm.txt"
+      - "benchmarks/validate_vlm.py"
+      - "pyproject.toml"
+      - ".github/workflows/vision.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-vision:
+    runs-on: macos-14
+    timeout-minutes: 20
+    env:
+      GGUF2MLX_RUN_VLM_E2E: "1"
+      HF_HUB_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e . -r tests/requirements-vlm.txt
+      - name: Require native runtime (never pass by skipping)
+        run: |
+          python - <<'PY'
+          import platform
+          import mlx.core
+          import mlx_vlm
+          assert platform.system() == "Darwin" and platform.machine() == "arm64"
+          PY
+      - name: Offline GGUF conversion and real image-path parity
+        run: >-
+          python -m pytest tests/test_vlm.py tests/test_vlm_cli.py
+          tests/test_vlm_qwen2.py tests/test_vlm_acceptance.py tests/test_vlm_runtime.py
+          -k "not real_checkpoint_image_smoke" -q

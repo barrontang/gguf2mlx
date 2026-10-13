@@ -1,0 +1,9 @@
+# Isolated Apple Silicon runtime: mlx-vlm's LLaVA processor is not compatible
+# with Transformers 5.19's strict image-kwargs validation.
+mlx-vlm==0.7.6
+mlx==0.32.2
+mlx-lm==0.31.3
+transformers==5.16.1
+huggingface-hub==1.30.0
+tokenizers==0.23.2
+pytest>=7

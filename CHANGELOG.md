@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Vision support
+
+- Add a strict Qwen2-VL adapter for combined or split GGUFs: reconstruct fused
+  vision QKV and temporal Conv3D kernels, retain the patch merger from GGUF,
+  normalize HF configuration and validate M-RoPE, special tokens and processors.
+- Extend direct affine 4-bit quantization to LLaVA and Qwen2-VL language
+  projections while keeping vision/projector tensors floating-point. Reuse
+  the existing quantizer; this is re-quantization, not lossless transpacking.
+- Detect additional vision tensor/metadata prefixes and newer multimodal
+  architecture IDs without enabling unsupported architecture fallbacks.
+- Reject stale HF quantization configs, inconsistent image normalization and
+  CLIP activation/normalization settings not honored by the tested MLX runtime.
+- Add isolated pinned VLM test requirements and Apple Silicon CI covering actual
+  MLX-VLM loading, image processing, feature/logit parity and generation with
+  offline tiny F32/Q4_0 checkpoints; add an opt-in local-model image smoke test.
+- Document the upstream LLaVA processor incompatibility between MLX-VLM 0.7.6
+  and Transformers 5.19; isolate native tests rather than downgrading dev requirements.
+- Support the historical `qwen2vl_merger` visual MLP naming and explicitly
+  validated zero position placeholder. Merge HF `added_tokens_decoder` token
+  definitions without relaxing conflict or vocabulary checks.
+- Complete pinned Qwen2-VL-2B real-checkpoint acceptance: all 729 floating tensors
+  audited, exact projected visual features against HF, and 12/12 labeled image
+  checks for HF, GGUF-to-FP16 and llama.cpp. Additional language-only MLX 4-bit
+  scores 11/12 exact matches; retain its longer photograph answer. Publish the offline
+  four-path harness and scoped report, not a broad visual-quality certification.
+- Correct the photograph failure diagnosis: the NASA suit is visibly orange;
+  the uniform 4-bit answer was semantically correct, not a color hallucination.
+  Report semantic garment/color checks separately from historical exact matches.
+- Add explicit Qwen2-VL `--preserve-source-quant` with direct quantization:
+  repack Q4_K's original codes/groups of 32 and keep other projections floating
+  instead of lowering Q6_K to four bits. The pinned model passes all 12 original
+  exact-answer checks; all-projection relative L2 error against decoded GGUF
+  falls from 8.51% to 0.0614%. This is mixed precision (~2.7 GiB), not all-four-bit
+  or bit-exact FP16 transpacking. Keep uniform quantization behavior unchanged.
+
 ### Fixes
 
 - Keep dev-only CI portable: skip HF precision-control tests when optional

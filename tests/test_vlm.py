@@ -25,6 +25,7 @@ class Field:
 class Reader:
     def __init__(self, metadata, tensors=()):
         self.metadata = metadata
+        self.fields = metadata
         self.tensors = list(tensors)
 
     def get_field(self, name):
@@ -144,7 +145,11 @@ def test_detection_raw_architecture(architecture):
     assert vlm.is_vlm(Reader({"general.architecture": architecture}))
 
 
-@pytest.mark.parametrize("name", ["v.patch_embd.weight", "mm.0.weight", "vision_tower.foo"])
+@pytest.mark.parametrize("name", [
+    "v.patch_embd.weight", "mm.0.weight", "vision_tower.foo", "vision_model.foo",
+    "visual.patch_embed.proj.weight", "model.visual.foo", "model.vision_tower.foo",
+    "mm_projector.0.weight", "multi_modal_projector.linear_1.weight",
+])
 def test_detection_vision_tensors(name):
     assert vlm.is_vlm(Reader({"general.architecture": "llama"}, [SimpleNamespace(name=name)]))
 
@@ -153,6 +158,42 @@ def test_detection_vision_tensors(name):
 def test_detection_presence_even_false(key):
     assert vlm.is_vlm(Reader({key: False}))
     assert not vlm.is_vlm(Reader({"general.architecture": "llama"}))
+
+
+@pytest.mark.parametrize("key", ["clip.vision.image_size", "clip.vision.embedding_length",
+                                "clip.vision.patch_size"])
+def test_detection_vision_metadata_without_tensor_payload(key):
+    assert vlm.is_vlm(Reader({"general.architecture": "llama", key: 224}))
+
+
+@pytest.mark.parametrize("options", [
+    {"q_bits": 8}, {"q_group_size": 32}, {"q_mode": "mxfp4"},
+])
+def test_vlm_direct_quant_options_rejected_before_loading(model, options):
+    with pytest.raises(ValueError, match="affine 4-bit"):
+        convert(model, direct_quant=True, **options)
+    assert not model.output.exists()
+
+
+def test_vlm_direct_quant_rejects_unaligned_projections(model):
+    with pytest.raises(ValueError, match="not divisible"):
+        convert(model, direct_quant=True)
+
+
+@pytest.mark.parametrize("key", ["quantization", "quantization_config"])
+def test_quantized_hf_config_rejected(model, key):
+    model.config[key] = {"bits": 4, "group_size": 64}
+    write_json(model.root / "config.json", model.config)
+    with pytest.raises(ValueError, match="unquantized HF config"):
+        convert(model)
+
+
+@pytest.mark.parametrize("key,value", [("hidden_act", "gelu"), ("layer_norm_eps", 1e-6)])
+def test_clip_rejects_settings_ignored_by_downstream_runtime(model, key, value):
+    model.config["vision_config"][key] = value
+    write_json(model.root / "config.json", model.config)
+    with pytest.raises(ValueError, match="hidden_act|layer_norm_eps"):
+        convert(model)
 
 
 def test_direct_conversion_numeric_layout_and_assets(model):

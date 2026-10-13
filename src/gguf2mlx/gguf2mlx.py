@@ -2431,6 +2431,7 @@ def convert(
     hf_fallback_vision: str | None = None,
     hf_revision: str = "main",
     offline: bool = False,
+    preserve_source_quant: bool = False,
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     if quantize and q_group_size not in SUPPORTED_MLX_LM_Q_GROUP_SIZES:
@@ -2459,7 +2460,7 @@ def convert(
         if model_type not in {"auto", "llm", "vlm"}:
             print(f"❌ Unsupported conversion type: {model_type}")
             return False
-        vlm_options = bool(mmproj or hf_model or hf_fallback_vision)
+        vlm_options = bool(mmproj or hf_model or hf_fallback_vision or preserve_source_quant)
         if model_type == "llm" and vlm_options:
             print("❌ VLM source options cannot be used with --type llm")
             return False
@@ -2476,10 +2477,23 @@ def convert(
             print("❌ Multimodal GGUF detected; use --type vlm with HF assets")
             return False
         if model_type == "vlm" or vlm_options or detected_vlm:
-            if quantize or direct_quant or mixed_precision:
-                print("❌ VLM conversion currently supports FP16/FP32 only, not LLM quantization")
+            if preserve_source_quant and not (quantize and direct_quant):
+                print("❌ --preserve-source-quant requires --quantize --direct-quant")
+                return False
+            if mixed_precision or quantize != direct_quant:
+                print(
+                    "❌ VLM quantization requires --quantize --direct-quant together; "
+                    "--mixed-precision is MoE-only"
+                )
                 return False
             try:
+                vlm_quant_options = (
+                    {"direct_quant": True, "q_bits": q_bits,
+                     "q_group_size": q_group_size, "q_mode": q_mode}
+                    if direct_quant else {}
+                )
+                if preserve_source_quant:
+                    vlm_quant_options["preserve_source_quant"] = True
                 convert_vlm(
                     gguf_path,
                     fp_output_path,
@@ -2489,6 +2503,7 @@ def convert(
                     hf_fallback_vision=hf_fallback_vision,
                     hf_revision=hf_revision,
                     offline=offline,
+                    **vlm_quant_options,
                 )
             except Exception as error:  # noqa: BLE001
                 print(f"❌ VLM conversion failed: {error}")
@@ -2793,7 +2808,7 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--quantize",
         action="store_true",
-        help="Run mlx-lm quantization after conversion to produce a quantized MLX output directory",
+        help="Quantize MLX output (VLM requires --direct-quant; quantizes language projections only)",
     )
     parser.add_argument(
         "--q-bits",
@@ -2820,7 +2835,16 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "Experimental bounded-memory direct quantization path "
-            "(currently affine 4-bit, group size 64, llama/gemma only)"
+            "(affine 4-bit, group size 64; VLM keeps vision/projector floating-point)"
+        ),
+    )
+    parser.add_argument(
+        "--preserve-source-quant",
+        action="store_true",
+        help=(
+            "Qwen2-VL only, with --quantize --direct-quant: preserve Q4_K codes "
+            "and their 32-value groups; keep other projections floating-point "
+            "(larger mixed-precision output, avoids lossy uniform re-quantization)"
         ),
     )
     parser.add_argument(
@@ -2874,6 +2898,7 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         hf_fallback_vision=args.hf_fallback_vision,
         hf_revision=args.hf_revision,
         offline=args.offline,
+        preserve_source_quant=args.preserve_source_quant,
     )
     return 0 if success else 1
 

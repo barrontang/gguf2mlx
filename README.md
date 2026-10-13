@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**Convert supported GGUF language models and LLaVA VLMs into MLX-compatible safetensors on Apple Silicon Macs.**
+**Convert supported GGUF language models, LLaVA and Qwen2-VL into MLX-compatible safetensors on Apple Silicon Macs.**
 
 [![PyPI](https://img.shields.io/pypi/v/gguf2mlx.svg)](https://pypi.org/project/gguf2mlx/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -109,13 +109,33 @@ gguf2mlx convert --input model.gguf --output ./mlx-model
 
 ### VLM conversion: architecture-specific direct or hybrid paths
 
-VLM conversion is separate from MLX-LM conversion. The initial adapter targets
-**LLaVA (`model_type: llava`) with a Llama language model, CLIP vision tower and
-two-layer MLP projector**, producing an HF-style directory for `mlx-vlm`.
-Qwen2/2.5-VL, LLaVA-NeXT, SigLIP and other layouts are detected or explicitly
-requested but **rejected**, not converted using guessed LLaVA tensor names.
-This adapter is offline-fixture tested; real-model Apple Silicon image inference
-is not yet end-to-end verified.
+VLM conversion is separate from MLX-LM conversion. Two explicit adapters produce
+HF-style directories for `mlx-vlm`:
+
+- **LLaVA-1.5** (`model_type: llava`): Llama + CLIP (QuickGELU,
+  `layer_norm_eps=1e-5`) + two-linear GELU projector.
+- **Qwen2-VL** (`model_type: qwen2_vl`, GGUF `qwen2vl`): Qwen2-VL language
+  model with M-RoPE, ViT and 2x2 patch merger. Reassembles split Q/K/V in order
+  and the two temporal Conv2D kernels into Conv3D; merger normalization and MLP
+  always come from GGUF, even in hybrid mode.
+
+Qwen2.5-VL, Qwen3/3.5, LLaVA-NeXT/1.6, SigLIP, Pixtral and other layouts remain
+**unsupported**, not converted using guessed prefixes. They need separate
+architecture contracts, not aliases to these adapters.
+Both adapters have offline, real `mlx-vlm` loader/processor/generation tests on
+Apple Silicon using tiny random checkpoints. **Large pretrained-model visual
+quality and cross-runtime perplexity parity are not broadly certified.**
+For the pinned **Qwen2-VL-2B-Instruct Q4_K_M + F16 mmproj** pair, real-checkpoint
+acceptance is now complete: HF / GGUF-to-FP16 / llama.cpp score **12/12** on a
+fixed image diagnostic; uniform language-only MLX 4-bit has **11/12 exact
+matches**, but its longer orange-spacesuit answer is semantically correct.
+The source-preserving Q4_K/float mode reaches **12/12 exact and semantic checks**.
+It keeps Q4_K codes and retains higher-precision source layers as floats, rather
+than forcing every projection to 4-bit. All 729 floating
+output tensors pass the independent weight audit, with exact visual-feature
+parity against HF on those inputs. See the [full report and reproduction
+commands](docs/qwen2-vl-real-validation.md), including the original exact-format failure
+and the limited scope. This is not broad visual-quality certification.
 
 ```bash
 # Optional HF download support; local sources need only the base converter
@@ -137,6 +157,25 @@ gguf2mlx convert --type vlm \
 gguf2mlx convert --input language.gguf --mmproj mmproj.gguf \
   --hf-fallback-vision /absolute/path/to/hf-llava --offline \
   --output ./llava-offline
+
+# Qwen2-VL: matching language GGUF + Qwen2-VL mmproj; HF supplies assets only
+gguf2mlx convert --type vlm \
+  --input qwen2-vl.gguf --mmproj qwen2-vl-mmproj.gguf \
+  --hf-model Qwen/Qwen2-VL-2B-Instruct --output ./qwen2-vl-mlx
+
+# Either adapter: affine 4-bit language projections, floating vision/projector
+gguf2mlx convert --type vlm \
+  --input language.gguf --mmproj mmproj.gguf \
+  --hf-model /absolute/path/to/matching-hf-vlm --offline \
+  --quantize --direct-quant --q-bits 4 --q-group-size 64 --q-mode affine \
+  --output ./vlm-language-4bit
+
+# Qwen2-VL Q4_K_M: avoid a second lossy quantization (recommended)
+gguf2mlx convert --type vlm \
+  --input qwen2-vl-Q4_K_M.gguf --mmproj qwen2-vl-mmproj.gguf \
+  --hf-model /absolute/path/to/matching-hf-qwen2-vl --offline \
+  --quantize --direct-quant --preserve-source-quant \
+  --output ./qwen2-vl-source-preserved
 ```
 
 - `--type auto` (default) detects multimodal architecture metadata and tensors.
@@ -152,13 +191,14 @@ gguf2mlx convert --input language.gguf --mmproj mmproj.gguf \
   commit for reproducible downloads. `--offline` uses local/cached assets only.
 - Matching `config.json`, `tokenizer.json`, `tokenizer_config.json` and
   `preprocessor_config.json` are required. The converter validates architecture,
-  tensor shapes/completeness and tokenizer compatibility, then copies processor
+  tensor shapes/completeness, image normalization metadata and tokenizer
+  compatibility, then copies processor
   and tokenizer assets without executing remote code or loading pickle files.
   Not every GGUF/HF release pair is compatible; vocabulary/config mismatches
   fail rather than fabricating weights. All tokenizer IDs, including image and
   padding tokens, must fit the language embedding vocabulary; older unresized
   exports are not repaired by synthesizing embedding rows.
-- Direct conversion requires a complete supported CLIP layout. Some mmproj
+- Direct conversion requires a complete supported vision layout. Some CLIP mmproj
   releases omit unused vision layers or normalization tensors: use the hybrid
   path when direct completeness validation fails.
 - Hybrid conversion reads only vision tensors from safetensors. Indexed HF
@@ -168,10 +208,40 @@ gguf2mlx convert --input language.gguf --mmproj mmproj.gguf \
 - Output includes `config.json`, tokenizer/processor assets, safetensors shards,
   an index and `vlm_conversion_report.json`. Validation failures clean staging
   files and never overwrite an existing nonempty output directory.
-- VLM output currently supports `--dtype float16` or `float32` only.
-  `--quantize`, `--direct-quant` and `--mixed-precision` are LLM-only options.
-  Install `mlx-vlm` separately on Apple Silicon to load this output; the `vlm`
-  extra provides downloads, not the inference runtime.
+- `--dtype float16` (default) or `float32` controls floating-point tensors.
+  `--quantize --direct-quant` together enable affine 4-bit, group-size-64
+  quantization of language attention/MLP projection matrices only. Embeddings,
+  LM head, norms, biases, vision tower and projector remain floating-point.
+  Quantization is **decode then re-quantize**, not bit-preserving GGUF
+  transpacking; misaligned projections fail instead of silently falling back.
+  `--quantize` alone and MoE `--mixed-precision` are rejected for VLMs.
+  The report lists quantized modules, logical/stored tensor counts and layouts.
+- For Qwen2-VL with Q4_K language projections, add `--preserve-source-quant`
+  to keep their original four-bit codes and **32-element** groups. This option
+  overrides the default 64-element re-quantization layout; leave `--q-*` at their
+  defaults. Other language projections (including Q6_K) are decoded to the
+  requested floating dtype, not reduced to four bits. Vision/projector and
+  embeddings remain floating. This is an explicit **mixed-precision** alternative,
+  not a promise of an all-four-bit model or bit-exact FP16 arithmetic: scales and
+  biases still round to `--dtype`. The named 2B artifact is about **2.7 GiB**
+  versus 2.4 GiB for uniform 4-bit and 4.1 GiB for FP16.
+  Missing Q4_K projections, LLaVA, or use without `--quantize --direct-quant`
+  fail explicitly. Every projection's source/output policy is recorded.
+- HF assets must be from the original unquantized checkpoint. The output
+  rebuilds model configuration and quantization metadata; it does not carry
+  stale HF quantization settings into the loader.
+- `multi_modal_config.json` is **not** a universal MLX-VLM requirement and is
+  not fabricated. LLaVA uses nested text/vision configuration; Qwen2-VL also
+  needs top-level language fields for the tested loader. Processor/tokenizer
+  semantics cannot be reliably inferred from tensor names or image mean/std
+  alone, so matching HF assets remain required rather than guessed defaults.
+- Install `mlx-vlm` separately on Apple Silicon to load the output. The tested
+  runtime is pinned in `tests/requirements-vlm.txt` and should be installed in a
+  separate environment. **`mlx-vlm==0.7.6`'s LLaVA processor is incompatible
+  with `transformers==5.19.0`**: it forwards text-only `padding` to the image
+  processor, which now rejects it. Native CI uses Transformers 5.16.1; the
+  existing `dev` extra retains its newer Transformers requirement. Do not
+  combine the two environments. The lightweight `vlm` extra provides downloads only.
 
 GGUF vision quantization is not inherently unusable: quality depends on the
 source quantization and model. Hybrid conversion avoids that vision
@@ -261,7 +331,9 @@ print('loaded')
 | Gemma and Phi-3 architecture fixtures | Supported |
 | Bounded-memory direct quantization (`--direct-quant`) | Supported |
 | StableLM conversion adapter | Supported |
-| LLaVA Llama + CLIP direct/hybrid VLM adapter | Offline fixture-validated; real image inference unverified |
+| LLaVA Llama + CLIP direct/hybrid VLM adapter | Native tiny-checkpoint image-path parity tested |
+| Qwen2-VL direct/hybrid VLM adapter | Tiny parity; named 2B direct checkpoint passes real-image acceptance |
+| Language-only 4-bit VLM conversion | Packed weights + native decoded-reference parity tested |
 
 ---
 
@@ -274,7 +346,7 @@ print('loaded')
 
 The language-model path recognizes 48 architecture identifiers for inspection
 and enables conversion for 12 identifiers. VLM detection and conversion use a
-separate registry; only the LLaVA Llama + CLIP adapter is currently enabled.
+separate registry with LLaVA Llama + CLIP and Qwen2-VL adapters.
 
 ### Conversion-enabled architectures
 
@@ -289,7 +361,8 @@ separate registry; only the LLaVA Llama + CLIP adapter is currently enabled.
 | Phi | `phi3` | ✅ Phi-3 4K fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
 | StableLM | `stablelm` | ✅ | ❌ | ❌ | — | ✅ generic package/verify | ❌ |
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
-| LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | ❌ real image inference unverified | ❌ | — | ✅ generic package/verify | ✅ Llama + CLIP only |
+| LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | Tiny image-path parity; pretrained quality unverified | ❌ | Language-only 4-bit | ✅ generic package/verify | ✅ Llama + CLIP only |
+| Qwen2-VL | `qwen2vl` + Qwen2-VL/mmproj | ✅ direct/hybrid fixture-validated | Named 2B direct checkpoint: 12/12 image diagnostic; see [report](docs/qwen2-vl-real-validation.md) | ❌ | Uniform 4-bit: 11/12 exact; source-preserved Q4_K/float: 12/12 | ✅ generic package/verify | ✅ ViT + patch merger |
 
 “Conversion” means that a code path exists. “End-to-end” means a converted model
 has been loaded and exercised; ⚠️ rows still require the opt-in model fixtures.
@@ -374,8 +447,9 @@ and [tokenizer implementation](https://github.com/ggml-org/llama.cpp/blob/master
 
 This project is intentionally more honest about scope now:
 
-- **4-bit MLX output uses MLX-LM re-quantization**; source GGUF Q4 blocks are not
-  preserved directly
+- **Default 4-bit output re-quantizes** via MLX-LM or the direct affine quantizer.
+  The explicit Qwen2-VL `--preserve-source-quant` exception retains Q4_K codes
+  and leaves other projection types floating; it is not a general GGUF repacker.
 - **Tokenizer fidelity still depends on available GGUF metadata**; embedded
   Hugging Face tokenizer JSON is preserved when present
 - **Architecture coverage is adapter-based**, not "all GGUF models"
@@ -461,9 +535,13 @@ recover information removed when the source GGUF was quantized.
 
 ### Does the 4-bit output preserve the original GGUF Q4 blocks?
 
-No. The current implementation dequantizes the GGUF and then uses MLX-LM to
-perform a second quantization. Use `--direct-quant` for the bounded-memory path
-that skips the FP16 staging directory; see `docs/direct-quant-transcoding.md`.
+Not by default. MLX-LM and the uniform `--direct-quant` path perform a second
+quantization; the latter skips the FP16 staging directory. See
+`docs/direct-quant-transcoding.md`. For Qwen2-VL with Q4_K projections,
+`--quantize --direct-quant --preserve-source-quant` instead keeps those codes
+and 32-element groups, while other projections remain floating-point.
+Coefficient rounding to the output dtype still applies; see the
+[real-checkpoint report](docs/qwen2-vl-real-validation.md).
 
 ### Why is the converted model larger than the GGUF file?
 
@@ -494,6 +572,24 @@ pytest
 
 # Opt-in MLX-LM integration test (Apple Silicon)
 GGUF2MLX_RUN_E2E=1 pytest tests/test_e2e.py
+
+# Offline native VLM tests (Apple Silicon; no model or image downloads)
+GGUF2MLX_RUN_VLM_E2E=1 HF_HUB_OFFLINE=1 \
+uv run --isolated --no-project --with-editable . \
+  --with-requirements tests/requirements-vlm.txt \
+  pytest tests/test_vlm.py tests/test_vlm_cli.py tests/test_vlm_qwen2.py tests/test_vlm_runtime.py
+
+# Or install into a dedicated venv, not the dev environment:
+python3 -m venv .venv-vlm
+.venv-vlm/bin/python -m pip install -e . -r tests/requirements-vlm.txt
+
+# Optional real-model image smoke test: all assets must already exist locally
+GGUF2MLX_RUN_VLM_E2E=1 HF_HUB_OFFLINE=1 \
+GGUF2MLX_VLM_GGUF=/models/language.gguf \
+GGUF2MLX_VLM_MMPROJ=/models/mmproj.gguf \
+GGUF2MLX_VLM_HF=/models/matching-original-hf-vlm \
+GGUF2MLX_VLM_IMAGE=/images/example.png \
+.venv-vlm/bin/python -m pytest tests/test_vlm_runtime.py -k real_checkpoint_image_smoke
 
 # Real MoE validation (finite logits, actual router entropy, generation)
 GGUF2MLX_RUN_E2E=1 \
@@ -549,6 +645,23 @@ Recent regression coverage includes:
 - fail-closed MoE router detection and per-tensor precision reports
 - tokenizer fixtures for 10 architectures, byte fallback, and 20 added tokens
 - chat-template rendering for single-turn, multi-turn, system, tool, and reasoning shapes
+- VLM split-file conversion, ordered QKV and temporal-kernel reconstruction,
+  hybrid vision-only replacement, M-RoPE and processor mismatch rejection
+- native VLM image features and logits against original HF-layout weights
+  (or an independently decoded quantized reference), image-change sensitivity,
+  finite outputs and `mlx_vlm.generate`; F32/Q4_0 inputs and FP16/FP32/4-bit outputs
+
+The dedicated **Vision conversion** workflow runs these offline tests on Apple
+Silicon and fails if the runtime is unavailable instead of silently skipping.
+The random-checkpoint test is a numerical/loader regression, not a visual
+reasoning benchmark. The optional pretrained smoke test checks finite logits,
+image sensitivity and nonempty generation; it does not certify caption accuracy.
+The separate [real Qwen2-VL acceptance harness](benchmarks/validate_vlm.py) audits
+all floating output weights and compares fixed labeled images against original HF
+and the same GGUF through llama.cpp. It preserves raw answers and exits nonzero
+on its predeclared gate failure; see the [results](docs/qwen2-vl-real-validation.md).
+Image generators such as `mlxgen` / Qwen-Image can supply test images but are not
+substitutes for a matching image-understanding checkpoint.
 
 ---
 
@@ -568,6 +681,10 @@ Completed:
 - StableLM conversion adapter (norm_eps, partial_rotary_factor, qk_layernorm, use_parallel_residual)
 - `mlx_lm.load()` parity validation test for `--direct-quant` output (`tests/test_e2e.py`)
 - opt-in real-GGUF convert + `mlx_lm.load()` finite-logit validation for gemma and phi3 fixtures (`tests/test_e2e.py`)
+- strict LLaVA-1.5 and Qwen2-VL vision adapters, language-only direct quantization,
+  and offline native image-path CI
+- pinned Qwen2-VL-2B real-checkpoint conversion, all-tensor audit and four-path
+  labeled image acceptance, including historical `qwen2vl_merger` compatibility
 - `--eval-ppl` perplexity guardrail in the benchmark harness (reuses `mlx_lm.perplexity`; reports standard vs `--direct-quant` PPL delta)
 
 Remaining areas for contributors:
@@ -580,6 +697,16 @@ Remaining areas for contributors:
 - evaluate GGUF→MLX conversion for high-demand non-text models (e.g. ASR/embedding) where competition is thin (pending verification that such models ship GGUF)
 - add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks
 - publish additional architecture-specific tokenizer normalizer fixtures as upstream formats evolve
+- add LLaVA-NeXT any-resolution/image-newline handling and distinct Qwen2.5/3.x
+  vision adapters, including Qwen3.5's different language backbone, before
+  claiming those families are supported
+- expand beyond the named Qwen2-VL-2B diagnostic to larger, diverse image corpora
+  and real LLaVA checkpoints; report quality separately from tiny-checkpoint parity
+
+Vision format references:
+[llama.cpp Qwen2-VL exporter](https://github.com/ggml-org/llama.cpp/blob/4413a192410fad1f054e9216114087a3e01527a0/conversion/qwenvl.py),
+[GGUF tensor mapping](https://github.com/ggml-org/llama.cpp/blob/4413a192410fad1f054e9216114087a3e01527a0/gguf-py/gguf/tensor_mapping.py),
+and the `mlx-vlm==0.7.6` loader/vision implementations exercised by the native tests.
 
 ### Mac validation snapshot (2026-10-06)
 

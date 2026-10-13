@@ -87,6 +87,35 @@ def test_vlm_rejects_llm_quantization(routing, options):
     assert not state["calls"]
 
 
+def test_vlm_direct_quantization_options_forwarded(routing):
+    source, output, state, _ = routing
+    state["detected"] = True
+    assert core.convert(str(source), str(output), quantize=True, direct_quant=True)
+    options = state["calls"][0][3]
+    assert options["direct_quant"] is True
+    assert options["q_bits"] == 4
+    assert options["q_group_size"] == 64
+    assert options["q_mode"] == "affine"
+
+
+def test_vlm_source_preserving_options_forwarded(routing):
+    source, output, state, _ = routing
+    assert core.convert(str(source), str(output), quantize=True, direct_quant=True,
+                        preserve_source_quant=True)
+    assert state["calls"][0][3]["preserve_source_quant"] is True
+
+
+@pytest.mark.parametrize("options", [
+    {}, {"quantize": True}, {"direct_quant": True},
+    {"quantize": True, "direct_quant": True, "model_type": "llm"},
+])
+def test_source_preserving_requires_vlm_direct_quant(routing, options):
+    source, output, state, _ = routing
+    assert not core.convert(str(source), str(output), preserve_source_quant=True, **options)
+    assert not state["calls"]
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("options", [
     {"hf_model": "org/llava"},
     {"mmproj": "mmproj.gguf"},
@@ -173,9 +202,11 @@ def test_both_cli_forms_forward_vlm_flags(monkeypatch, command):
         "--input", "language.gguf", "--output", "out", "--type", "vlm",
         "--mmproj", "mmproj.gguf", "--hf-model", "org/llava",
         "--hf-fallback-vision", "org/llava", "--hf-revision", "pinned", "--offline",
+        "--quantize", "--direct-quant", "--preserve-source-quant",
     ])
     assert calls[0]["model_type"] == "vlm"
     assert calls[0]["mmproj"] == "mmproj.gguf"
     assert calls[0]["hf_model"] == calls[0]["hf_fallback_vision"] == "org/llava"
     assert calls[0]["hf_revision"] == "pinned"
     assert calls[0]["offline"] is True
+    assert calls[0]["preserve_source_quant"] is True
