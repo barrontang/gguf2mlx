@@ -7,6 +7,7 @@ Phase 1: Real weight extraction, safetensors output, architecture detection,
 """
 
 import argparse
+import base64
 import gc
 import hashlib
 import json
@@ -1024,37 +1025,73 @@ def extract_tokenizer(
     model_max_length: int | None = None,
 ) -> None:
     """Extract tokenizer from GGUF metadata and save standard files."""
-    model_type = get_metadata_str(reader, "tokenizer.ggml.model") or "bpe"
+    source_model = (get_metadata_str(reader, "tokenizer.ggml.model") or "bpe").lower()
+    model_type = {"bert": "wordpiece", "t5": "unigram"}.get(source_model, source_model)
     tokenizer_pre = get_metadata_str(reader, "tokenizer.ggml.pre")
     embedded_hf_json = get_metadata_str(reader, "tokenizer.huggingface.json")
     bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id")
     eos_id = get_metadata_int(reader, "tokenizer.ggml.eos_token_id")
     unk_id = get_metadata_int(reader, "tokenizer.ggml.unknown_token_id")
-    bpe_without_unknown = unk_id is None and model_type == "gpt2"
     pad_id = get_metadata_int(reader, "tokenizer.ggml.padding_token_id")
     bos_was_missing = bos_id is None
     eos_was_missing = eos_id is None
-    bos_id = 1 if bos_id is None else bos_id
-    eos_id = 2 if eos_id is None else eos_id
-    unk_id = 0 if unk_id is None else unk_id
-    pad_id = 0 if pad_id is None else pad_id
+    bos_id = -1 if bos_id is None else bos_id
+    eos_id = -1 if eos_id is None else eos_id
+    unk_id = -1 if unk_id is None else unk_id
+    pad_id = -1 if pad_id is None else pad_id
     add_bos_token = get_metadata_bool(reader, "tokenizer.ggml.add_bos_token")
     add_eos_token = get_metadata_bool(reader, "tokenizer.ggml.add_eos_token")
+    add_sep_token = get_metadata_bool(reader, "tokenizer.ggml.add_sep_token")
     add_space_prefix = get_metadata_bool(reader, "tokenizer.ggml.add_space_prefix")
-    add_bos_token = True if add_bos_token is None else add_bos_token
-    add_eos_token = False if add_eos_token is None else add_eos_token
-    add_space_prefix = True if add_space_prefix is None else add_space_prefix
+    add_bos_token = (
+        model_type in ("llama", "spm", "sentencepiece", "wordpiece")
+        or tokenizer_pre in ("llama-bpe", "llama3", "llama-v3")
+        if add_bos_token is None else add_bos_token
+    )
+    add_eos_token = source_model == "t5" if add_eos_token is None else add_eos_token
+    add_sep_token = model_type == "wordpiece" if add_sep_token is None else add_sep_token
+    add_space_prefix = (
+        model_type in ("llama", "spm", "sentencepiece", "unigram") and source_model != "t5"
+        if add_space_prefix is None else add_space_prefix
+    )
 
     tokens = get_metadata_array_str(reader, "tokenizer.ggml.tokens")
     token_types = get_metadata_array_int(reader, "tokenizer.ggml.token_type")
     merges = get_metadata_array_str(reader, "tokenizer.ggml.merges")
     scores = get_metadata_array_float(reader, "tokenizer.ggml.scores")
+    sep_id = get_metadata_int(reader, "tokenizer.ggml.seperator_token_id")
+    if sep_id is None:
+        sep_id = get_metadata_int(reader, "tokenizer.ggml.separator_token_id")
+    if source_model == "bert":
+        tokens = [
+            token[1:] if token.startswith("▁") else (
+                token if token.startswith("[") or (
+                    i < len(token_types) and token_types[i] in (2, 3, 4)
+                ) else "##" + token
+            )
+            for i, token in enumerate(tokens)
+        ]
 
     if not tokens:
-        print("  ⚠ No tokenizer tokens found in GGUF — creating minimal tokenizer")
-        tokens = ["<unk>", "<s>", "</s>", "<pad>"]
-        token_types = [0, 3, 3, 3]
-        bos_id, eos_id, pad_id = 1, 2, 3
+        raise ValueError("GGUF has no tokenizer.ggml.tokens; cannot reconstruct a tokenizer")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError("GGUF tokenizer vocabulary contains duplicate tokens")
+    if token_types and len(token_types) != len(tokens):
+        raise ValueError("GGUF tokenizer requires a type for every token")
+    if scores and (len(scores) != len(tokens) or not np.isfinite(scores).all()):
+        raise ValueError("GGUF tokenizer requires a finite score for every token")
+    for role in ("bos", "eos", "unknown", "padding", "separator", "seperator", "mask"):
+        token_id = get_metadata_int(reader, f"tokenizer.ggml.{role}_token_id")
+        if token_id is not None and not 0 <= token_id < len(tokens):
+            raise ValueError(f"GGUF tokenizer {role}_token_id is outside the vocabulary")
+    if unk_id == -1:
+        unk_id = next((i for i, kind in enumerate(token_types) if kind == 2), -1)
+        if unk_id == -1:
+            unk_id = next((tokens.index(t) for t in ("<unk>", "[UNK]") if t in tokens), -1)
+    if pad_id == -1:
+        pad_id = next((tokens.index(t) for t in ("<pad>", "[PAD]") if t in tokens), -1)
+    if sep_id is None and model_type == "wordpiece" and "[SEP]" in tokens:
+        sep_id = tokens.index("[SEP]")
 
     # --- Fix BOS/EOS for Qwen, DeepSeek, and similar families ---
     # These models use special tokens like <|endoftext|> (BOS) and <|im_end|> (EOS)
@@ -1062,7 +1099,7 @@ def extract_tokenizer(
     #
     # Known special token names by role:
     SPECIAL_BOS_CANDIDATES = [
-        "<|endoftext|>", "<s>", "<|begin_of_text|>", "<|startoftext|>",
+        "<|endoftext|>", "<s>", "<|begin_of_text|>", "<|startoftext|>", "[CLS]",
     ]
     SPECIAL_EOS_CANDIDATES = [
         "<|im_end|>", "</s>", "<|end_of_text|>", "<|eot_id|>", "<|end|>",
@@ -1114,18 +1151,24 @@ def extract_tokenizer(
     tokenizer_config = {
         "add_bos_token": add_bos_token,
         "add_eos_token": add_eos_token,
-        "bos_token": tokens[bos_id] if bos_id < vocab_size else "<s>",
-        "eos_token": tokens[eos_id] if eos_id < vocab_size else "</s>",
-        "unk_token": tokens[unk_id] if unk_id < vocab_size else "<unk>",
-        "pad_token": tokens[pad_id] if pad_id < vocab_size else "<pad>",
+        "add_sep_token": add_sep_token,
         "model_max_length": model_max_length or 4096,
         "tokenizer_class": "PreTrainedTokenizerFast",
         "clean_up_tokenization_spaces": False,
     }
     if tokenizer_pre:
         tokenizer_config["gguf_tokenizer_pre"] = tokenizer_pre
-    if bpe_without_unknown:
-        tokenizer_config.pop("unk_token")
+    special_tokens = {
+        role: tokens[token_id]
+        for role, token_id in (
+            ("bos_token", bos_id), ("eos_token", eos_id),
+            ("unk_token", unk_id), ("pad_token", pad_id),
+            ("sep_token", sep_id),
+            ("mask_token", get_metadata_int(reader, "tokenizer.ggml.mask_token_id")),
+        )
+        if token_id is not None and 0 <= token_id < vocab_size
+    }
+    tokenizer_config.update(special_tokens)
 
     if arch != "gemma" and (model_type == "llama" or model_type == "bpe"):
         tokenizer_config.update(
@@ -1137,105 +1180,113 @@ def extract_tokenizer(
             }
         )
 
-    # --- Chat template (GGUF metadata first, canonical GLM fallback for glm-dsa/chatglm) ---
-    chat_template = _get_chat_template(reader, arch)
-    if chat_template:
-        tokenizer_config["chat_template"] = chat_template
-        with open(output_dir / "chat_template.jinja", "w", encoding="utf-8") as f:
-            f.write(chat_template)
-        print("  ✓ Saved chat_template.jinja")
-
-    with open(output_dir / "tokenizer_config.json", "w") as f:
-        json.dump(tokenizer_config, f, indent=2, ensure_ascii=False)
-    print("  ✓ Saved tokenizer_config.json")
-
-    # --- special_tokens_map.json ---
-    special_tokens = {
-        "bos_token": tokens[bos_id] if bos_id < vocab_size else "<s>",
-        "eos_token": tokens[eos_id] if eos_id < vocab_size else "</s>",
-        "unk_token": tokens[unk_id] if unk_id < vocab_size else "<unk>",
-    }
-    if bpe_without_unknown:
-        special_tokens.pop("unk_token")
-    if pad_id < vocab_size and tokens[pad_id]:
-        special_tokens["pad_token"] = tokens[pad_id]
-
-    with open(output_dir / "special_tokens_map.json", "w") as f:
-        json.dump(special_tokens, f, indent=2, ensure_ascii=False)
-    print("  ✓ Saved special_tokens_map.json")
-
-    # --- vocab.json (word → id mapping) ---
-    vocab = {}
-    for i, token in enumerate(tokens):
-        if i < vocab_size and isinstance(token, str):
-            vocab[token] = i
-
-    with open(output_dir / "vocab.json", "w") as f:
-        json.dump(vocab, f, indent=2, ensure_ascii=False)
-    print(f"  ✓ Saved vocab.json ({len(vocab)} entries)")
-
-    # --- merges.txt (for BPE tokenizers) ---
-    if model_type in ("bpe", "gpt2") and merges:
-        # GGUF stores merges with space characters
-        merges_path = output_dir / "merges.txt"
-        with open(merges_path, "w") as f:
-            # No version header — HuggingFace GPT-2 tokenizer expects raw merges
-            for merge in merges:
-                if isinstance(merge, bytes):
-                    merge = merge.decode("utf-8", errors="replace")
-                f.write(merge + "\n")
-        print(f"  ✓ Saved merges.txt ({len(merges)} merges)")
-
     # --- tokenizer.json (for fast tokenizers) ---
     tokenizer_json = None
     if embedded_hf_json:
         try:
             parsed_hf_json = json.loads(embedded_hf_json)
-            if not isinstance(parsed_hf_json, dict) or "model" not in parsed_hf_json:
-                raise ValueError("embedded tokenizer JSON is not a tokenizer object")
+            if not isinstance(parsed_hf_json, dict) or not isinstance(
+                parsed_hf_json.get("model"), dict,
+            ):
+                raise TypeError("embedded tokenizer JSON is not a tokenizer object")
+            embedded_vocab = parsed_hf_json["model"].get("vocab")
+            if isinstance(embedded_vocab, list):
+                embedded_vocab = {row[0]: i for i, row in enumerate(embedded_vocab)}
+            if not isinstance(embedded_vocab, dict) or not embedded_vocab:
+                raise ValueError("embedded tokenizer JSON has no vocabulary")
+            embedded_vocab = dict(embedded_vocab)
+            for added in parsed_hf_json.get("added_tokens", []):
+                embedded_vocab[added["content"]] = added["id"]
+            if embedded_vocab != {token: i for i, token in enumerate(tokens)}:
+                raise ValueError("embedded tokenizer vocabulary does not match GGUF token IDs")
             tokenizer_json = parsed_hf_json
             print("  ✓ Preserved embedded tokenizer.huggingface.json")
-        except (json.JSONDecodeError, ValueError) as error:
+        except (ValueError, TypeError, KeyError, IndexError) as error:
             warnings.warn(f"Invalid tokenizer.huggingface.json; rebuilding tokenizer: {error}")
 
     if tokenizer_json is None:
+        charsmap = reader.get_field("tokenizer.ggml.precompiled_charsmap")
+        encoded_charsmap = None
+        if charsmap is not None:
+            encoded_charsmap = base64.b64encode(bytes(charsmap.contents())).decode("ascii")
         tokenizer_json = _build_tokenizer_json(
             tokens,
             token_types,
             merges,
             scores,
-            model_type,
+            source_model,
             bos_id,
             eos_id,
             pad_id,
             unk_id=unk_id,
             add_space_prefix=add_space_prefix,
             arch=arch,
+            tokenizer_pre=tokenizer_pre,
+            do_lower_case=get_metadata_bool(reader, "tokenizer.ggml.normalizer.lowercase"),
+            strip_accents=get_metadata_bool(reader, "tokenizer.ggml.normalizer.strip_accents"),
+            precompiled_charsmap=encoded_charsmap,
+            special_token_ids=[
+                token_id for token_id in (
+                    sep_id, get_metadata_int(reader, "tokenizer.ggml.mask_token_id"),
+                ) if token_id is not None
+            ],
+            remove_extra_whitespaces=get_metadata_bool(
+                reader, "tokenizer.ggml.remove_extra_whitespaces",
+            ),
         )
-        if bpe_without_unknown:
-            tokenizer_json["model"]["unk_token"] = None
-        if arch == "gemma":
+        end_id = sep_id if model_type == "wordpiece" and add_sep_token else eos_id
+        add_end_token = add_sep_token if model_type == "wordpiece" else add_eos_token
+        if add_bos_token or add_end_token:
             special_ids = [
                 (tokens[token_id], token_id)
-                for enabled, token_id in ((add_bos_token, bos_id), (add_eos_token, eos_id))
-                if enabled
+                for enabled, token_id in ((add_bos_token, bos_id), (add_end_token, end_id))
+                if enabled and token_id is not None and 0 <= token_id < vocab_size
             ]
-            prefix = [{"SpecialToken": {"id": tokens[bos_id], "type_id": 0}}] if add_bos_token else []
-            suffix = [{"SpecialToken": {"id": tokens[eos_id], "type_id": 0}}] if add_eos_token else []
+            prefix = (
+                [{"SpecialToken": {"id": tokens[bos_id], "type_id": 0}}]
+                if add_bos_token and bos_id >= 0 else []
+            )
+            suffix = (
+                [{"SpecialToken": {"id": tokens[end_id], "type_id": 0}}]
+                if add_end_token and end_id is not None and end_id >= 0 else []
+            )
+            pair_suffix = (
+                [{"SpecialToken": {"id": tokens[end_id], "type_id": 1}}]
+                if model_type == "wordpiece" and suffix else suffix
+            )
             tokenizer_json["post_processor"] = {
                 "type": "TemplateProcessing",
                 "single": prefix + [{"Sequence": {"id": "A", "type_id": 0}}] + suffix,
                 "pair": (
                     prefix + [{"Sequence": {"id": "A", "type_id": 0}}] + suffix
-                    + prefix + [{"Sequence": {"id": "B", "type_id": 1}}] + suffix
+                    + ([] if model_type == "wordpiece" else prefix)
+                    + [{"Sequence": {"id": "B", "type_id": 1}}]
+                    + pair_suffix
                 ),
                 "special_tokens": {
                     token: {"id": token, "ids": [token_id], "tokens": [token]}
                     for token, token_id in special_ids
                 },
             }
+    chat_template = _get_chat_template(reader, arch)
+    if chat_template:
+        tokenizer_config["chat_template"] = chat_template
+        (output_dir / "chat_template.jinja").write_text(chat_template, encoding="utf-8")
+        print("  ✓ Saved chat_template.jinja")
+    vocab = {token: i for i, token in enumerate(tokens)}
+    for filename, document in (
+        ("tokenizer_config.json", tokenizer_config),
+        ("special_tokens_map.json", special_tokens),
+        ("vocab.json", vocab),
+    ):
+        with open(output_dir / filename, "w", encoding="utf-8") as f:
+            json.dump(document, f, indent=2, ensure_ascii=False)
+        print(f"  ✓ Saved {filename}")
+    if model_type in ("bpe", "gpt2") and merges:
+        (output_dir / "merges.txt").write_text("\n".join(merges) + "\n", encoding="utf-8")
+        print(f"  ✓ Saved merges.txt ({len(merges)} merges)")
     if tokenizer_json:
-        with open(output_dir / "tokenizer.json", "w") as f:
+        with open(output_dir / "tokenizer.json", "w", encoding="utf-8") as f:
             json.dump(tokenizer_json, f, indent=2, ensure_ascii=False)
         print("  ✓ Saved tokenizer.json")
 
@@ -1244,9 +1295,9 @@ def _sentencepiece_bpe_merges(
     tokens: list[str], token_types: list[int], scores: list[float],
 ) -> list[list[str]]:
     if len(scores) != len(tokens) or not np.isfinite(scores).all():
-        raise ValueError("Gemma SentencePiece BPE requires a finite score for every token")
+        raise ValueError("SentencePiece BPE requires a finite score for every token")
     if token_types and len(token_types) != len(tokens):
-        raise ValueError("Gemma SentencePiece BPE requires a type for every token")
+        raise ValueError("SentencePiece BPE requires a type for every token")
     vocab = {
         token: i for i, token in enumerate(tokens)
         if not token_types or token_types[i] == 1
@@ -1276,6 +1327,12 @@ def _build_tokenizer_json(
     unk_id: int = 0,
     add_space_prefix: bool = True,
     arch: str = "llama",
+    tokenizer_pre: str | None = None,
+    do_lower_case: bool | None = None,
+    remove_extra_whitespaces: bool | None = None,
+    strip_accents: bool | None = None,
+    precompiled_charsmap: str | None = None,
+    special_token_ids: list[int] | None = None,
 ) -> dict:
     """Build a complete tokenizer.json for HuggingFace tokenizers."""
     vocab = {}
@@ -1289,8 +1346,9 @@ def _build_tokenizer_json(
     for i, token in enumerate(tokens):
         tt = token_types[i] if i < len(token_types) else 1
         # Preserve GGUF control and user-defined token semantics.
-        if tt in (3, 4) or i in (bos_id, eos_id, pad_id):
-            special = tt == 3 or i in (bos_id, eos_id, pad_id)
+        role_token = i in (bos_id, eos_id, pad_id, unk_id) or i in (special_token_ids or [])
+        if tt in (2, 3, 4) or role_token:
+            special = tt in (2, 3) or role_token
             added_tokens.append(
                 {
                     "id": i,
@@ -1305,7 +1363,9 @@ def _build_tokenizer_json(
         else:
             normal_tokens.append(token)
 
-    normalized_model_type = model_type.lower()
+    normalized_model_type = {"bert": "wordpiece", "t5": "unigram"}.get(
+        model_type.lower(), model_type.lower(),
+    )
 
     # Build model block
     has_byte_fallback = any(
@@ -1313,10 +1373,12 @@ def _build_tokenizer_json(
         or (token.startswith("<0x") and token.endswith(">"))
         for i, token in enumerate(tokens)
     )
-    gemma_spm = arch == "gemma" and normalized_model_type in (
-        "llama", "spm", "sentencepiece", "unigram",
+    sentencepiece_bpe = normalized_model_type == "llama" or (
+        arch == "gemma" and normalized_model_type in ("spm", "sentencepiece", "unigram")
     )
-    if gemma_spm:
+    if sentencepiece_bpe:
+        if not 0 <= unk_id < len(tokens):
+            raise ValueError("SentencePiece BPE reconstruction requires a valid unknown_token_id")
         model_block = {
             "type": "BPE",
             "vocab": vocab,
@@ -1326,6 +1388,12 @@ def _build_tokenizer_json(
             "fuse_unk": True,
         }
     elif normalized_model_type in ("bpe", "gpt2"):
+        for merge in merges:
+            pieces = merge.split(" ")
+            if len(pieces) != 2 or any(piece not in vocab for piece in pieces):
+                raise ValueError(f"Invalid GGUF BPE merge: {merge!r}")
+            if "".join(pieces) not in vocab:
+                raise ValueError(f"GGUF BPE merge result is missing from the vocabulary: {merge!r}")
         byte_fallback = any(
             (i < len(token_types) and token_types[i] == 6)
             or (token.startswith("<0x") and token.endswith(">"))
@@ -1334,7 +1402,7 @@ def _build_tokenizer_json(
         model_block = {
             "type": "BPE",
             "dropout": None,
-            "unk_token": tokens[unk_id] if unk_id < len(tokens) else "<unk>",
+            "unk_token": tokens[unk_id] if 0 <= unk_id < len(tokens) else None,
             "continuing_subword_prefix": "",
             "end_of_word_suffix": "",
             "fuse_unk": False,
@@ -1343,6 +1411,10 @@ def _build_tokenizer_json(
             "merges": merges if merges else [],
         }
     elif normalized_model_type in ("llama", "spm", "sentencepiece", "unigram"):
+        if not 0 <= unk_id < len(tokens):
+            raise ValueError("Unigram reconstruction requires a valid unknown_token_id")
+        if len(scores) != len(tokens) or not np.isfinite(scores).all():
+            raise ValueError("Unigram reconstruction requires a finite score for every token")
         vocab_scores = []
         for i, token in enumerate(tokens):
             score = scores[i] if i < len(scores) else 0.0
@@ -1351,12 +1423,14 @@ def _build_tokenizer_json(
             "type": "Unigram",
             "unk_id": unk_id,
             "vocab": vocab_scores,
-            "byte_fallback": any(token.startswith("<0x") and token.endswith(">") for token in tokens),
+            "byte_fallback": has_byte_fallback,
         }
     elif normalized_model_type == "wordpiece":
+        if not 0 <= unk_id < len(tokens):
+            raise ValueError("WordPiece reconstruction requires a valid unknown_token_id")
         model_block = {
             "type": "WordPiece",
-            "unk_token": tokens[unk_id] if unk_id < len(tokens) else "[UNK]",
+            "unk_token": tokens[unk_id] if 0 <= unk_id < len(tokens) else "[UNK]",
             "continuing_subword_prefix": "##",
             "max_input_chars_per_word": 100,
             "vocab": vocab,
@@ -1364,7 +1438,12 @@ def _build_tokenizer_json(
     else:
         raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
 
-    normalizer = None if arch in {"qwen2", "qwen2moe", "qwen3moe"} else {"type": "NFC"}
+    normalizer = (
+        None if arch in {"qwen2", "qwen2moe", "qwen3moe"} or model_type == "t5"
+        else {"type": "NFC"}
+    )
+    if precompiled_charsmap:
+        normalizer = {"type": "Precompiled", "precompiled_charsmap": precompiled_charsmap}
     pre_tokenizer = {
         "type": "Sequence",
         "pretokenizers": [
@@ -1396,6 +1475,28 @@ def _build_tokenizer_json(
         "trim_offsets": False,
         "use_regex": False,
     }
+    if normalized_model_type in ("bpe", "gpt2") and tokenizer_pre:
+        if tokenizer_pre in ("gpt-2", "gpt2"):
+            normalizer = None
+            pre_tokenizer = {
+                "type": "ByteLevel", "add_prefix_space": False,
+                "trim_offsets": False, "use_regex": True,
+            }
+        elif tokenizer_pre in ("llama-bpe", "llama3", "llama-v3"):
+            model_block["ignore_merges"] = True
+            normalizer = None
+            pre_tokenizer["pretokenizers"][0]["pattern"]["Regex"] = (
+                "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+"
+                "|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*"
+                "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+            )
+        elif tokenizer_pre in ("qwen2", "deepseek-r1-qwen", "kormo", "f2llmv2"):
+            normalizer = None
+        else:
+            warnings.warn(
+                f"Unsupported tokenizer.ggml.pre={tokenizer_pre!r}; "
+                "using legacy BPE splitting, exact tokenization parity is not guaranteed",
+            )
     if normalized_model_type in ("bpe", "gpt2") and has_byte_fallback:
         decoder = {
             "type": "Sequence",
@@ -1409,7 +1510,6 @@ def _build_tokenizer_json(
                 },
             ],
         }
-
     if normalized_model_type in ("spm", "sentencepiece", "unigram", "llama"):
         pre_tokenizer = {
             "type": "Metaspace",
@@ -1427,22 +1527,61 @@ def _build_tokenizer_json(
                 {"type": "Strip", "content": " ", "start": 1, "stop": 0},
             ],
         }
-        if gemma_spm:
+        if not add_space_prefix:
+            decoder["decoders"].pop()
+        if remove_extra_whitespaces:
+            normalizer = {
+                "type": "Sequence",
+                "normalizers": [
+                    *([normalizer] if normalizer else []),
+                    {"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": " "},
+                    {"type": "Strip", "strip_left": True, "strip_right": True},
+                ],
+            }
+        if model_type == "t5":
             normalizers = []
+            if precompiled_charsmap:
+                normalizers = [{
+                    "type": "Precompiled", "precompiled_charsmap": precompiled_charsmap,
+                }]
+            if remove_extra_whitespaces:
+                normalizers.extend([
+                    {"type": "Replace", "pattern": {"Regex": " +"}, "content": " "},
+                    {"type": "Replace", "pattern": {"Regex": "^ | $"}, "content": ""},
+                    {
+                        "type": "Replace", "pattern": {"Regex": "^(?=[\\s\\S])"},
+                        "content": "▁",
+                    },
+                ])
+            elif add_space_prefix:
+                normalizers.append({
+                    "type": "Replace", "pattern": {"Regex": "^(?=[\\s\\S]*[^ ])"},
+                    "content": "▁",
+                })
+            normalizers.append({
+                "type": "Replace", "pattern": {"String": " "}, "content": "▁",
+            })
+            normalizer = {"type": "Sequence", "normalizers": normalizers}
+            pre_tokenizer = None
+        if sentencepiece_bpe:
+            normalizers = []
+            if remove_extra_whitespaces:
+                normalizers.extend([
+                    {"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": " "},
+                    {"type": "Strip", "strip_left": True, "strip_right": True},
+                ])
             if add_space_prefix:
                 normalizers.append({"type": "Prepend", "prepend": "▁"})
             normalizers.append({"type": "Replace", "pattern": {"String": " "}, "content": "▁"})
             normalizer = {"type": "Sequence", "normalizers": normalizers}
             pre_tokenizer = None
-            if not add_space_prefix:
-                decoder["decoders"].pop()
     elif normalized_model_type == "wordpiece":
         normalizer = {
             "type": "BertNormalizer",
             "clean_text": True,
             "handle_chinese_chars": True,
-            "strip_accents": None,
-            "lowercase": True,
+            "strip_accents": strip_accents,
+            "lowercase": True if do_lower_case is None else do_lower_case,
         }
         pre_tokenizer = {"type": "BertPreTokenizer"}
         post_processor = None

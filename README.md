@@ -331,6 +331,45 @@ unrelated architectures.
 
 If any required step fails, conversion fails and the staged output is cleaned up.
 
+### Offline tokenizer reconstruction
+
+Language-model conversion writes `tokenizer.json`, `tokenizer_config.json`,
+`special_tokens_map.json`, `vocab.json`, and, when available, `merges.txt` and
+`chat_template.jinja` directly from the GGUF header. No Hugging Face model or
+tokenizer download is needed for this step.
+
+- **BPE (`gpt2`, `bpe`)** preserves vocabulary IDs and merge order. Recognized
+  `tokenizer.ggml.pre` profiles include GPT-2, Llama-3 and Qwen2; these differ in
+  number splitting and Unicode normalization.
+- **SentencePiece BPE (`llama`)** reconstructs score-ranked merges rather than
+  incorrectly interpreting the vocabulary as Unigram.
+- **WordPiece (`bert`, `wordpiece`)** reverses BERT's GGUF word-start/continuation
+  representation and honors `normalizer.lowercase`, `normalizer.strip_accents`,
+  CLS/SEP IDs and insertion flags.
+- **Unigram (`t5`, `unigram`, `spm`, `sentencepiece`)** retains token scores,
+  byte fallback, whitespace-prefix/removal flags and any precompiled character
+  map. Legacy SentencePiece aliases on Gemma retain score-ranked BPE behavior.
+- Matching embedded `tokenizer.huggingface.json` takes precedence over rebuilding,
+  including its original normalization, added-token and post-processing rules.
+  Explicit GGUF special-token IDs are preserved; absent roles are inferred only
+  from known token names/types, not arbitrary vocabulary positions.
+
+Token strings, scores and token types are **header metadata arrays**, not the
+embedding tensor: weights alone cannot recover a vocabulary. Missing vocabulary,
+invalid IDs, duplicate entries, invalid merges, or missing/nonfinite scores for
+score-based models fail rather than creating a misleading minimal tokenizer.
+Unknown BPE pre-tokenizers emit a parity warning and retain legacy splitting.
+GGUF may omit original normalization or added-token options, so reconstruction
+does not guarantee exact native/original tokenizer parity for every model.
+The VLM path still requires matching processor/tokenizer assets as documented above.
+
+Metadata semantics follow the
+[llama.cpp GGUF definitions](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/constants.py)
+and [tokenizer implementation](https://github.com/ggml-org/llama.cpp/blob/master/src/llama-vocab.cpp).
+The requested [REA repository](https://github.com/morluto/rea) is a general
+reverse-engineering tool, not a GGUF tokenizer exporter; it is not a runtime
+dependency.
+
 ---
 
 ## Current limitations
