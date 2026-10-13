@@ -4,6 +4,7 @@
 
 **Convert supported GGUF language models and LLaVA VLMs into MLX-compatible safetensors on Apple Silicon Macs.**
 
+[![PyPI](https://img.shields.io/pypi/v/gguf2mlx.svg)](https://pypi.org/project/gguf2mlx/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-orange)](https://github.com/barrontang/gguf2mlx)
@@ -49,28 +50,32 @@ already-quantized GGUF file.
 
 ### Install
 
+For regular Mac users on Apple Silicon (M1, M2, M3, M4), installing is straightforward with no compilation or Xcode tools required:
+
 ```bash
-# Base converter
+# Standard install (automatically installs MLX and MLX-LM on Apple Silicon Macs)
 pip install gguf2mlx
 
-# Converter + MLX runtime for loading converted models
-pip install "gguf2mlx[mlx]"
-
-# Or with uv
-uv add "gguf2mlx[mlx]"
+# Recommended for global CLI usage (isolated, avoids Homebrew Python PEP 668 restrictions):
+pipx install gguf2mlx
+# or with uv:
+uv tool install gguf2mlx
 ```
 
-The `mlx` extra installs both `mlx` and `mlx-lm`.
+#### Optional extras
+
+- `pip install "gguf2mlx[all]"`: Complete bundle including MLX, MLX-LM, and Hugging Face Hub (for VLM models)
+- `pip install "gguf2mlx[vlm]"`: Base converter + Hugging Face Hub for Vision-Language Models
+- `pip install "gguf2mlx[dev]"`: Development toolchain (pytest, ruff, mypy, build, twine)
 
 ### Install from a local checkout
 
-If you cloned the repo and want the `gguf2mlx` command in your current
-environment, install it first:
+If you cloned the repo and want the `gguf2mlx` command in your current environment:
 
 ```bash
 python -m pip install -e .
-# or with MLX / MLX-LM support
-python -m pip install -e ".[mlx]"
+# or with all optional dependencies
+python -m pip install -e ".[all]"
 ```
 
 ### Convert

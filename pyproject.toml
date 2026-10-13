@@ -4,7 +4,7 @@ version = "2.1.1"
 description = "Convert verified GGUF models to MLX-LM safetensors on Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = {text = "Apache-2.0"}
 keywords = [
     "gguf",
     "mlx",
@@ -19,42 +19,74 @@ authors = [
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: MacOS X",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
     "gguf>=0.18.0",
     "safetensors",
     "numpy",
     "tqdm",
+    "mlx>=0.18.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.29.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.urls]
 Homepage = "https://github.com/barrontang/gguf2mlx"
+Documentation = "https://github.com/barrontang/gguf2mlx#readme"
 Repository = "https://github.com/barrontang/gguf2mlx"
 Issues = "https://github.com/barrontang/gguf2mlx/issues"
+Changelog = "https://github.com/barrontang/gguf2mlx/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-mlx = ["mlx>=0.18.0", "mlx-lm>=0.29.0"]
-ppl = ["llama-cpp-python==0.3.36"]
+mlx = [
+    "mlx>=0.18.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.29.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 vlm = ["huggingface-hub>=1.0.1"]
-dev = ["pytest", "pytest-cov", "ruff", "mypy", "tokenizers>=0.20", "jinja2>=3.1.6", "transformers>=5.19.0"]
+ppl = ["llama-cpp-python==0.3.36"]
+all = [
+    "mlx>=0.18.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.29.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "huggingface-hub>=1.0.1",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "build",
+    "twine",
+    "tokenizers>=0.20",
+    "jinja2>=3.1.6",
+    "transformers>=5.19.0",
+]
 
 [project.scripts]
 gguf2mlx = "gguf2mlx:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gguf2mlx*"]
+
 [tool.setuptools.package-data]
-gguf2mlx = ["data/*.jinja", "data/*.py"]
+gguf2mlx = ["data/*.py"]
 
 [tool.ruff]
 line-length = 100
