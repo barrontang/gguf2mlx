@@ -309,7 +309,12 @@ gguf2mlx convert --type vlm \
   --input qwen2-vl.gguf --mmproj qwen2-vl-mmproj.gguf \
   --hf-model Qwen/Qwen2-VL-2B-Instruct --output ./qwen2-vl-mlx
 
-# Either adapter: affine 4-bit language projections, floating vision/projector
+# MiniCPM-V 4.7 1B dense: Qwen3.5 language GGUF + matching MiniCPM-V mmproj
+gguf2mlx convert --type vlm \
+  --input minicpm-v-4.7-1b.gguf --mmproj minicpm-v-4.7-1b-mmproj.gguf \
+  --hf-model openbmb/MiniCPM-V-4.7 --output ./minicpm-v-4.7-1b-mlx
+
+# LLaVA/Qwen2-VL: affine 4-bit language projections, floating vision/projector
 gguf2mlx convert --type vlm \
   --input language.gguf --mmproj mmproj.gguf \
   --hf-model /absolute/path/to/matching-hf-vlm --offline \
@@ -331,6 +336,9 @@ gguf2mlx convert --type vlm \
 - Omit `--mmproj` for a combined GGUF. Both paths require GGUF projector
   weights; hybrid conversion never replaces the language model or projector
   with HF weights.
+- MiniCPM-V currently requires its separate 4.7 1B dense `clip` projector GGUF.
+  The 35B-A3B MoE and older 4.6 layouts are rejected; direct quantization is not
+  enabled for MiniCPM-V.
 - `--hf-model` must describe the **matching full VLM**, not a bare CLIP model.
   `--hf-fallback-vision` also supplies that source's assets; if both options are
   specified, they must reference the same source. Pin `--hf-revision` to a HF
@@ -356,7 +364,8 @@ gguf2mlx convert --type vlm \
   files and never overwrite an existing nonempty output directory.
 - `--dtype float16` (default) or `float32` controls floating-point tensors.
   `--quantize --direct-quant` together enable affine 4-bit, group-size-64
-  quantization of language attention/MLP projection matrices only. Embeddings,
+  quantization of language attention/MLP projection matrices for LLaVA and
+  Qwen2-VL only. Embeddings,
   LM head, norms, biases, vision tower and projector remain floating-point.
   Quantization is **decode then re-quantize**, not bit-preserving GGUF
   transpacking; misaligned projections fail instead of silently falling back.
@@ -493,8 +502,8 @@ print('loaded')
 
 Language-model conversion is enabled only for explicit adapters. Text conditioning
 adds a separate, opt-in contract for the four Qwen-VL identifiers above.
-Full-VLM detection and conversion retain their separate LLaVA Llama + CLIP and
-Qwen2-VL adapters.
+Full-VLM detection and conversion provide LLaVA, Qwen2-VL, and a dense
+MiniCPM-V 4.7 1B adapter.
 
 ### Conversion-enabled architectures
 
@@ -512,6 +521,7 @@ Qwen2-VL adapters.
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | Tiny image-path parity; pretrained quality unverified | ❌ | Language-only 4-bit | ✅ generic package/verify | ✅ Llama + CLIP only |
 | Qwen2-VL | `qwen2vl` + Qwen2-VL/mmproj | ✅ direct/hybrid fixture-validated | Named 2B direct checkpoint: 12/12 image diagnostic; see [report](docs/qwen2-vl-real-validation.md) | ❌ | Uniform 4-bit: 11/12 exact; source-preserved Q4_K/float: 12/12 | ✅ generic package/verify | ✅ ViT + patch merger |
+| MiniCPM-V 4.7 1B | dense `qwen35` + `clip.projector_type=minicpmv4_7` | ✅ portable fixture-validated | Native image inference unverified | ❌ (35B-A3B excluded) | ❌ | ✅ generic package/verify | ✅ SigLIP + window/final mergers |
 | Qwen-VL text encoder | `qwen3vl`, `qwen3_vl`, `qwen2vl`, `qwen2_vl` | ✅ `--type text-encoder`, BF16 default | Portable conversion only; native hidden-state/image quality unverified | ❌ | Explicit direct 4-bit only | ✅ generic package/verify | Text only; vision skipped |
 
 “Conversion” means that a code path exists. “End-to-end” means a converted model
@@ -540,6 +550,12 @@ These may still be recognized by metadata or `--skip-weights`, but they are
 
 That means no more silent "Llama fallback" producing invalid outputs for
 unrelated architectures.
+
+MiniCPM-V support is limited to the dense 4.7 1B checkpoint, supplied as a
+Qwen3.5 text GGUF plus its matching `minicpmv4_7` vision/projector GGUF and
+original HF assets. The 35B-A3B MoE and older 4.6 layouts are rejected.
+Plain MiniCPM3 is a separate text-only architecture and is not handled by the
+MiniCPM-V adapter.
 
 ---
 

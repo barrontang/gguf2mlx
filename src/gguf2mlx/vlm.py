@@ -30,10 +30,14 @@ VLM_ARCHITECTURES = {
     "internvl", "idefics2", "idefics3", "paligemma", "gemma3",
     "qwen2-vl", "qwen2.5-vl", "qwen2_5vl", "llava-next-video",
     "llava-onevision", "llava1.5", "llava_1_5",
-    "clip", "pixtral", "mplug_owl", "qwen35", "qwen35moe",
-    "qwen3_5", "qwen3_5_moe", "qwen3.5", "qwen3.5-vl", "qwen3_5_vl",
+    "clip", "pixtral", "mplug_owl",
+    "qwen3.5-vl", "qwen3_5_vl",
 }
-ARCHITECTURE_REGISTRY = {"llava": "llama_clip_mlp", "qwen2_vl": "qwen2_vit_patch_merger"}
+ARCHITECTURE_REGISTRY = {
+    "llava": "llama_clip_mlp",
+    "qwen2_vl": "qwen2_vit_patch_merger",
+    "minicpmv4_7": "qwen35_siglip_window_merger",
+}
 ASSETS = (
     "config.json", "tokenizer.json", "tokenizer_config.json",
     "preprocessor_config.json", "added_tokens.json", "special_tokens_map.json",
@@ -552,7 +556,11 @@ def _restore_llama(name: str, array: np.ndarray, text: dict) -> np.ndarray:
     return np.ascontiguousarray(array)
 
 
-def _hf_vision_name(name: str, architecture: str = "llava") -> str | None:
+def _hf_vision_name(
+    name: str, architecture: str = "llava", minicpm: Any = None,
+) -> str | None:
+    if architecture == "minicpmv4_7":
+        return minicpm.hf_vision_name(name) if minicpm else None
     if architecture == "qwen2_vl":
         for prefix in ("visual.", "model.visual.", "vision_tower."):
             if name.startswith(prefix):
@@ -583,6 +591,7 @@ def _safe_shard_name(name: Any) -> str:
 
 def _vision_files(
     root: Path, source: str, revision: str, offline: bool, architecture: str = "llava",
+    minicpm: Any = None,
 ) -> tuple[list[Path], dict[str, str] | None]:
     index_path = root / "model.safetensors.index.json"
     vision_index = None
@@ -595,8 +604,10 @@ def _vision_files(
             if not isinstance(name, str):
                 raise ValueError("Invalid tensor name in HF safetensors index")  # noqa: TRY004
             _safe_shard_name(shard)
-        vision_index = {name: shard for name, shard in index.items()
-                        if _hf_vision_name(name, architecture) is not None}
+        vision_index = {
+            name: shard for name, shard in index.items()
+            if _hf_vision_name(name, architecture, minicpm) is not None
+        }
         if not vision_index:
             raise ValueError("HF safetensors index contains no supported vision weights")
         names = sorted(set(vision_index.values()))
@@ -740,23 +751,42 @@ def convert_vlm(
         raise ValueError("Supply an original unquantized HF config, not a quantized checkpoint")
     architecture = config.get("model_type")
     if not isinstance(architecture, str) or architecture not in ARCHITECTURE_REGISTRY:
-        raise ValueError("Only HF model_type='llava' or 'qwen2_vl' is supported.")
-    qwen = None
+        raise ValueError(
+            "Only HF model_type='llava', 'qwen2_vl', or 'minicpmv4_7' is supported."
+        )
+    qwen = minicpm = None
     if architecture == "qwen2_vl":
         from .vision_qwen2 import Qwen2VisionAdapter
 
         qwen = Qwen2VisionAdapter(config)
         text, vision = qwen.text, qwen.vision
+    elif architecture == "minicpmv4_7":
+        from .vision_minicpm import MiniCPMV47Adapter
+
+        preprocessor = _read_json(root / "preprocessor_config.json")
+        config.setdefault(
+            "downsample_mode", preprocessor.get("downsample_mode", "16x")
+        )
+        minicpm = MiniCPMV47Adapter(config)
+        text, vision = minicpm.text, minicpm.vision
     else:
         text, vision = _validate_config(config)
     if preserve_source_quant and not qwen:
         raise ValueError("--preserve-source-quant currently supports Qwen2-VL only")
+    if minicpm and direct_quant:
+        raise ValueError("MiniCPM-V 4.7 direct quantization is not supported")
     reader = GGUFReader(gguf_path)
     if qwen:
         qwen.validate_text_metadata(reader)
+    elif minicpm:
+        minicpm.validate_text_metadata(reader)
+        minicpm_text_expected = minicpm.validate_text_tensors(reader)
     else:
         _validate_text_metadata(reader, text)
-    _validate_tokenizer(reader, root, text, config)
+    if minicpm:
+        minicpm.validate_tokenizer(reader, root)
+    else:
+        _validate_tokenizer(reader, root, text, config)
     readers = [reader]
     if mmproj:
         companion = GGUFReader(mmproj)
@@ -764,11 +794,21 @@ def convert_vlm(
         if companion_arch not in ("clip", "llava"):
             raise ValueError("The --mmproj companion must be a CLIP/LLaVA projector GGUF")
         readers.append(companion)
+    if minicpm and not mmproj:
+        raise ValueError("MiniCPM-V 4.7 requires its separate vision GGUF via --mmproj")
     if qwen:
         qwen.configure_layout(readers)
-    for current in readers:
+    processor = minicpm.validate_processor(root) if minicpm else None
+    for index, current in enumerate(readers):
         if qwen:
             qwen.validate_vision_metadata(current)
+            continue
+        if minicpm:
+            if index == 0:
+                continue
+            if core.get_metadata_str(current, "general.architecture") != "clip":
+                raise ValueError("MiniCPM-V 4.7 requires a separate CLIP projector GGUF")
+            minicpm.validate_vision_metadata(current, processor)
             continue
         projector_type = core.get_metadata_str(current, "clip.projector_type")
         if projector_type not in (None, "mlp"):
@@ -776,13 +816,17 @@ def convert_vlm(
         if core.get_metadata_bool(current, "clip.has_siglip") is True:
             raise ValueError("SigLIP projector companions are unsupported")
         _validate_vision_metadata(current, vision)
-    _validate_processor(readers, root, vision, architecture)
-    expected = qwen.expected if qwen else _expected_shapes(text, vision)
+    if not minicpm:
+        _validate_processor(readers, root, vision, architecture)
+    expected = (
+        {**minicpm.expected, **minicpm_text_expected}
+        if minicpm else qwen.expected if qwen else _expected_shapes(text, vision)
+    )
     seen: set[str] = set()
     raw_seen: set[str] = set()
     counts = {"language": 0, "projector": 0, "vision_gguf": 0, "vision_hf": 0,
               "vision_gguf_ignored": 0, "language_tied_head_ignored": 0,
-              "legacy_position_placeholder_ignored": 0}
+              "legacy_position_placeholder_ignored": 0, "separator_embedding_ignored": 0}
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
     if any(output_path.iterdir()):
@@ -835,6 +879,7 @@ def convert_vlm(
 
     embeddings = None
     tied_head = None
+    separator_embedding_seen = False
     validate_tied_head = text.get("tie_word_embeddings", False) and any(
         tensor.name == "output.weight" for tensor in reader.tensors
     )
@@ -855,9 +900,18 @@ def convert_vlm(
                     raise ValueError(f"Unsupported Qwen2-VL vision/projector tensor: {name}")
                 qwen_tensors[name] = tensor
             elif name.startswith("v."):
-                mapped = _map_vision(name)
+                if minicpm and name == "v.tok_embd_sep":
+                    if separator_embedding_seen:
+                        raise ValueError("Duplicate MiniCPM-V separator embedding tensor")
+                    separator_rows = _decode(tensor, "float32")
+                    if separator_rows.shape != (4, text["hidden_size"]):
+                        raise ValueError("MiniCPM-V v.tok_embd_sep must contain four text rows")
+                    separator_embedding_seen = True
+                    counts["separator_embedding_ignored"] += 1
+                    continue
+                mapped = minicpm.map_vision(name) if minicpm else _map_vision(name)
                 if mapped not in expected:
-                    raise ValueError(f"Unexpected CLIP layer/tensor: {name}")
+                    raise ValueError(f"Unexpected vision layer/tensor: {name}")
                 if hf_fallback_vision:
                     counts["vision_gguf_ignored"] += 1
                     continue
@@ -868,7 +922,8 @@ def convert_vlm(
                     array = array.reshape(vision["hidden_size"])
                 emit(mapped, array, "vision_gguf")
             elif name.startswith("mm."):
-                emit(_map_projector(name), _decode(tensor, dtype), "projector")
+                mapped = minicpm.map_projector(name) if minicpm else _map_projector(name)
+                emit(mapped, _decode(tensor, dtype), "projector")
             else:
                 if index:
                     raise ValueError(f"Unexpected non-vision tensor in --mmproj: {name}")
@@ -878,17 +933,22 @@ def convert_vlm(
                         raise ValueError("Tied language output.weight shape differs from token embeddings")
                     counts["language_tied_head_ignored"] += 1
                     continue
-                mapped = "language_model." + core._map_tensor_name(name, "qwen2" if qwen else "llama")
+                text_arch = "qwen2" if qwen else "qwen35" if minicpm else "llama"
+                mapped = "language_model." + core._map_tensor_name(name, text_arch)
                 if mapped not in expected or not mapped.startswith("language_model."):
-                    family = "Qwen2-VL" if qwen else "Llama"
+                    family = "Qwen2-VL" if qwen else "MiniCPM-V" if minicpm else "Llama"
                     raise ValueError(f"Unsupported {family} GGUF tensor: {name}")
                 decode_dtype = "float32" if direct_quant else dtype
                 array = _decode(tensor, decode_dtype)
-                if not qwen:
+                if minicpm:
+                    array = core._restore_architecture_tensor(name, array, "qwen35")
+                elif not qwen:
                     array = _restore_llama(name, array, text)
                 emit(mapped, array, "language", tensor)
                 if name == "token_embd.weight" and validate_tied_head:
                     embeddings = _decode(tensor, "float32") if dtype == "float16" else array
+    if minicpm and not separator_embedding_seen:
+        raise ValueError("MiniCPM-V 4.7 GGUF is missing required v.tok_embd_sep")
     if tied_head is not None and (
         embeddings is None or not np.array_equal(tied_head, embeddings)
     ):
@@ -919,13 +979,13 @@ def convert_vlm(
     if hf_fallback_vision:
         # Pin subsequent downloads to the resolved asset revision when available.
         files, vision_index = _vision_files(
-            root, source, resolved or hf_revision, offline, architecture
+            root, source, resolved or hf_revision, offline, architecture, minicpm
         )
         found_index_names: set[str] = set()
         for file in files:
             with safe_open(str(file), framework="np") as weights:
                 for name in list(weights.keys()):
-                    hf_name = _hf_vision_name(name, architecture)
+                    hf_name = _hf_vision_name(name, architecture, minicpm)
                     if hf_name is None:
                         continue
                     if vision_index is not None and (
@@ -959,6 +1019,9 @@ def convert_vlm(
     if qwen:
         config.update(text)
         config["model_type"] = architecture
+        config["vision_config"] = {**vision, "torch_dtype": dtype}
+    elif minicpm:
+        config["text_config"] = {**text, "torch_dtype": dtype}
         config["vision_config"] = {**vision, "torch_dtype": dtype}
     if direct_quant:
         if not quantized:
