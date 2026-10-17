@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PLACEHOLDER - Project Statistics</title>
+    <title>gguf2mlx - Project Statistics</title>
     <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"
             onerror="document.getElementById('chart-fallback').classList.remove('hidden')"></script>
@@ -527,8 +527,8 @@
 <body>
     <div class="container">
         <header>
-            <a href="https://github.com/OWNER/REPO" class="banner-link">
-                <p class="banner-title">PLACEHOLDER</p>
+            <a href="https://github.com/barrontang/gguf2mlx" class="banner-link">
+                <p class="banner-title">gguf2mlx</p>
                 <p class="banner-arrow">View repository &rarr;</p>
             </a>
             <h1><a href="https://github.com/djdarcy/github-traffic-tracker" class="ghtraf-heading"><img src="../images/ghtraf-banner.png" alt="GHTraf"></a> Project Statistics</h1>
@@ -919,8 +919,8 @@
                 <div class="footer-text">
                     <p>Data updates daily at 3:00 AM UTC &middot; Last data point: <span id="last-updated">--</span></p>
                     <p>
-                        <a href="https://github.com/OWNER/REPO">Repository</a> &middot;
-                        <a href="https://github.com/OWNER/REPO/releases">Releases</a>
+                        <a href="https://github.com/barrontang/gguf2mlx">Repository</a> &middot;
+                        <a href="https://github.com/barrontang/gguf2mlx/releases">Releases</a>
                     </p>
                     <p style="margin-top: 0.8rem; font-size: 0.8rem; font-weight: 600;">
                         Dashboard by <a href="https://github.com/djdarcy/github-traffic-tracker">GitHub Traffic Tracker</a>
@@ -946,13 +946,13 @@
 
     <script>
         // Configuration
-        const GIST_RAW_BASE = 'https://gist.githubusercontent.com/USER/GISTID/raw';
+        const GIST_RAW_BASE = 'https://gist.githubusercontent.com/barrontang/GIST_ID/raw';
         const STATE_URL = GIST_RAW_BASE + '/state.json';
-        const ARCHIVE_GIST_ID = 'ARCHIVEID';
+        const ARCHIVE_GIST_ID = 'ARCHIVE_GIST_ID';
         const ARCHIVE_API_URL = 'https://api.github.com/gists/' + ARCHIVE_GIST_ID;
-        const REPO_OWNER = 'OWNER';
-        const REPO_NAME = 'REPO';
-        const REPO_CREATED = '2025-01-01'; // for project age calculation
+        const REPO_OWNER = 'barrontang';
+        const REPO_NAME = 'gguf2mlx';
+        const REPO_CREATED = '2025-09-12'; // for project age calculation
         var primaryAuthor = null; // resolved from contributors API (org-owned repos have owner=org, not committer)
 
         // State

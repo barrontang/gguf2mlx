@@ -1,6 +1,6 @@
 # Project Statistics Dashboard
 
-Interactive dashboard showing traffic analytics for [PLACEHOLDER](https://github.com/OWNER/REPO).
+Interactive dashboard showing traffic analytics for [gguf2mlx](https://github.com/barrontang/gguf2mlx).
 
 ## How It Works
 
@@ -23,7 +23,7 @@ A [GitHub Actions workflow](../../.github/workflows/traffic-badges.yml) runs dai
 
 | Source | Type | Contents |
 |--------|------|----------|
-| [Badge Gist](https://gist.github.com/USER/GISTID) | Public | Current stats, rolling 31-day daily history |
+| Badge Gist | Public | Current stats, rolling 31-day daily history |
 | Archive Gist | Unlisted | Monthly snapshots with full daily breakdowns |
 | GitHub Statistics API | Public | Commit activity, code frequency, participation, contributors |
 
@@ -47,6 +47,6 @@ A [GitHub Actions workflow](../../.github/workflows/traffic-badges.yml) runs dai
 
 The dashboard is hosted on GitHub Pages:
 
-**https://OWNER.github.io/REPO/stats/**
+**https://barrontang.github.io/gguf2mlx/stats/**
 
 You can also open `index.html` directly in a browser for local testing — the gist CDN has permissive CORS headers.

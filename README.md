@@ -142,6 +142,31 @@ occurs if conversion fails.
 
 ## Other gguf2mlx workflows
 
+### Repository traffic analytics
+
+This repository includes a daily GitHub Traffic Tracker workflow and dashboard.
+To activate collection, authenticate `gh` with access to this repository, install
+the tracker, and follow its setup prompts:
+
+```bash
+pip install github-traffic-tracker
+ghtraf create --owner barrontang --repo gguf2mlx --configure \
+  --repo-dir /absolute/path/to/gguf2mlx
+```
+
+Add the prompted Gist token as the `TRAFFIC_GIST_TOKEN` repository secret, then
+enable GitHub Pages from the `main` branch and `/docs` directory:
+
+```bash
+gh secret set TRAFFIC_GIST_TOKEN
+```
+
+The workflow remains skipped until `TRAFFIC_GIST_ID` is configured. Once setup is complete,
+the dashboard is available at
+[barrontang.github.io/gguf2mlx/stats](https://barrontang.github.io/gguf2mlx/stats/).
+The tracker workflow and dashboard are distributed under GPL-3.0-or-later; see
+[`LICENSES/GPL-3.0.txt`](LICENSES/GPL-3.0.txt).
+
 GGUF is great for distribution, but MLX and MLX-LM expect a Hugging Face-style
 directory with `config.json`, tokenizer assets, and safetensors weights.
 
