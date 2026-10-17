@@ -490,7 +490,7 @@ print('loaded')
 | Embedded `tokenizer.huggingface.json` preservation | Supported |
 | GGUF BOS/EOS/UNK and space-prefix metadata | Supported |
 | Executable Unigram and WordPiece tokenizer tests | Supported |
-| Gemma and Phi-3 architecture fixtures | Supported |
+| Gemma and Phi-3/Phi-4 architecture fixtures, including LongRoPE config | Supported |
 | Bounded-memory direct quantization (`--direct-quant`) | Supported |
 | StableLM conversion adapter | Supported |
 | LLaVA Llama + CLIP direct/hybrid VLM adapter | Native tiny-checkpoint image-path parity tested |
@@ -524,7 +524,7 @@ MiniCPM-V 4.7 1B adapter.
 | DeepSeek | `deepseek2`, `deepseek3` | ✅ | ⚠️ scheduled opt-in | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | GLM | `glm4moe` | ✅ | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | Gemma | `gemma`, `gemma2`, `gemma3`, text-only `gemma4` | ✅ | Portable conversion fixtures; native runtime unverified | Gemma4 MoE layout supported | — | ✅ generic package/verify | ❌ |
-| Phi | `phi3` | ✅ Phi-3 4K fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
+| Phi | `phi3` (Phi-3 and Phi-4; Phi-4 alias) | ✅ Phi-3 4K/LongRoPE and Phi-4 fixtures | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
 | StableLM | `stablelm` | ✅ | ❌ | ❌ | — | ✅ generic package/verify | ❌ |
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | Tiny image-path parity; pretrained quality unverified | ❌ | Language-only 4-bit | ✅ generic package/verify | ✅ Llama + CLIP only |
@@ -630,8 +630,6 @@ This project is intentionally more honest about scope now:
   Hugging Face tokenizer JSON is preserved when present
 - **Architecture coverage is adapter-based**, not "all GGUF models"
 - **Performance claims depend on model, prompt, hardware, and MLX-LM version**
-- **Phi-3 LongRoPE is rejected** until its factor tensors are represented safely
-  in the generated MLX configuration
 - **Mixed-precision MoE output is experimental.** It writes
   `jang_config.json` and requires a JANG-compatible runtime. No specific JANG
   runtime is claimed as verified yet; use uniform output when interoperability
@@ -727,8 +725,9 @@ conversion writes FP16 or FP32 safetensors, so a larger output is expected.
 ### Are Gemma and Phi supported?
 
 Gemma, Gemma 2, Gemma 3, and text-only Gemma 4 have conversion adapters. Gemma 4
-multimodal/audio tensors are not part of the text-only output. Phi-2, Phi-MoE,
-and Phi-3 LongRoPE remain unsupported.
+multimodal/audio tensors are not part of the text-only output. Phi-3 (including
+LongRoPE) and Phi-4 text GGUFs have adapters; Phi-4 uses MLX-LM's Phi-3 model type.
+Phi-2, Phi-MoE, and Phi-4 vision conversion remain unsupported.
 
 ### Is MLX always faster than llama.cpp?
 
@@ -853,7 +852,7 @@ Completed:
 - MLX quantized output through bundled `mlx_lm.convert`
 - MLX-LM load/integration tests on Apple Silicon
 - strict adapter-based architecture validation
-- fixture-backed Gemma and standard Phi-3 4K adapters
+- fixture-backed Gemma, Phi-3 (4K and LongRoPE), and Phi-4 adapters
 - GGUF tokenizer flags and embedded tokenizer JSON preservation
 - reproducible conversion benchmark harness
 - bounded-memory direct quantization pipeline (`--direct-quant`, affine 4-bit, dense and declared MoE adapters, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K–Q8_K/IQ4_NL/BF16 source qtypes)
@@ -876,8 +875,6 @@ Remaining areas for contributors:
 - canonical chat-template fallback table for known model families when GGUF-embedded Jinja templates are missing or broken
 - publish peak RSS and output-size comparison results from `benchmarks/benchmark_conversion.py --compare`
 - evaluate GGUF→MLX conversion for high-demand non-text models (e.g. ASR/embedding) where competition is thin (pending verification that such models ship GGUF)
-- add a fixture-backed Phi-3 LongRoPE adapter only when its factor tensors can be
-  represented safely in the generated MLX configuration
 - publish additional architecture-specific tokenizer normalizer fixtures as upstream formats evolve
 - add LLaVA-NeXT any-resolution/image-newline handling and distinct Qwen2.5/3.x
   vision adapters, including Qwen3.5's different language backbone, before

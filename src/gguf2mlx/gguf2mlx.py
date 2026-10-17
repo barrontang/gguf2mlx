@@ -197,6 +197,7 @@ ARCH_MAP: dict[str, str] = {
     "qwen2moe": "qwen2_moe",
     "qwen3moe": "qwen3_moe",
     "phi3": "phi3",
+    "phi4": "phi3",
     "phi2": "phi",
     "phi": "phi",
     "gemma": "gemma",
@@ -247,6 +248,7 @@ CONVERTIBLE_ARCHES = {
     "llama",
     "mistral",
     "phi3",
+    "phi4",
     "qwen2",
     "qwen3",
     "qwen35",
@@ -265,7 +267,7 @@ CONVERTIBLE_ARCHES = {
 }
 
 STRICT_ADAPTER_ARCHES = {
-    "gemma", "gemma2", "gemma3", "gemma4", "phi3", "qwen3",
+    "gemma", "gemma2", "gemma3", "gemma4", "phi3", "phi4", "qwen3",
     "qwen35", "qwen3_5", "qwen3.5", "qwen36", "qwen3_6", "qwen3.6",
     "qwen38", "qwen3_8", "qwen3.8",
 }
@@ -275,6 +277,7 @@ QWEN35_ARCHES = {
     "qwen38", "qwen3_8", "qwen3.8",
 }
 GEMMA_ARCHES = {"gemma", "gemma2", "gemma3", "gemma4"}
+PHI_ARCHES = {"phi3", "phi4"}
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
 MOE_ARCHES = {"qwen2moe", "qwen3moe", "deepseek2", "deepseek3", "glm4moe", "glm-dsa"}
 DIRECT_QUANT_SUPPORTED_ARCHES = {
@@ -348,6 +351,12 @@ def detect_architecture(reader: GGUFReader) -> str:
     """Detect model architecture from GGUF metadata."""
     arch = get_metadata_str(reader, "general.architecture")
     name = get_metadata_str(reader, "general.name")
+
+    if arch == "phi4" or (
+        arch in PHI_ARCHES
+        and get_metadata_int(reader, f"{arch}.attention.sliding_window") == 0
+    ) or (name and re.search(r"\bphi[\s._-]*4\b", name, re.IGNORECASE)):
+        return "phi4"
 
     if arch in QWEN_VL_TEXT_ARCHES:
         return arch
@@ -434,14 +443,10 @@ def validate_architecture_variant(reader: GGUFReader, arch: str) -> str | None:
             f"The {arch} adapter supports dense layouts only; MoE expert tensors "
             "are not supported."
         )
-    if arch == "phi3" and any(
-        tensor.name in {"rope_factors_long", "rope_factors_short"}
-        for tensor in reader.tensors
-    ):
-        return (
-            "Phi-3 LongRoPE tensors are not supported yet; the verified adapter "
-            "currently targets standard Phi-3 4K checkpoints."
-        )
+    if arch in PHI_ARCHES:
+        factors = _find_phi3_rope_factor_tensors(reader)
+        if bool(factors.get("long")) != bool(factors.get("short")):
+            return "Phi LongRoPE requires both rope_factors_long and rope_factors_short tensors."
     return None
 
 
@@ -534,6 +539,19 @@ def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[st
 
 def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[str, Any]:
     """Build MLX-compatible config.json from GGUF metadata."""
+    if arch == "phi4":
+        original_reader = reader
+
+        class Phi4Metadata:
+            tensors = original_reader.tensors
+
+            def get_field(self, key):
+                field = original_reader.get_field(key)
+                if field is None and key.startswith("phi4."):
+                    field = original_reader.get_field("phi3." + key[len("phi4."):])
+                return field
+
+        reader = Phi4Metadata()
     if arch in QWEN_VL_TEXT_ARCHES:
         return Qwen3VLTextEncoderConverter.build_config(reader, arch, dtype)
     if arch in QWEN35_ARCHES and arch != "qwen35":
@@ -930,24 +948,55 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
         config["linear_conv_kernel_dim"] = config.get("linear_conv_kernel_dim", 4)
         config["full_attention_interval"] = config.get("full_attention_interval", 4)
 
-    if arch == "phi3":
+    if arch in PHI_ARCHES:
         head_dim = hidden_size // num_heads
-        rope_dim = get_metadata_int(reader, "phi3.rope.dimension_count") or head_dim
+        rope_dim = get_metadata_int(reader, f"{arch}.rope.dimension_count") or head_dim
         original_context = get_metadata_int(
-            reader, "phi3.rope.scaling.original_context_length"
+            reader, f"{arch}.rope.scaling.original_context_length"
         ) or min(ctx_length, 4096)
         config["partial_rotary_factor"] = rope_dim / head_dim
         config["original_max_position_embeddings"] = original_context
         config["attention_bias"] = False
         config["tie_word_embeddings"] = False
 
-        rope_scaling_type = get_metadata_str(reader, "phi3.rope.scaling.type")
-        rope_scaling_factor = get_metadata_float(reader, "phi3.rope.scaling.factor")
+        rope_scaling_type = get_metadata_str(reader, f"{arch}.rope.scaling.type")
+        rope_scaling_factor = get_metadata_float(reader, f"{arch}.rope.scaling.factor")
         if rope_scaling_type == "linear" and rope_scaling_factor is not None:
             config["rope_scaling"] = {
                 "type": "linear",
                 "factor": rope_scaling_factor,
             }
+        rope_factors = _find_phi3_rope_factor_tensors(reader)
+        if rope_factors:
+            if set(rope_factors) != {"long", "short"}:
+                raise ValueError(
+                    "Phi LongRoPE requires both rope_factors_long and rope_factors_short tensors"
+                )
+            long_factor = rope_factors["long"]
+            short_factor = rope_factors["short"]
+            expected_factor_count = rope_dim // 2
+            if (
+                rope_dim % 2
+                or len(long_factor) != expected_factor_count
+                or len(short_factor) != expected_factor_count
+            ):
+                raise ValueError(
+                    "Phi LongRoPE factor lengths must equal half the rotary dimension "
+                    f"({expected_factor_count})"
+                )
+            if rope_scaling_type not in (None, "longrope", "su"):
+                raise ValueError(
+                    f"Phi rope scaling type {rope_scaling_type!r} conflicts with LongRoPE tensors"
+                )
+            config["rope_scaling"] = {
+                "type": "longrope",
+                "long_factor": long_factor,
+                "short_factor": short_factor,
+            }
+        elif rope_scaling_type in ("longrope", "su"):
+            raise ValueError(
+                "Phi LongRoPE config is missing rope_factors_long and rope_factors_short tensors"
+            )
 
     # --- StableLM ---
     if arch == "stablelm":
@@ -1083,8 +1132,29 @@ def _map_llama_tensor_name(gguf_name: str) -> str:
     return gguf_name
 
 
+def _find_phi3_rope_factor_tensors(reader: GGUFReader) -> dict[str, list[float]]:
+    """Read and validate the shared LongRoPE factor tensors from a Phi GGUF."""
+    factors: dict[str, list[float]] = {}
+    for tensor in reader.tensors:
+        match = re.fullmatch(
+            r"(?:blk\.\d+\.)?rope_factors_(long|short)(?:\.weight)?",
+            tensor.name,
+        )
+        if match is None:
+            continue
+        which = match.group(1)
+        values = np.asarray(tensor.data, dtype=np.float32).reshape(-1)
+        if values.size == 0 or np.any(~np.isfinite(values)) or np.any(values <= 0):
+            raise ValueError(f"Invalid Phi LongRoPE {which} factor tensor")
+        factor_values = values.tolist()
+        if which in factors and factors[which] != factor_values:
+            raise ValueError(f"Conflicting Phi LongRoPE {which} factor tensors")
+        factors[which] = factor_values
+    return factors
+
+
 def _map_phi3_tensor_name(gguf_name: str) -> str:
-    """Map Phi-3 GGUF tensors to the fused layout expected by MLX-LM."""
+    """Map Phi-3/Phi-4 GGUF tensors to the layout expected by MLX-LM."""
     if gguf_name == "token_embd.weight":
         return "model.embed_tokens.weight"
     if gguf_name == "output.weight":
@@ -1278,7 +1348,7 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
             "per_layer_model_proj.weight": "model.per_layer_model_projection.weight",
             "per_layer_proj_norm.weight": "model.per_layer_projection_norm.weight",
         }[gguf_name]
-    elif arch == "phi3":
+    elif arch in PHI_ARCHES:
         mapped = _map_phi3_tensor_name(gguf_name)
     elif arch == "qwen2moe" and (
         match := re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down|gate_inp)_shexp\.weight", gguf_name)
@@ -2025,7 +2095,7 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
 
     # --- Phi-3 split Q/K/V -> fused qkv_proj ---
     match = re.fullmatch(r"blk\.(\d+)\.attn_(q|k|v)\.weight", gguf_name)
-    if match and arch == "phi3":
+    if match and arch in PHI_ARCHES:
         layer_idx, projection = match.groups()
         buf = pending_qkv.setdefault(layer_idx, {})
         buf[projection] = arr
@@ -2184,13 +2254,18 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
     """Decode lazily, visiting related headers together to bound fusion buffers."""
     groups: dict[str, list[Any]] = {}
     for tensor in reader.tensors:
+        if arch in PHI_ARCHES and re.fullmatch(
+            r"(?:blk\.\d+\.)?rope_factors_(?:long|short)(?:\.weight)?",
+            tensor.name,
+        ):
+            continue
         if arch in QWEN_VL_TEXT_ARCHES:
             if Qwen3VLTextEncoderConverter.is_visual_tensor(tensor.name):
                 print(f"    Skipping vision/projector tensor: {tensor.name}")
                 continue
             _map_tensor_name(tensor.name, arch)
         group = tensor.name
-        if arch == "phi3":
+        if arch in PHI_ARCHES:
             match = re.fullmatch(r"(blk\.\d+)\.attn_[qkv]\.weight", tensor.name)
             if match:
                 group = match[1] + ".attn_qkv.weight"
