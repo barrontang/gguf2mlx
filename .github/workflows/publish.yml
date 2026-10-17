@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: publish-${{ github.ref }}-${{ inputs.target || 'pypi' }}
+  group: publish-${{ inputs.target || 'pypi' }}
   cancel-in-progress: false
 
 jobs:
@@ -117,7 +117,6 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
-          skip-existing: true
 
   publish-testpypi:
     name: Publish to TestPyPI
@@ -155,6 +154,14 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: v${{ needs.build.outputs.version }}
         run: |
+          refs=$(gh api "repos/$GH_REPO/git/matching-refs/tags/$TAG" --jq '.[].ref')
+          if grep -Fxq "refs/tags/$TAG" <<< "$refs"; then
+            tagged_sha=$(gh api "repos/$GH_REPO/commits/$TAG" --jq '.sha')
+            if [ "$tagged_sha" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag $TAG no longer points to the published source."
+              exit 1
+            fi
+          fi
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
           fi

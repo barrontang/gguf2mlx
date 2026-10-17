@@ -513,8 +513,8 @@ The `testpypi` target does not create a GitHub Release.
 The old `v2.1.2` and `v2.1.3` tags contain package metadata for `2.1.1`; do not
 rerun them or move them. Version `2.1.4` is the fresh release prepared to recover
 from those failed uploads. PyPI cannot overwrite an existing distribution.
-If publishing succeeds but GitHub Release creation fails, rerun the failed jobs.
-Repeated PyPI runs skip distributions already uploaded.
+If publishing succeeds but GitHub Release creation fails, rerun only the failed
+jobs from that same run rather than rebuilding or uploading the package again.
 
 ## Supported conversion matrix
 
