@@ -274,6 +274,7 @@ QWEN35_ARCHES = {
     "qwen35", "qwen3_5", "qwen3.5", "qwen36", "qwen3_6", "qwen3.6",
     "qwen38", "qwen3_8", "qwen3.8",
 }
+GEMMA_ARCHES = {"gemma", "gemma2", "gemma3", "gemma4"}
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
 MOE_ARCHES = {"qwen2moe", "qwen3moe", "deepseek2", "deepseek3", "glm4moe", "glm-dsa"}
 DIRECT_QUANT_SUPPORTED_ARCHES = {
@@ -332,6 +333,9 @@ MODEL_NAME_ARCH_FALLBACKS: list[tuple[str, str]] = [
     (r"\bdeepseek-v3\b", "deepseek3"),
     (r"\bdeepseek-r1\b", "deepseek3"),
     (r"\bdeepseek-v2\b", "deepseek2"),
+    (r"\bqwen\s*3[._ -]?5\b", "qwen35"),
+    (r"\bqwen\s*3[._ -]?6\b", "qwen36"),
+    (r"\bqwen\s*3[._ -]?8\b", "qwen38"),
     (r"\bmixtral\b", "mistral"),
     (r"\bcommand-r\+", "command-r-plus"),
     (r"\bcommand-r\b", "command-r"),
@@ -1488,7 +1492,7 @@ def extract_tokenizer(
         ]
     tokenizer_config.update(special_tokens)
 
-    if arch != "gemma" and (model_type == "llama" or model_type == "bpe"):
+    if arch not in GEMMA_ARCHES and (model_type == "llama" or model_type == "bpe"):
         tokenizer_config.update(
             {
                 "model_type": "bpe",

@@ -406,6 +406,14 @@ def test_gemma_rebuilds_score_ranked_bpe_without_unicode_normalization(tmp_path,
     assert tokenizer.encode("").ids == [2]
 
 
+@pytest.mark.parametrize("arch", ["gemma2", "gemma3"])
+def test_gemma2_and_gemma3_keep_gemma_tokenizer_class(tmp_path, arch):
+    core.extract_tokenizer(_gemma_reader(), tmp_path, arch=arch)
+
+    config = json.loads((tmp_path / "tokenizer_config.json").read_text())
+    assert config["tokenizer_class"] == "PreTrainedTokenizerFast"
+
+
 @pytest.mark.parametrize("add_bos,add_eos", [(False, False), (True, False), (False, True), (True, True)])
 def test_gemma_rebuilt_tokenizer_honors_special_token_flags(tmp_path, add_bos, add_eos):
     core.extract_tokenizer(_gemma_reader(add_bos=add_bos, add_eos=add_eos), tmp_path, arch="gemma")
