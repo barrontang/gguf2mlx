@@ -501,6 +501,21 @@ print('loaded')
 
 ---
 
+## Publishing a release
+
+Keep the versions in `pyproject.toml` and `src/gguf2mlx/__init__.py` identical.
+Merge the release changes, then run **Actions → Publish to PyPI → Run workflow**
+on `main` with target `pypi`. Alternatively, push a matching `vX.Y.Z` tag.
+The workflow checks the versions, builds and validates the distributions, publishes
+to PyPI, and creates a GitHub Release (and its tag if missing) at the built commit.
+The `testpypi` target does not create a GitHub Release.
+
+The old `v2.1.2` and `v2.1.3` tags contain package metadata for `2.1.1`; do not
+rerun them or move them. Version `2.1.4` is the fresh release prepared to recover
+from those failed uploads. PyPI cannot overwrite an existing distribution.
+If publishing succeeds but GitHub Release creation fails, rerun the failed jobs.
+Repeated PyPI runs skip distributions already uploaded.
+
 ## Supported conversion matrix
 
 `gguf2mlx` distinguishes between:
