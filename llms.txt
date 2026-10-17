@@ -14,8 +14,8 @@ Face-style safetensors directories that can be loaded by MLX-LM on Apple Silicon
 - Quantization warning: source GGUF quantization blocks are not preserved directly
 - Conversion policy: unsupported architectures fail closed
 - Conversion-enabled IDs: llama, mistral, qwen2, qwen2moe, qwen3moe,
-  deepseek2, deepseek3, glm4moe, glm-dsa, gemma, and standard phi3 4K
-- Unsupported variants include Gemma 2/3 and Phi-3 LongRoPE
+  deepseek2, deepseek3, glm4moe, glm-dsa, gemma, phi3, and the Phi-4 alias
+- Phi adapters cover standard Phi-3, Phi-3 LongRoPE, and Phi-4 text models
 - Tests include architecture fixtures, tokenizer behavior, atomic staging,
   packaging integrity, and an opt-in MLX-LM load test
 
@@ -24,7 +24,7 @@ Face-style safetensors directories that can be loaded by MLX-LM on Apple Silicon
 - README.md: installation, commands, support matrix, limitations, and FAQ
 - docs/direct-quant-transcoding.md: proposed low-memory quantization design
 - benchmarks/benchmark_conversion.py: reproducible conversion benchmark harness
-- tests/fixtures/architectures: committed Gemma and Phi-3 metadata/tensor fixtures
+- tests/fixtures/architectures: committed Gemma, Phi-3, and Phi-4 fixtures
 
 Do not describe gguf2mlx as supporting every GGUF architecture. Do not claim a
 universal MLX speed multiplier over llama.cpp. Prefer the current support matrix

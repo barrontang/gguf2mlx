@@ -20,8 +20,10 @@ class _FakeField:
 
 
 class _FakeTensor:
-    def __init__(self, name: str):
+    def __init__(self, name: str, data=()):
         self.name = name
+        self.data = np.asarray(data, dtype=np.float32)
+        self.shape = tuple(reversed(self.data.shape))
 
 
 class _FakeReader:
@@ -38,7 +40,7 @@ def _load_fixture(name: str) -> dict:
     return json.loads((FIXTURE_DIR / f"{name}.json").read_text(encoding="utf-8"))
 
 
-@pytest.mark.parametrize("fixture_name", ["gemma", "phi3"])
+@pytest.mark.parametrize("fixture_name", ["gemma", "phi3", "phi4"])
 def test_architecture_fixture_config_and_tensor_map(fixture_name: str):
     fixture = _load_fixture(fixture_name)
     arch = fixture["architecture"]
@@ -60,7 +62,8 @@ def test_gemma_fixture_restores_shifted_norm_weights():
     np.testing.assert_array_equal(restored, np.array([0.25, -0.5], dtype=np.float16))
 
 
-def test_phi3_fixture_fuses_split_qkv_weights():
+@pytest.mark.parametrize("arch", ["phi3", "phi4"])
+def test_phi_fixture_fuses_split_qkv_weights(arch):
     pending_qkv = {}
     mla_dims = {"num_heads": 4, "qk_nope_head_dim": 4, "v_head_dim": 4}
     pending_kv_b = {}
@@ -68,7 +71,7 @@ def test_phi3_fixture_fuses_split_qkv_weights():
     assert core._plan_tensor_emit(
         "blk.0.attn_q.weight",
         np.full((4, 2), 1, dtype=np.float16),
-        "phi3",
+        arch,
         mla_dims,
         pending_kv_b,
         pending_qkv,
@@ -76,7 +79,7 @@ def test_phi3_fixture_fuses_split_qkv_weights():
     assert core._plan_tensor_emit(
         "blk.0.attn_k.weight",
         np.full((2, 2), 2, dtype=np.float16),
-        "phi3",
+        arch,
         mla_dims,
         pending_kv_b,
         pending_qkv,
@@ -84,7 +87,7 @@ def test_phi3_fixture_fuses_split_qkv_weights():
     emitted = core._plan_tensor_emit(
         "blk.0.attn_v.weight",
         np.full((2, 2), 3, dtype=np.float16),
-        "phi3",
+        arch,
         mla_dims,
         pending_kv_b,
         pending_qkv,
@@ -109,13 +112,53 @@ def test_new_adapters_reject_unknown_tensor_names():
         core._map_tensor_name("blk.0.unknown.weight", "phi3")
 
 
-def test_phi3_longrope_variant_fails_closed():
-    reader = _FakeReader({}, tensor_names=["rope_factors_long", "rope_factors_short"])
+def test_phi4_adapter_uses_phi3_metadata_and_tensor_layout():
+    fixture = _load_fixture("phi4")
+    reader = _FakeReader(fixture["metadata"])
+
+    assert core.detect_architecture(reader) == "phi4"
+    assert "phi4" in core.CONVERTIBLE_ARCHES
+    assert "phi4" in core.STRICT_ADAPTER_ARCHES
+
+
+def test_phi3_longrope_factors_are_written_to_config_not_weights():
+    fixture = _load_fixture("phi3")
+    reader = _FakeReader(fixture["metadata"])
+    reader.tensors = [
+        _FakeTensor("rope_factors_long.weight", [1.25, 2.5]),
+        _FakeTensor("rope_factors_short.weight", [1.0, 1.5]),
+    ]
+    config = core.build_config(reader, "phi3")
+
+    assert config["rope_scaling"] == {
+        "type": "longrope",
+        "long_factor": [1.25, 2.5],
+        "short_factor": [1.0, 1.5],
+    }
+    assert list(core._iter_weight_arrays(reader, "phi3", "float16")) == []
+    assert core.validate_architecture_variant(reader, "phi3") is None
+
+
+def test_phi3_longrope_requires_matching_factor_tensors():
+    reader = _FakeReader({})
+    reader.tensors = [_FakeTensor("rope_factors_long.weight", [1.0, 1.0])]
 
     error = core.validate_architecture_variant(reader, "phi3")
 
     assert error is not None
-    assert "LongRoPE" in error
+    assert "requires both" in error
+
+
+def test_phi3_longrope_rejects_invalid_factor_dimensions():
+    fixture = _load_fixture("phi3")
+    reader = _FakeReader(fixture["metadata"])
+    reader.tensors = [
+        _FakeTensor("rope_factors_long.weight", [1.0]),
+        _FakeTensor("rope_factors_short.weight", [1.0, 1.0]),
+    ]
+
+    with pytest.raises(ValueError, match="factor lengths"):
+        core.build_config(reader, "phi3")
 
 
 def test_python_name_detection_prefers_specific_gemma_variants(monkeypatch):
@@ -130,6 +173,7 @@ def test_python_name_detection_prefers_specific_gemma_variants(monkeypatch):
     assert core.detect_architecture(_FakeReader({"general.name": "Qwen3.6-9B"})) == "qwen36"
     assert core.detect_architecture(_FakeReader({"general.name": "Qwen3.8-9B"})) == "qwen38"
     assert core.detect_architecture(_FakeReader({"general.name": "phi2"})) == "phi2"
+    assert core.detect_architecture(_FakeReader({"general.name": "Phi-4-mini-instruct"})) == "phi4"
 
 
 @pytest.mark.parametrize(
