@@ -146,7 +146,8 @@ GGUF is great for distribution, but MLX and MLX-LM expect a Hugging Face-style
 directory with `config.json`, tokenizer assets, and safetensors weights.
 
 Alongside text conditioning, `gguf2mlx` converts supported GGUF language models
-to MLX-LM directories and supports separate LLaVA/Qwen2-VL full-VLM adapters.
+to MLX-LM directories and supports separate LLaVA, Qwen2-VL, and MiniCPM-V 4.7
+full-VLM adapters.
 It bridges that gap for **supported architectures** by:
 
 - reading GGUF metadata and tensors
@@ -254,7 +255,7 @@ the staging directory instead of publishing a partial model.
 
 ### VLM conversion: architecture-specific direct or hybrid paths
 
-VLM conversion is separate from MLX-LM conversion. Two explicit adapters produce
+VLM conversion is separate from MLX-LM conversion. Three explicit adapters produce
 HF-style directories for `mlx-vlm`:
 
 - **LLaVA-1.5** (`model_type: llava`): Llama + CLIP (QuickGELU,
@@ -263,14 +264,20 @@ HF-style directories for `mlx-vlm`:
   model with M-RoPE, ViT and 2x2 patch merger. Reassembles split Q/K/V in order
   and the two temporal Conv2D kernels into Conv3D; merger normalization and MLP
   always come from GGUF, even in hybrid mode.
+- **MiniCPM-V 4.7 1B** (`model_type: minicpmv4_7`): dense Qwen3.5 text GGUF plus
+  a separate CLIP projector GGUF tagged `minicpmv4_7`; matching HF config,
+  tokenizer, and processor assets are required. Direct quantization is not
+  supported.
 
 Full Qwen2.5-VL, Qwen3-VL/3.5, LLaVA-NeXT/1.6, SigLIP, Pixtral and other layouts remain
 **unsupported** by the full-VLM adapters. Qwen3-VL **text-only** extraction is
 supported separately above. Other full layouts need separate
 architecture contracts, not aliases to these adapters.
-Both adapters have offline, real `mlx-vlm` loader/processor/generation tests on
-Apple Silicon using tiny random checkpoints. **Large pretrained-model visual
-quality and cross-runtime perplexity parity are not broadly certified.**
+LLaVA and Qwen2-VL have offline, real `mlx-vlm` loader/processor/generation tests
+on Apple Silicon using tiny random checkpoints. MiniCPM-V 4.7 has portable
+conversion fixtures, but native image inference is unverified. **Large
+pretrained-model visual quality and cross-runtime perplexity parity are not
+broadly certified.**
 For the pinned **Qwen2-VL-2B-Instruct Q4_K_M + F16 mmproj** pair, real-checkpoint
 acceptance is now complete: HF / GGUF-to-FP16 / llama.cpp score **12/12** on a
 fixed image diagnostic; uniform language-only MLX 4-bit has **11/12 exact
@@ -488,6 +495,7 @@ print('loaded')
 | StableLM conversion adapter | Supported |
 | LLaVA Llama + CLIP direct/hybrid VLM adapter | Native tiny-checkpoint image-path parity tested |
 | Qwen2-VL direct/hybrid VLM adapter | Tiny parity; named 2B direct checkpoint passes real-image acceptance |
+| MiniCPM-V 4.7 1B VLM adapter | Portable conversion fixtures; native image inference unverified |
 | Language-only 4-bit VLM conversion | Packed weights + native decoded-reference parity tested |
 | Qwen3-VL / Qwen2-VL text conditioning | Portable conversion fixtures; BF16/mRoPE preserved; native conditioning parity unverified |
 
@@ -780,9 +788,9 @@ python -m gguf2mlx.chat_validation ./converted-model --expect-marker '<|im_start
 ruff check src/ tests/ benchmarks/
 ```
 
-### Hybrid Rust migration (in progress)
+### Optional Rust extension
 
-The repository now includes an initial Rust core scaffold at:
+The repository includes a Rust crate at:
 
 - `rust/gguf2mlx-rs`
 
@@ -796,8 +804,10 @@ maturin develop --manifest-path rust/gguf2mlx-rs/Cargo.toml
 Current integration behavior:
 
 - Python CLI/UX remains the primary entrypoint.
-- Python can use an optional `gguf2mlx_rust` extension for architecture detection.
-- If the Rust extension is unavailable, the existing Python logic is used unchanged.
+- The optional `gguf2mlx_rust` extension currently provides architecture detection
+  and dense/MoE/hybrid classification; conversion and CLI workflows remain in Python.
+- If the Rust extension is unavailable or errors, Python falls back to its existing
+  detection and classification logic.
 
 Recent regression coverage includes:
 
@@ -816,6 +826,8 @@ Recent regression coverage includes:
 - chat-template rendering for single-turn, multi-turn, system, tool, and reasoning shapes
 - VLM split-file conversion, ordered QKV and temporal-kernel reconstruction,
   hybrid vision-only replacement, M-RoPE and processor mismatch rejection
+- MiniCPM-V 4.7 dense Qwen3.5 text, separate SigLIP projector, merger mappings,
+  and processor/tokenizer validation
 - native VLM image features and logits against original HF-layout weights
   (or an independently decoded quantized reference), image-change sensitivity,
   finite outputs and `mlx_vlm.generate`; F32/Q4_0 inputs and FP16/FP32/4-bit outputs
@@ -864,7 +876,8 @@ Remaining areas for contributors:
 - canonical chat-template fallback table for known model families when GGUF-embedded Jinja templates are missing or broken
 - publish peak RSS and output-size comparison results from `benchmarks/benchmark_conversion.py --compare`
 - evaluate GGUF→MLX conversion for high-demand non-text models (e.g. ASR/embedding) where competition is thin (pending verification that such models ship GGUF)
-- add Gemma 2/3 and Phi LongRoPE adapters without broad family fallbacks
+- add a fixture-backed Phi-3 LongRoPE adapter only when its factor tensors can be
+  represented safely in the generated MLX configuration
 - publish additional architecture-specific tokenizer normalizer fixtures as upstream formats evolve
 - add LLaVA-NeXT any-resolution/image-newline handling and distinct Qwen2.5/3.x
   vision adapters, including Qwen3.5's different language backbone, before
