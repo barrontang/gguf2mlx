@@ -42,16 +42,29 @@ class StreamingShardWriter:
     def close(self) -> None:
         self._temp.cleanup()
 
-    def add(self, name: str, array: np.ndarray) -> None:
+    def add(self, name: str, array: np.ndarray, *, dtype: str | None = None) -> None:
         if name == "__metadata__" or name in self.weight_map:
             raise ValueError(f"Duplicate or reserved output tensor name: {name}")
+        if dtype is not None:
+            if dtype != "bfloat16":
+                raise ValueError(f"Unsupported output dtype override: {dtype}")
+            from gguf import GGMLQuantizationType
+            from gguf.quants import quantize
+
+            shape = array.shape
+            array = quantize(
+                np.ascontiguousarray(array, dtype=np.float32), GGMLQuantizationType.BF16,
+            ).view(np.uint16).reshape(shape)
+            dtype_name = "BF16"
+        else:
+            dtype_name = None
         dtype = array.dtype
         if dtype.kind not in "fiub" or dtype.itemsize not in (1, 2, 4, 8):
             raise ValueError(f"Unsupported safetensors dtype: {dtype}")
-        dtype_name = "BOOL" if dtype.kind == "b" else (
+        dtype_name = dtype_name or ("BOOL" if dtype.kind == "b" else (
             f"{'F' if dtype.kind == 'f' else 'I' if dtype.kind == 'i' else 'U'}"
             f"{dtype.itemsize * 8}"
-        )
+        ))
         if self._header and self.size + array.nbytes > self.max_shard_bytes:
             self.flush()
         # tofile handles strided layouts without building a shard-sized bytes copy.
