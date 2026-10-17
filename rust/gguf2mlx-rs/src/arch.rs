@@ -1,7 +1,7 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 
-const MODEL_NAME_ARCH_FALLBACKS: [(&str, &str); 10] = [
+const MODEL_NAME_ARCH_FALLBACKS: [(&str, &str); 13] = [
     (r"\bdeepseek-r1-distill-qwen\b", "qwen2"),
     (r"\bdeepseek-r1-distill-llama\b", "llama"),
     (r"\bdeepseek-v3\b", "deepseek3"),
@@ -12,6 +12,9 @@ const MODEL_NAME_ARCH_FALLBACKS: [(&str, &str); 10] = [
     (r"\bcommand-r\b", "command-r"),
     (r"^\s*yi\b", "llama"),
     (r"\bglm-dsa\b", "glm-dsa"),
+    (r"\bqwen\s*3[._ -]?5\b", "qwen35"),
+    (r"\bqwen\s*3[._ -]?6\b", "qwen36"),
+    (r"\bqwen\s*3[._ -]?8\b", "qwen38"),
 ];
 
 static MODEL_NAME_ARCH_FALLBACKS_REGEX: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
@@ -26,7 +29,7 @@ static MODEL_NAME_ARCH_FALLBACKS_REGEX: Lazy<Vec<(Regex, &'static str)>> = Lazy:
         .collect()
 });
 
-const ARCH_SUBSTRINGS: [&str; 40] = [
+const ARCH_SUBSTRINGS: [&str; 45] = [
     "llama",
     "mistral",
     "falcon",
@@ -41,11 +44,16 @@ const ARCH_SUBSTRINGS: [&str; 40] = [
     "command-r",
     "qwen2moe",
     "qwen3moe",
+    "qwen35",
+    "qwen36",
+    "qwen38",
     "qwen2",
+    "qwen3",
     "phi3",
     "phi2",
     "phi",
     "gemma3",
+    "gemma4",
     "gemma2",
     "gemma",
     "stablelm",
@@ -138,6 +146,9 @@ mod tests {
         assert_eq!(detect_architecture(None, Some("phi2")), "phi2");
         assert_eq!(detect_architecture(None, Some("gemma2-9b")), "gemma2");
         assert_eq!(detect_architecture(None, Some("gemma3-27b")), "gemma3");
+        assert_eq!(detect_architecture(None, Some("Gemma4-E4B")), "gemma4");
+        assert_eq!(detect_architecture(None, Some("Qwen3.5-9B")), "qwen35");
+        assert_eq!(detect_architecture(None, Some("Qwen 3.6-9B")), "qwen36");
         assert_eq!(detect_architecture(None, Some("minicpm3-4b")), "minicpm3");
         assert_eq!(detect_architecture(None, Some("olmo2-13b")), "olmo2");
         assert_eq!(

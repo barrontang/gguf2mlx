@@ -183,6 +183,15 @@ ARCH_MAP: dict[str, str] = {
     "command-r": "cohere",
     "command-r-plus": "cohere",
     "qwen2": "qwen2",
+    "qwen3": "qwen3",
+    **{
+        arch: "qwen3_5"
+        for arch in (
+            "qwen35", "qwen3_5", "qwen3.5",
+            "qwen36", "qwen3_6", "qwen3.6",
+            "qwen38", "qwen3_8", "qwen3.8",
+        )
+    },
     **{arch: "qwen3_vl_text" if "3" in arch else "qwen2_vl_text"
        for arch in QWEN_VL_TEXT_ARCHES},
     "qwen2moe": "qwen2_moe",
@@ -193,6 +202,7 @@ ARCH_MAP: dict[str, str] = {
     "gemma": "gemma",
     "gemma2": "gemma2",
     "gemma3": "gemma3",
+    "gemma4": "gemma4_text",
     "stablelm": "stablelm",
     "deepseek2": "deepseek_v2",
     "deepseek3": "deepseek_v3",
@@ -231,18 +241,40 @@ CONVERTIBLE_ARCHES = {
     "glm-dsa",
     "glm4moe",
     "gemma",
+    "gemma2",
+    "gemma3",
+    "gemma4",
     "llama",
     "mistral",
     "phi3",
     "qwen2",
+    "qwen3",
+    "qwen35",
+    "qwen3_5",
+    "qwen3.5",
+    "qwen36",
+    "qwen3_6",
+    "qwen3.6",
+    "qwen38",
+    "qwen3_8",
+    "qwen3.8",
     "qwen2moe",
     "qwen3moe",
     "stablelm",
     *QWEN_VL_TEXT_ARCHES,
 }
 
-STRICT_ADAPTER_ARCHES = {"gemma", "phi3"}
+STRICT_ADAPTER_ARCHES = {
+    "gemma", "gemma2", "gemma3", "gemma4", "phi3", "qwen3",
+    "qwen35", "qwen3_5", "qwen3.5", "qwen36", "qwen3_6", "qwen3.6",
+    "qwen38", "qwen3_8", "qwen3.8",
+}
 
+QWEN35_ARCHES = {
+    "qwen35", "qwen3_5", "qwen3.5", "qwen36", "qwen3_6", "qwen3.6",
+    "qwen38", "qwen3_8", "qwen3.8",
+}
+GEMMA_ARCHES = {"gemma", "gemma2", "gemma3", "gemma4"}
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
 MOE_ARCHES = {"qwen2moe", "qwen3moe", "deepseek2", "deepseek3", "glm4moe", "glm-dsa"}
 DIRECT_QUANT_SUPPORTED_ARCHES = {
@@ -301,6 +333,9 @@ MODEL_NAME_ARCH_FALLBACKS: list[tuple[str, str]] = [
     (r"\bdeepseek-v3\b", "deepseek3"),
     (r"\bdeepseek-r1\b", "deepseek3"),
     (r"\bdeepseek-v2\b", "deepseek2"),
+    (r"\bqwen\s*3[._ -]?5\b", "qwen35"),
+    (r"\bqwen\s*3[._ -]?6\b", "qwen36"),
+    (r"\bqwen\s*3[._ -]?8\b", "qwen38"),
     (r"\bmixtral\b", "mistral"),
     (r"\bcommand-r\+", "command-r-plus"),
     (r"\bcommand-r\b", "command-r"),
@@ -391,6 +426,14 @@ def validate_moe_layout(reader: GGUFReader, arch: str, architecture_kind: str) -
 
 def validate_architecture_variant(reader: GGUFReader, arch: str) -> str | None:
     """Return an actionable error when a recognized architecture variant is unverified."""
+    if (arch == "qwen3" or arch in QWEN35_ARCHES) and any(
+        any(pattern in tensor.name for pattern in _EXPERT_PATTERNS)
+        for tensor in reader.tensors
+    ):
+        return (
+            f"The {arch} adapter supports dense layouts only; MoE expert tensors "
+            "are not supported."
+        )
     if arch == "phi3" and any(
         tensor.name in {"rope_factors_long", "rope_factors_short"}
         for tensor in reader.tensors
@@ -493,6 +536,21 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
     """Build MLX-compatible config.json from GGUF metadata."""
     if arch in QWEN_VL_TEXT_ARCHES:
         return Qwen3VLTextEncoderConverter.build_config(reader, arch, dtype)
+    if arch in QWEN35_ARCHES and arch != "qwen35":
+        original_reader = reader
+
+        class Qwen35Metadata:
+            tensors = original_reader.tensors
+
+            def get_field(self, key):
+                field = original_reader.get_field(key)
+                if field is None and key.startswith(f"{arch}."):
+                    field = original_reader.get_field(
+                        "qwen35." + key[len(arch) + 1:]
+                    )
+                return field
+
+        reader = Qwen35Metadata()
 
     def _warn(key: str, value: Any) -> None:
         warnings.warn(f"  ⚠ '{key}' not found in GGUF metadata, using default: {value}")
@@ -598,9 +656,7 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
 
     # Detect attention bias. Gemma projections are bias-free; Phi-3 uses a fused,
     # bias-free QKV projection in MLX-LM.
-    attention_bias = arch in (
-        "qwen2", "qwen2moe", "qwen3moe",
-    )
+    attention_bias = arch in ("qwen2", "qwen2moe")
 
     # Convert model_type to CamelCase architecture class name
     arch_class = "".join(part.capitalize() for part in hf_model_type.split("_")) + "ForCausalLM"
@@ -696,14 +752,183 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
                         raise ValueError(f"Qwen2MoE {metadata_key} disagrees with tensor shapes")
                     config[config_key] = inferred
 
-    if arch == "gemma":
+    if arch in {"gemma", "gemma2", "gemma3"}:
         config["head_dim"] = (
-            get_metadata_int(reader, "gemma.attention.key_length")
+            get_metadata_int(reader, f"{arch}.attention.key_length")
             or hidden_size // num_heads
         )
         config["hidden_activation"] = "gelu_pytorch_tanh"
         config["attention_bias"] = False
         config["tie_word_embeddings"] = True
+
+    if arch == "gemma2":
+        for metadata_key, config_key in (
+            ("attn_logit_softcapping", "attn_logit_softcapping"),
+            ("final_logit_softcapping", "final_logit_softcapping"),
+            ("attention.sliding_window", "sliding_window"),
+        ):
+            value = (
+                get_metadata_int(reader, f"{arch}.{metadata_key}")
+                if metadata_key == "attention.sliding_window"
+                else get_metadata_float(reader, f"{arch}.{metadata_key}")
+            )
+            if value is not None:
+                config[config_key] = value
+        config["query_pre_attn_scalar"] = get_metadata_int(
+            reader, f"{arch}.attention.query_pre_attn_scalar"
+        ) or config["head_dim"]
+
+    if arch == "gemma3":
+        for metadata_key, config_key in (
+            ("attention.sliding_window", "sliding_window"),
+            ("attention.sliding_window_pattern", "sliding_window_pattern"),
+        ):
+            value = get_metadata_int(reader, f"{arch}.{metadata_key}")
+            if value is not None:
+                config[config_key] = value
+        final_softcap = get_metadata_float(reader, f"{arch}.final_logit_softcapping")
+        if final_softcap is not None:
+            config["final_logit_softcapping"] = final_softcap
+        config["query_pre_attn_scalar"] = get_metadata_int(
+            reader, f"{arch}.attention.query_pre_attn_scalar"
+        ) or config["head_dim"]
+        rope_theta = get_metadata_float(reader, f"{arch}.rope.freq_base")
+        if rope_theta is not None:
+            config["rope_theta"] = rope_theta
+
+    if arch == "gemma4":
+        gemma4_sliding_dim = get_metadata_int(
+            reader, f"{arch}.attention.key_length_swa"
+        )
+        gemma4_global_dim = get_metadata_int(
+            reader, f"{arch}.attention.key_length"
+        )
+        layer_pattern = get_metadata_array_int(
+            reader, f"{arch}.attention.sliding_window_pattern"
+        )
+        sliding_window_pattern = (
+            next((index + 1 for index, is_sliding in enumerate(layer_pattern)
+                  if not is_sliding), len(layer_pattern))
+            if layer_pattern else get_metadata_int(
+                reader, f"{arch}.attention.sliding_window_pattern"
+            ) or 5
+        )
+        config.update({
+            "model_type": "gemma4_text",
+            "architectures": ["Gemma4TextModel"],
+            "head_dim": gemma4_sliding_dim or hidden_size // num_heads,
+            "global_head_dim": gemma4_global_dim or hidden_size // num_heads,
+            "hidden_size_per_layer_input": get_metadata_int(
+                reader, f"{arch}.embedding_length_per_layer_input"
+            ) or 0,
+            "vocab_size_per_layer_input": vocab_size,
+            "num_kv_shared_layers": get_metadata_int(
+                reader, f"{arch}.attention.shared_kv_layers"
+            ) or 0,
+            "sliding_window": get_metadata_int(
+                reader, f"{arch}.attention.sliding_window"
+            ) or 512,
+            "sliding_window_pattern": sliding_window_pattern,
+            "use_double_wide_mlp": True,
+            "tie_word_embeddings": True,
+        })
+        global_rope_theta = get_metadata_float(reader, f"{arch}.rope.freq_base")
+        sliding_rope_theta = get_metadata_float(reader, f"{arch}.rope.freq_base_swa")
+        config["rope_parameters"] = {
+            "full_attention": {
+                "rope_type": "proportional",
+                "rope_theta": global_rope_theta or 1_000_000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            "sliding_attention": {
+                "rope_type": "default",
+                "rope_theta": sliding_rope_theta or 10_000.0,
+                "partial_rotary_factor": 1.0,
+            },
+        }
+        if layer_pattern:
+            if len(layer_pattern) != num_layers:
+                raise ValueError(
+                    "Gemma4 sliding-window pattern length does not match block_count"
+                )
+            config["layer_types"] = [
+                "sliding_attention" if is_sliding else "full_attention"
+                for is_sliding in layer_pattern
+            ]
+        elif any(t.name.startswith("blk.") and ".attn_qkv." in t.name for t in reader.tensors):
+            raise ValueError("Gemma4 linear-attention layer layout is unsupported")
+        for suffix, config_key in (
+            ("attention.head_count_kv", "num_key_value_heads"),
+        ):
+            value = get_metadata_int(reader, f"{arch}.{suffix}")
+            if value is not None:
+                config[config_key] = value
+        final_softcap = get_metadata_float(reader, f"{arch}.final_logit_softcapping")
+        if final_softcap is not None:
+            config["final_logit_softcapping"] = final_softcap
+        num_experts = get_metadata_int(reader, f"{arch}.expert_count")
+        if num_experts:
+            config.update({
+                "enable_moe_block": True,
+                "num_experts": num_experts,
+                "top_k_experts": get_metadata_int(reader, f"{arch}.expert_used_count") or 1,
+                "moe_intermediate_size": (
+                    get_metadata_int(reader, f"{arch}.expert_feed_forward_length")
+                    or config["intermediate_size"]
+                ),
+            })
+
+    if arch == "qwen3":
+        config["head_dim"] = (
+            get_metadata_int(reader, f"{arch}.attention.key_length")
+            or hidden_size // num_heads
+        )
+        config["attention_bias"] = False
+        config["tie_word_embeddings"] = False
+
+    if arch in QWEN35_ARCHES:
+        config["model_type"] = "qwen3_5"
+        config["architectures"] = ["Qwen3_5ForCausalLM"]
+        config["attention_bias"] = False
+        config["tie_word_embeddings"] = False
+        config["head_dim"] = (
+            get_metadata_int(reader, f"{arch}.attention.key_length")
+            or hidden_size // num_heads
+        )
+        for suffix, config_key in (
+            ("ssm.group_count", "linear_num_key_heads"),
+            ("ssm.time_step_rank", "linear_num_value_heads"),
+            ("ssm.state_size", "linear_key_head_dim"),
+            ("ssm.conv_kernel", "linear_conv_kernel_dim"),
+            ("full_attention_interval", "full_attention_interval"),
+        ):
+            value = get_metadata_int(reader, f"{arch}.{suffix}")
+            if value is not None:
+                config[config_key] = value
+        inner_size = get_metadata_int(reader, f"{arch}.ssm.inner_size")
+        value_heads = config.get("linear_num_value_heads")
+        if inner_size is not None and value_heads:
+            if inner_size % value_heads:
+                raise ValueError("Qwen3.5 SSM inner size is not divisible by value-head count")
+            config["linear_value_head_dim"] = inner_size // value_heads
+        mrope = get_metadata_array_int(reader, f"{arch}.rope.dimension_sections")
+        if len(mrope) == 4 and mrope[-1] == 0:
+            mrope.pop()
+        if mrope:
+            if len(mrope) != 3 or any(section <= 0 for section in mrope):
+                raise ValueError("Qwen3.5 requires three positive RoPE dimension sections")
+            config["rope_parameters"] = {
+                "type": "default",
+                "mrope_section": mrope,
+                "rope_theta": rope_theta,
+                "partial_rotary_factor": 0.25,
+            }
+        config["linear_num_key_heads"] = config.get("linear_num_key_heads", 16)
+        config["linear_num_value_heads"] = config.get("linear_num_value_heads", 64)
+        config["linear_key_head_dim"] = config.get("linear_key_head_dim", 128)
+        config["linear_value_head_dim"] = config.get("linear_value_head_dim", 128)
+        config["linear_conv_kernel_dim"] = config.get("linear_conv_kernel_dim", 4)
+        config["full_attention_interval"] = config.get("full_attention_interval", 4)
 
     if arch == "phi3":
         head_dim = hidden_size // num_heads
@@ -888,11 +1113,18 @@ def _map_phi3_tensor_name(gguf_name: str) -> str:
 
 def _restore_architecture_tensor(gguf_name: str, arr: np.ndarray, arch: str) -> np.ndarray:
     """Undo architecture-specific transformations applied during HF-to-GGUF export."""
-    if arch == "gemma" and (
+    if arch in {"gemma", "gemma2", "gemma3"} and (
         gguf_name == "output_norm.weight"
         or re.fullmatch(r"blk\.\d+\.(attn_norm|ffn_norm)\.weight", gguf_name)
     ):
         return arr - np.array(1, dtype=arr.dtype)
+    if arch in QWEN35_ARCHES:
+        if gguf_name == "ssm_a":
+            if np.any(~np.isfinite(arr)) or np.any(arr >= 0):
+                raise ValueError("Qwen3.5 ssm_a must contain finite negative values")
+            return np.log(-arr).astype(arr.dtype)
+        if re.fullmatch(r"blk\.\d+\.ssm_norm\.weight", gguf_name):
+            return arr - np.array(1, dtype=arr.dtype)
     return arr
 
 
@@ -993,7 +1225,60 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
         mapped = _map_mla_tensor_name(gguf_name)
         if mapped is not None:
             return mapped
-    if arch == "phi3":
+    if arch in QWEN35_ARCHES and (match := re.fullmatch(
+        r"blk\.(\d+)\.(attn_qkv|attn_gate|ssm_conv1d|ssm_dt|ssm_a|"
+        r"ssm_beta|ssm_alpha|ssm_norm|ssm_out)(?:\.weight|\.bias)?", gguf_name
+    )):
+        layer, source = match.groups()
+        suffix = {
+            "attn_qkv": "linear_attn.in_proj_qkv.weight",
+            "attn_gate": "linear_attn.in_proj_z.weight",
+            "ssm_conv1d": "linear_attn.conv1d.weight",
+            "ssm_dt": "linear_attn.dt_bias",
+            "ssm_a": "linear_attn.A_log",
+            "ssm_beta": "linear_attn.in_proj_b.weight",
+            "ssm_alpha": "linear_attn.in_proj_a.weight",
+            "ssm_norm": "linear_attn.norm.weight",
+            "ssm_out": "linear_attn.out_proj.weight",
+        }[source]
+        mapped = f"model.layers.{layer}.{suffix}"
+    elif arch == "gemma4" and (match := re.fullmatch(
+        r"blk\.(\d+)\.(attn_post_norm|ffn_post_norm|ffn_pre_norm|"
+        r"ffn_pre_norm_2|ffn_post_norm_1|ffn_post_norm_2|"
+        r"ffn_gate_inp|ffn_gate_inp_s|ffn_gate_exps|ffn_up_exps|"
+        r"ffn_down_exps|layer_output_scale|per_layer_inp_gate|"
+        r"per_layer_proj|per_layer_post_norm)(?:\.weight|\.scale)?", gguf_name
+    )):
+        layer, source = match.groups()
+        suffix = {
+            "attn_post_norm": "post_attention_layernorm.weight",
+            "ffn_pre_norm": "pre_feedforward_layernorm.weight",
+            "ffn_pre_norm_2": "pre_feedforward_layernorm_2.weight",
+            "ffn_post_norm_1": "post_feedforward_layernorm_1.weight",
+            "ffn_post_norm_2": "post_feedforward_layernorm_2.weight",
+            "ffn_post_norm": "post_feedforward_layernorm.weight",
+            "ffn_gate_inp": "router.proj.weight",
+            "ffn_gate_inp_s": "router.scale",
+            "ffn_gate_exps": "experts.switch_glu.gate_proj.weight",
+            "ffn_up_exps": "experts.switch_glu.up_proj.weight",
+            "ffn_down_exps": "experts.switch_glu.down_proj.weight",
+            "layer_output_scale": "layer_scalar",
+            "per_layer_inp_gate": "per_layer_input_gate.weight",
+            "per_layer_proj": "per_layer_projection.weight",
+            "per_layer_post_norm": "post_per_layer_input_norm.weight",
+        }[source]
+        mapped = f"model.layers.{layer}.{suffix}"
+    elif arch == "gemma4" and gguf_name in {
+        "per_layer_token_embd.weight",
+        "per_layer_model_proj.weight",
+        "per_layer_proj_norm.weight",
+    }:
+        mapped = {
+            "per_layer_token_embd.weight": "model.embed_tokens_per_layer.weight",
+            "per_layer_model_proj.weight": "model.per_layer_model_projection.weight",
+            "per_layer_proj_norm.weight": "model.per_layer_projection_norm.weight",
+        }[gguf_name]
+    elif arch == "phi3":
         mapped = _map_phi3_tensor_name(gguf_name)
     elif arch == "qwen2moe" and (
         match := re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down|gate_inp)_shexp\.weight", gguf_name)
@@ -1006,6 +1291,25 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
         mapped = f"model.layers.{layer}.mlp.{suffix}"
     else:
         mapped = _map_llama_tensor_name(gguf_name)
+    if arch == "gemma4" and mapped == gguf_name and gguf_name.startswith("blk."):
+        match = re.fullmatch(r"blk\.(\d+)\.(.+)", gguf_name)
+        if match is not None:
+            layer, rest = match.groups()
+            gemma4_layer_names = {
+                "attn_q.weight": "self_attn.q_proj.weight",
+                "attn_k.weight": "self_attn.k_proj.weight",
+                "attn_v.weight": "self_attn.v_proj.weight",
+                "attn_output.weight": "self_attn.o_proj.weight",
+                "attn_q_norm.weight": "self_attn.q_norm.weight",
+                "attn_k_norm.weight": "self_attn.k_norm.weight",
+                "attn_norm.weight": "input_layernorm.weight",
+                "ffn_norm.weight": "pre_feedforward_layernorm.weight",
+                "ffn_gate.weight": "mlp.gate_proj.weight",
+                "ffn_up.weight": "mlp.up_proj.weight",
+                "ffn_down.weight": "mlp.down_proj.weight",
+            }
+            if rest in gemma4_layer_names:
+                mapped = f"model.layers.{layer}.{gemma4_layer_names[rest]}"
     if arch in STRICT_ADAPTER_ARCHES and mapped == gguf_name:
         raise ValueError(f"Unsupported {arch} tensor: {gguf_name}")
     return mapped
@@ -1188,7 +1492,7 @@ def extract_tokenizer(
         ]
     tokenizer_config.update(special_tokens)
 
-    if arch != "gemma" and (model_type == "llama" or model_type == "bpe"):
+    if arch not in GEMMA_ARCHES and (model_type == "llama" or model_type == "bpe"):
         tokenizer_config.update(
             {
                 "model_type": "bpe",
@@ -1637,7 +1941,20 @@ def _read_mla_dims(reader: GGUFReader, arch: str) -> dict[str, int]:
     n_heads = _g("attention.head_count") or 64
     qk_nope = _g("attention.qk_nope_head_dim") or 192
     v_head = _g("attention.value_length") or _g("attention.v_head_dim") or qk_nope
-    return {"num_heads": n_heads, "qk_nope_head_dim": qk_nope, "v_head_dim": v_head}
+    dims = {"num_heads": n_heads, "qk_nope_head_dim": qk_nope, "v_head_dim": v_head}
+    if arch == "gemma4":
+        dims["num_attention_heads"] = (
+            get_metadata_int(reader, "gemma4.attention.head_count") or 8
+        )
+        dims["num_key_value_heads"] = (
+            get_metadata_int(reader, "gemma4.attention.head_count_kv") or 1
+        )
+        dims["gemma4_head_dim"] = (
+            get_metadata_int(reader, "gemma4.attention.key_length")
+            or get_metadata_int(reader, "gemma4.attention.key_length_swa")
+            or 256
+        )
+    return dims
 
 
 def _reconstruct_kv_b(k_b: np.ndarray, v_b: np.ndarray,
@@ -1680,6 +1997,31 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
     arr = _restore_architecture_tensor(gguf_name, arr, arch)
     if arch == "qwen2moe" and re.fullmatch(r"blk\.\d+\.ffn_gate_inp_shexp\.weight", gguf_name):
         arr = arr.reshape(1, -1)
+
+    # Some Gemma4 exporters fuse full-attention Q/K/V projections. MLX-LM's
+    # Gemma4 attention module keeps these as independent linear layers.
+    match = re.fullmatch(r"blk\.(\d+)\.attn_qkv\.weight", gguf_name)
+    if match and arch == "gemma4":
+        layer_idx = match.group(1)
+        heads = mla_dims["num_attention_heads"]
+        kv_heads = mla_dims["num_key_value_heads"]
+        head_dim = mla_dims["gemma4_head_dim"]
+        q_size = heads * head_dim
+        kv_size = kv_heads * head_dim
+        if arr.shape[0] == q_size + 2 * kv_size:
+            q, k, v = np.split(arr, [q_size, q_size + kv_size], axis=0)
+            return [
+                (f"model.layers.{layer_idx}.self_attn.q_proj.weight", q),
+                (f"model.layers.{layer_idx}.self_attn.k_proj.weight", k),
+                (f"model.layers.{layer_idx}.self_attn.v_proj.weight", v),
+            ]
+        if arr.shape[0] == q_size + kv_size:
+            q, k = np.split(arr, [q_size], axis=0)
+            return [
+                (f"model.layers.{layer_idx}.self_attn.q_proj.weight", q),
+                (f"model.layers.{layer_idx}.self_attn.k_proj.weight", k),
+            ]
+        raise ValueError(f"Invalid Gemma4 fused QKV shape: {gguf_name}: {arr.shape}")
 
     # --- Phi-3 split Q/K/V -> fused qkv_proj ---
     match = re.fullmatch(r"blk\.(\d+)\.attn_(q|k|v)\.weight", gguf_name)
