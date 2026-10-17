@@ -3,6 +3,7 @@
 We do NOT download a model in CI (too slow, too big). The actual end-to-end
 test against a real GGUF lives in `tests/test_e2e.py` and is opt-in via env var.
 """
+import ast
 import json
 import subprocess
 import sys
@@ -47,6 +48,17 @@ def test_package_imports():
     # Verify the previously-missing imports are present at module level
     assert hasattr(core, "gc"), "gc import was missing — see PR description"
     assert hasattr(core, "warnings"), "warnings import was missing — see PR description"
+
+
+def test_package_version_matches_metadata():
+    import gguf2mlx
+
+    root = Path(__file__).resolve().parents[1]
+    project_section = (root / "pyproject.toml").read_text().split("[project]", 1)[1]
+    version_line = next(
+        line for line in project_section.splitlines() if line.startswith("version = ")
+    )
+    assert gguf2mlx.__version__ == ast.literal_eval(version_line.split("=", 1)[1].strip())
 
 
 def test_cli_help():
