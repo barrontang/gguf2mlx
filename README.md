@@ -1,8 +1,8 @@
-# GGUF to MLX Converter for Apple Silicon
+# gguf2mlx — Qwen-VL text conditioning and GGUF conversion for MLX
 
 <div align="center">
 
-**Convert supported GGUF language models, LLaVA and Qwen2-VL into MLX-compatible safetensors on Apple Silicon Macs.**
+**New: convert the Qwen3-VL-8B text-conditioning component into BF16 safetensors, preserving multimodal rotary positions and vision-token IDs.**
 
 [![PyPI](https://img.shields.io/pypi/v/gguf2mlx.svg)](https://pypi.org/project/gguf2mlx/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -10,22 +10,143 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-orange)](https://github.com/barrontang/gguf2mlx)
 [![Validation](https://img.shields.io/badge/conversion-strict-purple)](https://github.com/barrontang/gguf2mlx)
 
-**GGUF → dequantized safetensors → optional 4-bit MLX, with strict architecture validation.**
+**GGUF → HF-style safetensors, with explicit architecture contracts and no silent precision downgrade.**
 
-[Quick start](#quick-start) · [Supported models](#supported-conversion-matrix) · [Benchmarks](#reproducible-benchmarks) · [FAQ](#frequently-asked-questions)
+[Qwen3-VL text conditioning](#qwen3-vl-text-conditioning) · [Quick start](#quick-start) · [Supported models](#supported-conversion-matrix) · [Validation](#text-encoder-validation-and-boundaries)
 
 </div>
 
 ---
 
-## What is gguf2mlx?
+## Qwen3-VL text conditioning
+
+This release adds a dedicated **`Qwen3VLTextEncoderConverter`** for the language
+component of Qwen-VL checkpoints. The development target is the
+**Qwen3-VL-8B conditioning encoder described for Qwen-Image-2.1**. Conversion
+support is not a claim that an entire Qwen-Image pipeline has been implemented
+or that a particular upstream image-generation release has been certified.
+
+The converter builds on the existing Qwen2 tensor mapping, rather than treating
+a multimodal encoder as an ordinary Qwen2 causal language model.
+
+### Convert the text component
+
+```bash
+pip install gguf2mlx
+
+# Explicit text-only extraction; BF16 is the default.
+gguf2mlx convert --type text-encoder \
+  --input /absolute/path/to/Qwen3-VL-8B.gguf \
+  --output /absolute/path/to/qwen3-vl-text-bf16
+
+# Keep decoded weights in FP32 instead.
+gguf2mlx convert --type text-encoder \
+  --input /absolute/path/to/Qwen3-VL-8B.gguf \
+  --output /absolute/path/to/qwen3-vl-text-fp32 --dtype float32
+```
+
+Use a build containing this feature (install a local checkout with
+`python -m pip install -e .` if your published package predates it).
+No HF downloads or companion `mmproj` file are needed for **text-only**
+conversion, but the GGUF must contain the matching tokenizer metadata.
+
+**Select `--type text-encoder` deliberately.** Automatic multimodal detection
+continues to use the existing full-VLM route; it does not silently discard a
+vision tower. The accepted architecture strings are `qwen3vl`, `qwen3_vl`,
+`qwen2vl`, and `qwen2_vl`. Qwen2-tagged exports with Qwen3-VL model identity or
+Q/K normalization tensors receive the Qwen3 text configuration; actual
+Qwen2-VL exports retain their Qwen2 text identity.
+
+### What the conversion preserves
+
+| Component | Result |
+|---|---|
+| Text embeddings and transformer projections | Existing Qwen2-compatible HF key layout |
+| Qwen3 Q/K normalization | `self_attn.q_norm.weight` and `self_attn.k_norm.weight` |
+| Multidimensional RoPE | GGUF `rope.dimension_sections` → `rope_scaling.mrope_section` |
+| Qwen3 interleaved mRoPE | `rope_scaling.mrope_interleaved: true` |
+| Long conditioning sequences | Source context length, head dimensions and RoPE base |
+| Vision markers in the text stream | Image, video, vision-start and vision-end token IDs |
+| Combined text + vision GGUF | Recognized vision/projector tensors skipped with a log message |
+| Floating-point output | Real BF16 safetensors by default; FP32 decoding before BF16 rounding |
+
+The output contains `config.json`, reconstructed or embedded tokenizer assets,
+safetensors shards, and `model.safetensors.index.json`. Its
+`gguf2mlx_component` is `text_encoder`, with `model_type: qwen3_vl_text`
+(or `qwen2_vl_text`), not a fabricated full-VLM configuration.
+
+### Tensor contract
+
+| GGUF key | Output key |
+|---|---|
+| `token_embd.weight` | `model.embed_tokens.weight` |
+| `blk.{N}.attn_q.weight` | `model.layers.{N}.self_attn.q_proj.weight` |
+| `blk.{N}.attn_k.weight` | `model.layers.{N}.self_attn.k_proj.weight` |
+| `blk.{N}.attn_v.weight` | `model.layers.{N}.self_attn.v_proj.weight` |
+| `blk.{N}.attn_output.weight` | `model.layers.{N}.self_attn.o_proj.weight` |
+| `blk.{N}.attn_q_norm.weight` / `attn_k_norm.weight` | `model.layers.{N}.self_attn.q_norm.weight` / `k_norm.weight` |
+| `blk.{N}.ffn_gate.weight` | `model.layers.{N}.mlp.gate_proj.weight` |
+| `blk.{N}.ffn_up.weight` | `model.layers.{N}.mlp.up_proj.weight` |
+| `blk.{N}.ffn_down.weight` | `model.layers.{N}.mlp.down_proj.weight` |
+| `blk.{N}.attn_norm.weight` | `model.layers.{N}.input_layernorm.weight` |
+| `blk.{N}.ffn_norm.weight` | `model.layers.{N}.post_attention_layernorm.weight` |
+| `output_norm.weight` | `model.norm.weight` |
+| `output.weight` | `lm_head.weight` |
+
+Supported Qwen2 attention Q/K/V biases are also mapped. Unknown **language**
+tensors fail conversion instead of being silently omitted.
+
+### Precision is an explicit choice
+
+BF16 output is written as **BF16**, not FP16 or an integer array labelled BF16.
+BF16-range values are decoded through FP32, avoiding FP16 overflow. Conversion
+cannot recover information already lost in a quantized GGUF source.
+
+Plain `--dtype float16` and `--quantize` without `--direct-quant` are rejected
+for text conditioning. Reduced precision requires the explicit direct path:
+
+```bash
+# Optional, lossy affine 4-bit projections; BF16 floating tensors/scales/biases.
+gguf2mlx convert --type text-encoder \
+  --input /absolute/path/to/Qwen3-VL-8B.gguf \
+  --output /absolute/path/to/qwen3-vl-text-4bit \
+  --quantize --direct-quant --q-bits 4 --q-group-size 64 --q-mode affine
+```
+
+This opt-in output needs a consumer supporting the emitted quantization layout.
+Prefer BF16 for conditioning quality; no automatic quantized or FP16 fallback
+occurs if conversion fails.
+
+### Text-encoder validation and boundaries
+
+- Portable tests cover dummy Qwen3-VL-8B topology metadata, architecture aliases,
+  all text tensor mappings, long-context configuration, vision token IDs,
+  mRoPE validation, BF16 payloads/range/rounding, vision skipping, explicit
+  quantization, and cleanup on failure.
+- Required topology, mRoPE sections, and vision token IDs must be present.
+  Three positive rotary sections must sum to half the attention head dimension;
+  a fourth trailing zero in GGUF is accepted and removed. Values are not guessed
+  from a model name.
+- Vision tower and merger weights are intentionally **not emitted**. There is
+  no image processor, vision-feature generation, or complete Qwen3-VL runtime
+  in this text-only artifact.
+- The consuming conditioning pipeline must support Qwen-VL hidden states,
+  multimodal positions, tokenizer semantics, and this standalone key layout.
+  This is **not** a promise of drop-in `mlx_lm.load()` or `mlx_vlm.load()` support.
+- Portable conversion tests do **not** certify real Qwen3-VL-8B inference,
+  Qwen-Image-2.1 image quality, hidden-state parity, or Apple Silicon performance.
+  Those require matching real checkpoints and native runtime validation.
+
+---
+
+## Other gguf2mlx workflows
 
 GGUF is great for distribution, but MLX and MLX-LM expect a Hugging Face-style
 directory with `config.json`, tokenizer assets, and safetensors weights.
 
-`gguf2mlx` is a command-line converter for Mac users who have a model in GGUF
-format but need an MLX-LM model directory. It bridges that gap for **supported
-architectures** by:
+Alongside text conditioning, `gguf2mlx` converts supported GGUF language models
+to MLX-LM directories and supports separate LLaVA/Qwen2-VL full-VLM adapters.
+It bridges that gap for **supported architectures** by:
 
 - reading GGUF metadata and tensors
 - rebuilding MLX-LM-compatible model artifacts
@@ -39,7 +160,7 @@ If the original Hugging Face weights are available, converting those directly
 with MLX-LM is preferable because it avoids inheriting quantization error from an
 already-quantized GGUF file.
 
-> **Important:** `gguf2mlx` writes **HF-style safetensors for MLX-LM** and can
+> **Important:** The language-model route writes **HF-style safetensors for MLX-LM** and can
 > optionally run `mlx_lm.convert` to emit 4-bit MLX output. This is MLX-LM
 > re-quantization after conversion, not bit-for-bit preservation of the original
 > GGUF quantization blocks.
@@ -142,8 +263,9 @@ HF-style directories for `mlx-vlm`:
   and the two temporal Conv2D kernels into Conv3D; merger normalization and MLP
   always come from GGUF, even in hybrid mode.
 
-Qwen2.5-VL, Qwen3/3.5, LLaVA-NeXT/1.6, SigLIP, Pixtral and other layouts remain
-**unsupported**, not converted using guessed prefixes. They need separate
+Full Qwen2.5-VL, Qwen3-VL/3.5, LLaVA-NeXT/1.6, SigLIP, Pixtral and other layouts remain
+**unsupported** by the full-VLM adapters. Qwen3-VL **text-only** extraction is
+supported separately above. Other full layouts need separate
 architecture contracts, not aliases to these adapters.
 Both adapters have offline, real `mlx-vlm` loader/processor/generation tests on
 Apple Silicon using tiny random checkpoints. **Large pretrained-model visual
@@ -357,6 +479,7 @@ print('loaded')
 | LLaVA Llama + CLIP direct/hybrid VLM adapter | Native tiny-checkpoint image-path parity tested |
 | Qwen2-VL direct/hybrid VLM adapter | Tiny parity; named 2B direct checkpoint passes real-image acceptance |
 | Language-only 4-bit VLM conversion | Packed weights + native decoded-reference parity tested |
+| Qwen3-VL / Qwen2-VL text conditioning | Portable conversion fixtures; BF16/mRoPE preserved; native conditioning parity unverified |
 
 ---
 
@@ -367,9 +490,10 @@ print('loaded')
 1. **recognized for inspection** via GGUF metadata, and
 2. **conversion enabled** through an explicit tensor adapter.
 
-The language-model path recognizes 48 architecture identifiers for inspection
-and enables conversion for 12 identifiers. VLM detection and conversion use a
-separate registry with LLaVA Llama + CLIP and Qwen2-VL adapters.
+Language-model conversion is enabled only for explicit adapters. Text conditioning
+adds a separate, opt-in contract for the four Qwen-VL identifiers above.
+Full-VLM detection and conversion retain their separate LLaVA Llama + CLIP and
+Qwen2-VL adapters.
 
 ### Conversion-enabled architectures
 
@@ -386,6 +510,7 @@ separate registry with LLaVA Llama + CLIP and Qwen2-VL adapters.
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | Tiny image-path parity; pretrained quality unverified | ❌ | Language-only 4-bit | ✅ generic package/verify | ✅ Llama + CLIP only |
 | Qwen2-VL | `qwen2vl` + Qwen2-VL/mmproj | ✅ direct/hybrid fixture-validated | Named 2B direct checkpoint: 12/12 image diagnostic; see [report](docs/qwen2-vl-real-validation.md) | ❌ | Uniform 4-bit: 11/12 exact; source-preserved Q4_K/float: 12/12 | ✅ generic package/verify | ✅ ViT + patch merger |
+| Qwen-VL text encoder | `qwen3vl`, `qwen3_vl`, `qwen2vl`, `qwen2_vl` | ✅ `--type text-encoder`, BF16 default | Portable conversion only; native hidden-state/image quality unverified | ❌ | Explicit direct 4-bit only | ✅ generic package/verify | Text only; vision skipped |
 
 “Conversion” means that a code path exists. “End-to-end” means a converted model
 has been loaded and exercised; ⚠️ rows still require the opt-in model fixtures.
@@ -420,7 +545,7 @@ unrelated architectures.
 2. Validate that the architecture has a supported adapter
 3. Build `config.json` using source metadata and selected dtype
 4. Export tokenizer assets from GGUF metadata
-5. Dequantize GGUF tensors to FP16 or FP32
+5. Decode tensors to the selected floating precision (text conditioning uses FP32 intermediates for BF16 output)
 6. Remap tensor names into the target Hugging Face / MLX-LM layout
 7. Optionally run `mlx_lm.convert --quantize` into a second staged directory
 8. Write the selected output directory atomically

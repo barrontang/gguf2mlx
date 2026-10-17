@@ -24,6 +24,7 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
+from .qwen_vl_text import QWEN_VL_TEXT_ARCHES, Qwen3VLTextEncoderConverter
 from .rust_backend import classify_architecture as rust_classify_architecture
 from .rust_backend import detect_architecture as rust_detect_architecture
 from .streaming import StreamingShardWriter
@@ -182,6 +183,8 @@ ARCH_MAP: dict[str, str] = {
     "command-r": "cohere",
     "command-r-plus": "cohere",
     "qwen2": "qwen2",
+    **{arch: "qwen3_vl_text" if "3" in arch else "qwen2_vl_text"
+       for arch in QWEN_VL_TEXT_ARCHES},
     "qwen2moe": "qwen2_moe",
     "qwen3moe": "qwen3_moe",
     "phi3": "phi3",
@@ -235,6 +238,7 @@ CONVERTIBLE_ARCHES = {
     "qwen2moe",
     "qwen3moe",
     "stablelm",
+    *QWEN_VL_TEXT_ARCHES,
 }
 
 STRICT_ADAPTER_ARCHES = {"gemma", "phi3"}
@@ -247,6 +251,7 @@ DIRECT_QUANT_SUPPORTED_ARCHES = {
     "mistral",
     "qwen2",
     "stablelm",
+    *QWEN_VL_TEXT_ARCHES,
     *MOE_ARCHES,
 }
 DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES = {
@@ -309,6 +314,8 @@ def detect_architecture(reader: GGUFReader) -> str:
     arch = get_metadata_str(reader, "general.architecture")
     name = get_metadata_str(reader, "general.name")
 
+    if arch in QWEN_VL_TEXT_ARCHES:
+        return arch
     rust_arch = rust_detect_architecture(arch, name)
     if rust_arch:
         return rust_arch
@@ -484,6 +491,8 @@ def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[st
 
 def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[str, Any]:
     """Build MLX-compatible config.json from GGUF metadata."""
+    if arch in QWEN_VL_TEXT_ARCHES:
+        return Qwen3VLTextEncoderConverter.build_config(reader, arch, dtype)
 
     def _warn(key: str, value: Any) -> None:
         warnings.warn(f"  ⚠ '{key}' not found in GGUF metadata, using default: {value}")
@@ -978,6 +987,8 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
     transforms (kv_b concat, per-expert split) are handled separately in the
     convert loop by _plan_tensor_emit.
     """
+    if arch in QWEN_VL_TEXT_ARCHES:
+        return Qwen3VLTextEncoderConverter.map_tensor_name(gguf_name)
     if arch in _MLA_ARCHES:
         mapped = _map_mla_tensor_name(gguf_name)
         if mapped is not None:
@@ -1023,6 +1034,7 @@ def extract_tokenizer(
     output_dir: Path,
     arch: str = "llama",
     model_max_length: int | None = None,
+    additional_special_token_ids: list[int] | None = None,
 ) -> None:
     """Extract tokenizer from GGUF metadata and save standard files."""
     source_model = (get_metadata_str(reader, "tokenizer.ggml.model") or "bpe").lower()
@@ -1076,6 +1088,8 @@ def extract_tokenizer(
         raise ValueError("GGUF has no tokenizer.ggml.tokens; cannot reconstruct a tokenizer")
     if len(set(tokens)) != len(tokens):
         raise ValueError("GGUF tokenizer vocabulary contains duplicate tokens")
+    if any(not 0 <= token_id < len(tokens) for token_id in (additional_special_token_ids or [])):
+        raise ValueError("Additional special token ID is outside the vocabulary")
     if token_types and len(token_types) != len(tokens):
         raise ValueError("GGUF tokenizer requires a type for every token")
     if scores and (len(scores) != len(tokens) or not np.isfinite(scores).all()):
@@ -1168,6 +1182,10 @@ def extract_tokenizer(
         )
         if token_id is not None and 0 <= token_id < vocab_size
     }
+    if additional_special_token_ids:
+        special_tokens["additional_special_tokens"] = [
+            tokens[token_id] for token_id in additional_special_token_ids
+        ]
     tokenizer_config.update(special_tokens)
 
     if arch != "gemma" and (model_type == "llama" or model_type == "bpe"):
@@ -1225,7 +1243,7 @@ def extract_tokenizer(
             do_lower_case=get_metadata_bool(reader, "tokenizer.ggml.normalizer.lowercase"),
             strip_accents=get_metadata_bool(reader, "tokenizer.ggml.normalizer.strip_accents"),
             precompiled_charsmap=encoded_charsmap,
-            special_token_ids=[
+            special_token_ids=(additional_special_token_ids or []) + [
                 token_id for token_id in (
                     sep_id, get_metadata_int(reader, "tokenizer.ggml.mask_token_id"),
                 ) if token_id is not None
@@ -1439,7 +1457,8 @@ def _build_tokenizer_json(
         raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
 
     normalizer = (
-        None if arch in {"qwen2", "qwen2moe", "qwen3moe"} or model_type == "t5"
+        None if arch in {"qwen2", "qwen2moe", "qwen3moe", *QWEN_VL_TEXT_ARCHES}
+        or model_type == "t5"
         else {"type": "NFC"}
     )
     if precompiled_charsmap:
@@ -1761,7 +1780,7 @@ def _is_direct_quantizable_linear_weight(hf_name: str, arr: np.ndarray) -> bool:
 
 
 def _quantize_affine_4bit(
-    arr: np.ndarray, q_group_size: int
+    arr: np.ndarray, q_group_size: int, *, floating_dtype: str = "float16",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Quantize an array of linear weights into affine 4-bit groups."""
     if arr.ndim < 2:
@@ -1789,7 +1808,7 @@ def _quantize_affine_4bit(
     codes = q.reshape(*leading_shape, cols // 8, 8).astype(np.uint32)
     shifts = np.arange(8, dtype=np.uint32) * 4
     packed = np.bitwise_or.reduce(codes << shifts, axis=-1)
-    return packed, safe_scales.astype(np.float16), mins.astype(np.float16)
+    return packed, safe_scales.astype(floating_dtype), mins.astype(floating_dtype)
 
 
 def _finalize_safetensor_shards(output_dir: Path, total_bytes_out: int) -> tuple[int, int]:
@@ -1823,6 +1842,11 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
     """Decode lazily, visiting related headers together to bound fusion buffers."""
     groups: dict[str, list[Any]] = {}
     for tensor in reader.tensors:
+        if arch in QWEN_VL_TEXT_ARCHES:
+            if Qwen3VLTextEncoderConverter.is_visual_tensor(tensor.name):
+                print(f"    Skipping vision/projector tensor: {tensor.name}")
+                continue
+            _map_tensor_name(tensor.name, arch)
         group = tensor.name
         if arch == "phi3":
             match = re.fullmatch(r"(blk\.\d+)\.attn_[qkv]\.weight", tensor.name)
@@ -1866,7 +1890,7 @@ def extract_and_convert_weights(
     print(f"  Output dtype: {dtype}")
     with StreamingShardWriter(output_dir, max_shard_bytes) as writer:
         for _, _, name, array in _iter_weight_arrays(reader, arch, dtype):
-            writer.add(name, array)
+            writer.add(name, array, **({"dtype": "bfloat16"} if dtype == "bfloat16" else {}))
             del array
         if arch == "glm-dsa":
             layers = _detect_full_indexer_layers(list(writer.weight_map))
@@ -1920,21 +1944,31 @@ def extract_and_convert_weights_direct_quant(
 
             if should_quantize:
                 qtype_val = int(qtype)
-                if qtype_val not in DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES:
+                supported_qtypes = DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES
+                if arch in QWEN_VL_TEXT_ARCHES:
+                    supported_qtypes = supported_qtypes | {0, 1}
+                if qtype_val not in supported_qtypes:
                     raise RuntimeError(
                         f"Unsupported source quantization for direct quantization: "
                         f"{gguf_name} has qtype={qtype_val}; supported: "
-                        f"{sorted(DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES)}"
+                        f"{sorted(supported_qtypes)}"
                     )
-                packed, scales, biases = _quantize_affine_4bit(out_arr, q_group_size)
+                quant_options = {"floating_dtype": "float32"} if dtype == "bfloat16" else {}
+                packed, scales, biases = _quantize_affine_4bit(
+                    out_arr, q_group_size, **quant_options,
+                )
                 base = hf_name.removesuffix(".weight")
                 writer.add(f"{base}.weight", packed)
-                writer.add(f"{base}.scales", scales.astype(np_dtype))
-                writer.add(f"{base}.biases", biases.astype(np_dtype))
+                bf16_options = {"dtype": "bfloat16"} if dtype == "bfloat16" else {}
+                writer.add(f"{base}.scales", scales.astype(np_dtype), **bf16_options)
+                writer.add(f"{base}.biases", biases.astype(np_dtype), **bf16_options)
                 del packed, scales, biases
                 quantized_tensors += 1
             else:
-                writer.add(hf_name, out_arr)
+                writer.add(
+                    hf_name, out_arr,
+                    **({"dtype": "bfloat16"} if dtype == "bfloat16" else {}),
+                )
                 fallback_tensors += 1
             del out_arr
 
@@ -2032,7 +2066,14 @@ def _convert_direct_quantized(
     _write_runtime_adapter(output_path, arch, config)
     with open(output_path / "config.json", "w") as f:
         json.dump(config, f, indent=2)
-    extract_tokenizer(reader, output_path, arch, config["max_position_embeddings"])
+    token_options = (
+        {"additional_special_token_ids": [
+            config[key] for key in (
+                "image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id",
+            )
+        ]} if arch in QWEN_VL_TEXT_ARCHES else {}
+    )
+    extract_tokenizer(reader, output_path, arch, config["max_position_embeddings"], **token_options)
 
     print("\n[direct-quant] Converting tensors with bounded memory...")
     try:
@@ -2189,7 +2230,14 @@ def _convert(
 
     # Step 3: Extract tokenizer
     print("\n[3/5] Extracting tokenizer...")
-    extract_tokenizer(reader, output_path, arch, config["max_position_embeddings"])
+    token_options = (
+        {"additional_special_token_ids": [
+            config[key] for key in (
+                "image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id",
+            )
+        ]} if arch in QWEN_VL_TEXT_ARCHES else {}
+    )
+    extract_tokenizer(reader, output_path, arch, config["max_position_embeddings"], **token_options)
 
     # Step 4: Extract, dequantize, and convert weights
     print("\n[4/5] Extracting and converting weights...")
@@ -2261,7 +2309,7 @@ def _quantize_output_with_mlx_lm(
 def convert(
     gguf_path: str,
     output_dir: str,
-    dtype: str = "float16",
+    dtype: str | None = None,
     quantize: bool = False,
     q_bits: int = 4,
     q_group_size: int = 64,
@@ -2316,7 +2364,7 @@ def convert(
     try:
         from .vlm import convert_vlm, is_vlm
 
-        if model_type not in {"auto", "llm", "vlm"}:
+        if model_type not in {"auto", "llm", "vlm", "text-encoder"}:
             print(f"❌ Unsupported conversion type: {model_type}")
             return False
         vlm_options = bool(mmproj or hf_model or hf_fallback_vision or preserve_source_quant)
@@ -2324,14 +2372,40 @@ def convert(
             print("❌ VLM source options cannot be used with --type llm")
             return False
         detected_vlm = False
+        detected_arch = None
         if Path(gguf_path).is_file():
             try:
                 reader = GGUFReader(gguf_path)
+                if model_type == "text-encoder":
+                    detected_arch = detect_architecture(reader)
                 detected_vlm = is_vlm(reader)
                 del reader
             except Exception as error:  # noqa: BLE001
                 print(f"❌ Could not inspect GGUF: {error}")
                 return False
+        if model_type == "text-encoder":
+            if detected_arch not in QWEN_VL_TEXT_ARCHES:
+                print("❌ --type text-encoder requires a Qwen2-VL or Qwen3-VL GGUF")
+                return False
+            if vlm_options or mixed_precision:
+                print("❌ Text-only conversion cannot use VLM source or MoE precision options")
+                return False
+            if direct_quant != quantize:
+                print("❌ Text-encoder quantization requires --quantize --direct-quant together")
+                return False
+            dtype = dtype or "bfloat16"
+            if dtype == "float16" and not direct_quant:
+                print("❌ Text conditioning requires BF16 or FP32; FP16 requires --direct-quant")
+                return False
+            detected_vlm = False
+        else:
+            dtype = dtype or "float16"
+            if dtype == "bfloat16":
+                print("❌ --dtype bfloat16 currently requires --type text-encoder")
+                return False
+        if dtype not in {"float16", "float32", "bfloat16"}:
+            print(f"❌ Unsupported output dtype: {dtype}")
+            return False
         if model_type == "llm" and detected_vlm:
             print("❌ Multimodal GGUF detected; use --type vlm with HF assets")
             return False
@@ -2635,7 +2709,8 @@ def verify_mlx_bundle(bundle_path: str) -> bool:
 
 def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--type", dest="model_type", choices=["auto", "llm", "vlm"], default="auto",
+        "--type", dest="model_type", choices=["auto", "llm", "vlm", "text-encoder"],
+        default="auto",
         help="Conversion family (default: auto-detect multimodal metadata/tensors)",
     )
     parser.add_argument(
@@ -2662,9 +2737,9 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--dtype",
-        default="float16",
-        choices=["float16", "float32"],
-        help="Output data type (default: float16)",
+        default=None,
+        choices=["float16", "float32", "bfloat16"],
+        help="Output dtype (default: BF16 for text-encoder, FP16 otherwise)",
     )
     parser.add_argument(
         "--max-shard-gb",
