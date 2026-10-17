@@ -2284,7 +2284,11 @@ def convert(
         if not np.isfinite(max_shard_gb) or max_shard_gb <= 0:
             print("❌ max_shard_gb must be finite and positive")
             return False
-        max_shard_bytes = int(max_shard_gb * 1024**3)
+        byte_limit = max_shard_gb * 1024**3
+        if not np.isfinite(byte_limit):
+            print("❌ max_shard_gb is too large")
+            return False
+        max_shard_bytes = int(byte_limit)
         if max_shard_bytes < 1:
             print("❌ max_shard_gb must specify at least one byte")
             return False
