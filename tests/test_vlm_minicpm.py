@@ -50,6 +50,10 @@ def model_config():
             "num_attention_heads": 1, "num_key_value_heads": 1, "vocab_size": 5,
             "head_dim": 4, "tie_word_embeddings": False, "attention_bias": False,
             "hidden_act": "silu",
+            "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+            "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 4, "full_attention_interval": 4,
             "rope_parameters": {"mrope_section": [1, 1, 1]},
         },
         "vision_config": {
@@ -71,6 +75,14 @@ def make_readers(config):
         "qwen35.attention.head_count": 1,
         "qwen35.attention.head_count_kv": 1,
         "qwen35.attention.key_length": 4,
+        "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
+        "qwen35.rope.freq_base": 1000000.0,
+        "qwen35.ssm.group_count": 2,
+        "qwen35.ssm.time_step_rank": 4,
+        "qwen35.ssm.state_size": 8,
+        "qwen35.ssm.inner_size": 32,
+        "qwen35.ssm.conv_kernel": 4,
+        "qwen35.full_attention_interval": 4,
         "qwen35.rope.dimension_sections": [1, 1, 1, 0],
         "tokenizer.ggml.tokens": ["<unk>", "<s>", "</s>", "word", "<image>"],
         "tokenizer.ggml.bos_token_id": 1,
@@ -104,7 +116,9 @@ def make_readers(config):
         "clip.vision.attention.head_count": 1,
         "clip.vision.image_size": 448,
         "clip.vision.patch_size": 2,
-        "clip.vision.projector.scale_factor": 4,
+        "clip.vision.projector.scale_factor": (
+            2 if config.get("downsample_mode") == "4x" else 4
+        ),
         "clip.vision.wa_layer_indexes": [0],
         "clip.use_gelu": True,
         "clip.vision.attention.layer_norm_epsilon": 1e-6,
@@ -150,7 +164,7 @@ def convert(model, **kwargs):
 def test_minicpm_v47_dense_conversion_maps_both_mergers_and_validates_separator(model):
     convert(model)
 
-    weights = load_file(next(model.output.glob("model-*.safetensors")))
+    weights = load_file(model.output / "model.safetensors")
     assert "language_model.model.layers.0.self_attn.q_proj.weight" in weights
     assert "vision_tower.embeddings.patch_embedding.bias" in weights
     assert "vit_merger.self_attn.q_proj.weight" in weights
@@ -186,3 +200,18 @@ def test_minicpm_v47_rejects_moe_text_tensors(model):
     reader.tensors.append(tensor("blk.0.ffn_gate_exps.weight", np.ones((2, 4, 4))))
     with pytest.raises(ValueError, match="dense layouts only"):
         convert(model)
+
+
+def test_minicpm_v47_4x_omits_window_merger():
+    config = model_config()
+    config["downsample_mode"] = "4x"
+    adapter = MiniCPMV47Adapter(config)
+
+    assert not any(name.startswith("vit_merger.") for name in adapter.expected)
+    assert adapter.map_projector("mm.up.weight") == "merger.mlp.0.linear_1.weight"
+    with pytest.raises(ValueError, match="Unsupported MiniCPM-V 4.7 vision tensor"):
+        adapter.map_vision("v.vit_merger.ln1.weight")
+
+
+def test_plain_minicpm3_is_not_detected_as_vlm():
+    assert not vlm.is_vlm(Reader({"general.architecture": "minicpm3"}))

@@ -752,7 +752,7 @@ def convert_vlm(
     architecture = config.get("model_type")
     if not isinstance(architecture, str) or architecture not in ARCHITECTURE_REGISTRY:
         raise ValueError(
-            "Supported HF model_type values are 'llava', 'qwen2_vl', and 'minicpmv4_7'."
+            "Only HF model_type='llava', 'qwen2_vl', or 'minicpmv4_7' is supported."
         )
     qwen = minicpm = None
     if architecture == "qwen2_vl":

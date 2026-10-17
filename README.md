@@ -309,7 +309,12 @@ gguf2mlx convert --type vlm \
   --input qwen2-vl.gguf --mmproj qwen2-vl-mmproj.gguf \
   --hf-model Qwen/Qwen2-VL-2B-Instruct --output ./qwen2-vl-mlx
 
-# Either adapter: affine 4-bit language projections, floating vision/projector
+# MiniCPM-V 4.7 1B dense: Qwen3.5 language GGUF + matching MiniCPM-V mmproj
+gguf2mlx convert --type vlm \
+  --input minicpm-v-4.7-1b.gguf --mmproj minicpm-v-4.7-1b-mmproj.gguf \
+  --hf-model openbmb/MiniCPM-V-4.7 --output ./minicpm-v-4.7-1b-mlx
+
+# LLaVA/Qwen2-VL: affine 4-bit language projections, floating vision/projector
 gguf2mlx convert --type vlm \
   --input language.gguf --mmproj mmproj.gguf \
   --hf-model /absolute/path/to/matching-hf-vlm --offline \
@@ -331,6 +336,9 @@ gguf2mlx convert --type vlm \
 - Omit `--mmproj` for a combined GGUF. Both paths require GGUF projector
   weights; hybrid conversion never replaces the language model or projector
   with HF weights.
+- MiniCPM-V currently requires its separate 4.7 1B dense `clip` projector GGUF.
+  The 35B-A3B MoE and older 4.6 layouts are rejected; direct quantization is not
+  enabled for MiniCPM-V.
 - `--hf-model` must describe the **matching full VLM**, not a bare CLIP model.
   `--hf-fallback-vision` also supplies that source's assets; if both options are
   specified, they must reference the same source. Pin `--hf-revision` to a HF
@@ -356,7 +364,8 @@ gguf2mlx convert --type vlm \
   files and never overwrite an existing nonempty output directory.
 - `--dtype float16` (default) or `float32` controls floating-point tensors.
   `--quantize --direct-quant` together enable affine 4-bit, group-size-64
-  quantization of language attention/MLP projection matrices only. Embeddings,
+  quantization of language attention/MLP projection matrices for LLaVA and
+  Qwen2-VL only. Embeddings,
   LM head, norms, biases, vision tower and projector remain floating-point.
   Quantization is **decode then re-quantize**, not bit-preserving GGUF
   transpacking; misaligned projections fail instead of silently falling back.

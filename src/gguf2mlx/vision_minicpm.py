@@ -10,7 +10,6 @@ import numpy as np
 from . import gguf2mlx as core
 from . import vlm
 
-
 _VISION_ROOTS = {
     "v.patch_embd.weight": "vision_tower.embeddings.patch_embedding.weight",
     "v.patch_embd.bias": "vision_tower.embeddings.patch_embedding.bias",
@@ -54,7 +53,9 @@ class MiniCPMV47Adapter:
             raise ValueError("MiniCPM-V adapter requires MiniCPMV4_7ForConditionalGeneration")
         raw_text, raw_vision = config.get("text_config"), config.get("vision_config")
         if not isinstance(raw_text, dict) or not isinstance(raw_vision, dict):
-            raise ValueError("MiniCPM-V 4.7 requires text_config and vision_config objects")
+            raise ValueError(  # noqa: TRY004
+                "MiniCPM-V 4.7 requires text_config and vision_config objects"
+            )
         if raw_text.get("model_type") != "qwen3_5_text":
             raise ValueError("MiniCPM-V 4.7 1B requires dense qwen3_5_text")
         if raw_vision.get("model_type") not in (
@@ -215,7 +216,7 @@ class MiniCPMV47Adapter:
             if value is None or value != self.text[config_key]:
                 raise ValueError(f"GGUF qwen35.{suffix} is missing or incompatible with HF")
         head_dim = core.get_metadata_int(reader, "qwen35.attention.key_length")
-        if head_dim is not None and head_dim != self.text.get(
+        if head_dim is None or head_dim != self.text.get(
             "head_dim", self.text["hidden_size"] // self.text["num_attention_heads"]
         ):
             raise ValueError("GGUF Qwen3.5 head dimension is incompatible with HF config")
@@ -227,7 +228,23 @@ class MiniCPMV47Adapter:
             ("full_attention_interval", "full_attention_interval"),
         ):
             value = core.get_metadata_int(reader, f"qwen35.{suffix}")
-            if value is not None and value != self.text.get(config_key, value):
+            if value is None or value != self.text.get(config_key):
+                raise ValueError(f"GGUF qwen35.{suffix} is incompatible with HF config")
+        inner_size = core.get_metadata_int(reader, "qwen35.ssm.inner_size")
+        expected_inner_size = (
+            self.text["linear_num_value_heads"] * self.text["linear_value_head_dim"]
+        )
+        if inner_size is None or inner_size != expected_inner_size:
+            raise ValueError("GGUF qwen35.ssm.inner_size is incompatible with HF config")
+        for suffix, expected in (
+            ("rope.freq_base", self.text.get("rope_theta")),
+            ("attention.layer_norm_rms_epsilon", self.text.get("rms_norm_eps")),
+        ):
+            value = core.get_metadata_float(reader, f"qwen35.{suffix}")
+            if (
+                expected is None or value is None
+                or not np.isclose(value, expected, rtol=1e-5, atol=0)
+            ):
                 raise ValueError(f"GGUF qwen35.{suffix} is incompatible with HF config")
         sections = core.get_metadata_array_int(reader, "qwen35.rope.dimension_sections")
         rope = self.text.get("rope_parameters", self.text.get("rope_scaling"))
@@ -303,7 +320,7 @@ class MiniCPMV47Adapter:
                 raise ValueError(f"GGUF CLIP {suffix} is missing or incompatible with MiniCPM-V")
         scale_resolution = preprocessor.get("scale_resolution", 448)
         image_size = core.get_metadata_int(reader, "clip.vision.image_size")
-        if image_size is not None and image_size != scale_resolution:
+        if image_size is None or image_size != scale_resolution:
             raise ValueError("GGUF image_size does not match MiniCPM-V processor scale_resolution")
         scale_factor = core.get_metadata_int(reader, "clip.vision.projector.scale_factor")
         expected_scale = 2 if self.downsample_mode == "4x" else 4
@@ -312,8 +329,18 @@ class MiniCPMV47Adapter:
         if core.get_metadata_bool(reader, "clip.use_gelu") is not True:
             raise ValueError("MiniCPM-V 4.7 requires the GGUF SigLIP GELU activation")
         epsilon = core.get_metadata_float(reader, "clip.vision.attention.layer_norm_epsilon")
-        if epsilon is not None and not np.isclose(epsilon, 1e-6, rtol=1e-5, atol=0):
+        if epsilon is None or not np.isclose(epsilon, 1e-6, rtol=1e-5, atol=0):
             raise ValueError("MiniCPM-V 4.7 vision layer norm epsilon must be 1e-6")
+        for key in ("image_mean", "image_std"):
+            value = preprocessor.get(key)
+            if reader.get_field(f"clip.vision.{key}") is not None:
+                gguf_value = core.get_metadata_array_float(reader, f"clip.vision.{key}")
+                if (
+                    not isinstance(value, list) or len(value) != 3
+                    or len(gguf_value) != 3
+                    or not np.allclose(gguf_value, value, rtol=1e-5, atol=1e-7)
+                ):
+                    raise ValueError(f"GGUF/HF MiniCPM-V processor {key} mismatch")
         indexes = core.get_metadata_array_int(reader, "clip.vision.wa_layer_indexes")
         if indexes != [self.insert_layer_id]:
             raise ValueError("GGUF vit_merger insertion layer differs from HF config")
@@ -353,7 +380,7 @@ class MiniCPMV47Adapter:
             raise ValueError("MiniCPM-V tokenizer must contain a verifiable vocabulary")
         for entry in document.get("added_tokens", []):
             if not isinstance(entry, dict) or not isinstance(entry.get("content"), str):
-                raise ValueError("Invalid MiniCPM-V tokenizer added token")
+                raise ValueError("Invalid MiniCPM-V tokenizer added token")  # noqa: TRY004
             token_ids[entry["content"]] = entry.get("id")
         decoder = tokenizer_config.get("added_tokens_decoder", {})
         if isinstance(decoder, dict):
@@ -410,13 +437,13 @@ class MiniCPMV47Adapter:
         raise ValueError(f"Unsupported MiniCPM-V 4.7 merger tensor {name}")
 
     def hf_vision_name(self, name: str) -> str | None:
+        if name.startswith(("model.merger.", "merger.")):
+            return None
         prefixes = (
             ("model.vision_tower.", "vision_tower."),
             ("vision_tower.", "vision_tower."),
             ("model.vit_merger.", "vit_merger."),
             ("vit_merger.", "vit_merger."),
-            ("model.merger.", "merger."),
-            ("merger.", "merger."),
         )
         for prefix, target in prefixes:
             if name.startswith(prefix):
