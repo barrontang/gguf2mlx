@@ -1953,7 +1953,10 @@ def extract_and_convert_weights_direct_quant(
                         f"{gguf_name} has qtype={qtype_val}; supported: "
                         f"{sorted(supported_qtypes)}"
                     )
-                quant_options = {"floating_dtype": "float32"} if dtype == "bfloat16" else {}
+                preserve_float_range = dtype == "bfloat16" or (
+                    arch in QWEN_VL_TEXT_ARCHES and dtype == "float32"
+                )
+                quant_options = {"floating_dtype": "float32"} if preserve_float_range else {}
                 packed, scales, biases = _quantize_affine_4bit(
                     out_arr, q_group_size, **quant_options,
                 )

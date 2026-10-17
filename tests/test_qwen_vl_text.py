@@ -121,6 +121,17 @@ def test_metadata_namespace_alias_and_explicit_token_ids():
         core.build_config(Reader(fields), "qwen3_vl", "float32")
 
 
+@pytest.mark.parametrize("scaling_type,factor", [("yarn", 4.0), ("linear", 2.0),
+                                               (None, 2.0), ("default", float("nan"))])
+def test_nondefault_source_rope_scaling_is_rejected(scaling_type, factor):
+    fields = metadata()
+    if scaling_type is not None:
+        fields["qwen3vl.rope.scaling.type"] = scaling_type
+    fields["qwen3vl.rope.scaling.factor"] = factor
+    with pytest.raises(ValueError, match="Nondefault Qwen-VL RoPE scaling"):
+        core.build_config(Reader(fields), "qwen3vl", "bfloat16")
+
+
 @pytest.mark.parametrize("name", ["visual.patch_embed.weight", "vision_tower.blk.0.weight",
                                  "model.visual.merger.weight", "merger.weight",
                                  "v.blk.0.attn_q.weight", "mm.0.weight"])
@@ -223,24 +234,27 @@ def test_text_encoder_rejects_non_vl_architecture(tmp_path):
     assert not output.exists()
 
 
-def test_explicit_direct_quantization_and_float32_output(tmp_path):
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_explicit_direct_quantization_and_float32_output(tmp_path, dtype):
     source = tmp_path / "source.gguf"
     write_gguf(source)
     assert core.convert(str(source), str(tmp_path / "fp32"), "float32", model_type="text-encoder")
-    assert core.convert(str(source), str(tmp_path / "quant"), model_type="text-encoder",
+    assert core.convert(str(source), str(tmp_path / "quant"), dtype, model_type="text-encoder",
                         quantize=True, direct_quant=True)
     config = json.loads((tmp_path / "quant" / "config.json").read_text())
     assert config["quantization"]["bits"] == 4
-    assert config["torch_dtype"] == "bfloat16"
+    assert config["torch_dtype"] == dtype
     assert config["rope_scaling"]["mrope_interleaved"] is True
     index = json.loads((tmp_path / "quant" / "model.safetensors.index.json").read_text())
     shard = tmp_path / "quant" / next(iter(index["weight_map"].values()))
     header, payload = read_payload(shard)
     bias = header["model.layers.0.self_attn.q_proj.biases"]
-    assert bias["dtype"] == "BF16"
+    assert bias["dtype"] == ("BF16" if dtype == "bfloat16" else "F32")
     start, end = bias["data_offsets"]
-    decoded = dequantize(np.frombuffer(payload[start:end], dtype=np.uint8),
-                         GGMLQuantizationType.BF16)
+    decoded = (
+        dequantize(np.frombuffer(payload[start:end], dtype=np.uint8), GGMLQuantizationType.BF16)
+        if dtype == "bfloat16" else np.frombuffer(payload[start:end], dtype="<f4")
+    )
     np.testing.assert_array_equal(decoded, [99840, 99840])
 
 

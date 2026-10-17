@@ -126,7 +126,8 @@ occurs if conversion fails.
 - Required topology, mRoPE sections, and vision token IDs must be present.
   Three positive rotary sections must sum to half the attention head dimension;
   a fourth trailing zero in GGUF is accepted and removed. Values are not guessed
-  from a model name.
+  from a model name. Nondefault frequency scaling (such as YaRN or linear RoPE)
+  is rejected rather than silently replaced by default mRoPE.
 - Vision tower and merger weights are intentionally **not emitted**. There is
   no image processor, vision-feature generation, or complete Qwen3-VL runtime
   in this text-only artifact.

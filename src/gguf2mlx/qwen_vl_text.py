@@ -38,6 +38,7 @@ class Qwen3VLTextEncoderConverter:
         from .gguf2mlx import (
             build_config,
             get_metadata_array_str,
+            get_metadata_float,
             get_metadata_int,
             get_metadata_str,
         )
@@ -58,6 +59,13 @@ class Qwen3VLTextEncoderConverter:
                 return reader.get_field(key)
 
         metadata = TextMetadata()
+        scaling_type = get_metadata_str(metadata, "qwen2.rope.scaling.type")
+        scaling_factor = get_metadata_float(metadata, "qwen2.rope.scaling.factor")
+        if scaling_type not in (None, "none", "default") or scaling_factor not in (None, 1.0):
+            raise ValueError(
+                "Nondefault Qwen-VL RoPE scaling is unsupported; "
+                "refusing to discard source scaling parameters"
+            )
         for suffix in (
             "embedding_length", "block_count", "attention.head_count",
             "attention.head_count_kv", "feed_forward_length", "context_length",
