@@ -274,8 +274,6 @@ QWEN35_ARCHES = {
     "qwen35", "qwen3_5", "qwen3.5", "qwen36", "qwen3_6", "qwen3.6",
     "qwen38", "qwen3_8", "qwen3.8",
 }
-GEMMA_ARCHES = {"gemma", "gemma2", "gemma3", "gemma4"}
-
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
 MOE_ARCHES = {"qwen2moe", "qwen3moe", "deepseek2", "deepseek3", "glm4moe", "glm-dsa"}
 DIRECT_QUANT_SUPPORTED_ARCHES = {
@@ -424,6 +422,14 @@ def validate_moe_layout(reader: GGUFReader, arch: str, architecture_kind: str) -
 
 def validate_architecture_variant(reader: GGUFReader, arch: str) -> str | None:
     """Return an actionable error when a recognized architecture variant is unverified."""
+    if (arch == "qwen3" or arch in QWEN35_ARCHES) and any(
+        any(pattern in tensor.name for pattern in _EXPERT_PATTERNS)
+        for tensor in reader.tensors
+    ):
+        return (
+            f"The {arch} adapter supports dense layouts only; MoE expert tensors "
+            "are not supported."
+        )
     if arch == "phi3" and any(
         tensor.name in {"rope_factors_long", "rope_factors_short"}
         for tensor in reader.tensors
@@ -526,6 +532,21 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
     """Build MLX-compatible config.json from GGUF metadata."""
     if arch in QWEN_VL_TEXT_ARCHES:
         return Qwen3VLTextEncoderConverter.build_config(reader, arch, dtype)
+    if arch in QWEN35_ARCHES and arch != "qwen35":
+        original_reader = reader
+
+        class Qwen35Metadata:
+            tensors = original_reader.tensors
+
+            def get_field(self, key):
+                field = original_reader.get_field(key)
+                if field is None and key.startswith(f"{arch}."):
+                    field = original_reader.get_field(
+                        "qwen35." + key[len(arch) + 1:]
+                    )
+                return field
+
+        reader = Qwen35Metadata()
 
     def _warn(key: str, value: Any) -> None:
         warnings.warn(f"  ⚠ '{key}' not found in GGUF metadata, using default: {value}")
@@ -772,12 +793,27 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
             config["rope_theta"] = rope_theta
 
     if arch == "gemma4":
+        gemma4_sliding_dim = get_metadata_int(
+            reader, f"{arch}.attention.key_length_swa"
+        )
+        gemma4_global_dim = get_metadata_int(
+            reader, f"{arch}.attention.key_length"
+        )
+        layer_pattern = get_metadata_array_int(
+            reader, f"{arch}.attention.sliding_window_pattern"
+        )
+        sliding_window_pattern = (
+            next((index + 1 for index, is_sliding in enumerate(layer_pattern)
+                  if not is_sliding), len(layer_pattern))
+            if layer_pattern else get_metadata_int(
+                reader, f"{arch}.attention.sliding_window_pattern"
+            ) or 5
+        )
         config.update({
             "model_type": "gemma4_text",
             "architectures": ["Gemma4TextModel"],
-            "global_head_dim": get_metadata_int(
-                reader, f"{arch}.attention.key_length"
-            ) or config["head_dim"],
+            "head_dim": gemma4_sliding_dim or hidden_size // num_heads,
+            "global_head_dim": gemma4_global_dim or hidden_size // num_heads,
             "hidden_size_per_layer_input": get_metadata_int(
                 reader, f"{arch}.embedding_length_per_layer_input"
             ) or 0,
@@ -788,9 +824,7 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
             "sliding_window": get_metadata_int(
                 reader, f"{arch}.attention.sliding_window"
             ) or 512,
-            "sliding_window_pattern": get_metadata_int(
-                reader, f"{arch}.attention.sliding_window_pattern"
-            ) or 5,
+            "sliding_window_pattern": sliding_window_pattern,
             "use_double_wide_mlp": True,
             "tie_word_embeddings": True,
         })
@@ -808,10 +842,11 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
                 "partial_rotary_factor": 1.0,
             },
         }
-        layer_pattern = get_metadata_array_int(
-            reader, f"{arch}.attention.sliding_window_pattern"
-        )
         if layer_pattern:
+            if len(layer_pattern) != num_layers:
+                raise ValueError(
+                    "Gemma4 sliding-window pattern length does not match block_count"
+                )
             config["layer_types"] = [
                 "sliding_attention" if is_sliding else "full_attention"
                 for is_sliding in layer_pattern
@@ -819,7 +854,6 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
         elif any(t.name.startswith("blk.") and ".attn_qkv." in t.name for t in reader.tensors):
             raise ValueError("Gemma4 linear-attention layer layout is unsupported")
         for suffix, config_key in (
-            ("attention.key_length_swa", "head_dim"),
             ("attention.head_count_kv", "num_key_value_heads"),
         ):
             value = get_metadata_int(reader, f"{arch}.{suffix}")
@@ -1240,14 +1274,6 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
             "per_layer_model_proj.weight": "model.per_layer_model_projection.weight",
             "per_layer_proj_norm.weight": "model.per_layer_projection_norm.weight",
         }[gguf_name]
-    elif arch == "gemma4" and (match := re.fullmatch(
-        r"blk\.(\d+)\.attn_qkv\.weight", gguf_name
-    )):
-        mapped = f"model.layers.{match.group(1)}.self_attn.qkv_proj.weight"
-    elif arch == "gemma4" and (match := re.fullmatch(
-        r"blk\.(\d+)\.rope_freqs\.weight", gguf_name
-    )):
-        mapped = f"model.layers.{match.group(1)}.self_attn.rope.freqs"
     elif arch == "phi3":
         mapped = _map_phi3_tensor_name(gguf_name)
     elif arch == "qwen2moe" and (
@@ -1273,7 +1299,7 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
                 "attn_q_norm.weight": "self_attn.q_norm.weight",
                 "attn_k_norm.weight": "self_attn.k_norm.weight",
                 "attn_norm.weight": "input_layernorm.weight",
-                "ffn_norm.weight": "post_attention_layernorm.weight",
+                "ffn_norm.weight": "pre_feedforward_layernorm.weight",
                 "ffn_gate.weight": "mlp.gate_proj.weight",
                 "ffn_up.weight": "mlp.up_proj.weight",
                 "ffn_down.weight": "mlp.down_proj.weight",
@@ -1911,7 +1937,20 @@ def _read_mla_dims(reader: GGUFReader, arch: str) -> dict[str, int]:
     n_heads = _g("attention.head_count") or 64
     qk_nope = _g("attention.qk_nope_head_dim") or 192
     v_head = _g("attention.value_length") or _g("attention.v_head_dim") or qk_nope
-    return {"num_heads": n_heads, "qk_nope_head_dim": qk_nope, "v_head_dim": v_head}
+    dims = {"num_heads": n_heads, "qk_nope_head_dim": qk_nope, "v_head_dim": v_head}
+    if arch == "gemma4":
+        dims["num_attention_heads"] = (
+            get_metadata_int(reader, "gemma4.attention.head_count") or 8
+        )
+        dims["num_key_value_heads"] = (
+            get_metadata_int(reader, "gemma4.attention.head_count_kv") or 1
+        )
+        dims["gemma4_head_dim"] = (
+            get_metadata_int(reader, "gemma4.attention.key_length")
+            or get_metadata_int(reader, "gemma4.attention.key_length_swa")
+            or 256
+        )
+    return dims
 
 
 def _reconstruct_kv_b(k_b: np.ndarray, v_b: np.ndarray,
@@ -1954,6 +1993,31 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
     arr = _restore_architecture_tensor(gguf_name, arr, arch)
     if arch == "qwen2moe" and re.fullmatch(r"blk\.\d+\.ffn_gate_inp_shexp\.weight", gguf_name):
         arr = arr.reshape(1, -1)
+
+    # Some Gemma4 exporters fuse full-attention Q/K/V projections. MLX-LM's
+    # Gemma4 attention module keeps these as independent linear layers.
+    match = re.fullmatch(r"blk\.(\d+)\.attn_qkv\.weight", gguf_name)
+    if match and arch == "gemma4":
+        layer_idx = match.group(1)
+        heads = mla_dims["num_attention_heads"]
+        kv_heads = mla_dims["num_key_value_heads"]
+        head_dim = mla_dims["gemma4_head_dim"]
+        q_size = heads * head_dim
+        kv_size = kv_heads * head_dim
+        if arr.shape[0] == q_size + 2 * kv_size:
+            q, k, v = np.split(arr, [q_size, q_size + kv_size], axis=0)
+            return [
+                (f"model.layers.{layer_idx}.self_attn.q_proj.weight", q),
+                (f"model.layers.{layer_idx}.self_attn.k_proj.weight", k),
+                (f"model.layers.{layer_idx}.self_attn.v_proj.weight", v),
+            ]
+        if arr.shape[0] == q_size + kv_size:
+            q, k = np.split(arr, [q_size], axis=0)
+            return [
+                (f"model.layers.{layer_idx}.self_attn.q_proj.weight", q),
+                (f"model.layers.{layer_idx}.self_attn.k_proj.weight", k),
+            ]
+        raise ValueError(f"Invalid Gemma4 fused QKV shape: {gguf_name}: {arr.shape}")
 
     # --- Phi-3 split Q/K/V -> fused qkv_proj ---
     match = re.fullmatch(r"blk\.(\d+)\.attn_(q|k|v)\.weight", gguf_name)

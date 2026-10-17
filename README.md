@@ -501,11 +501,12 @@ Qwen2-VL adapters.
 | Family | GGUF architecture IDs | Conversion | End-to-end | MoE | Mixed precision | `.mlx` bundle | VLM |
 |---|---|---|---|---|---|---|---|
 | Llama | `llama`, `mistral` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
-| Qwen | `qwen2` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
+| Qwen | `qwen2`, dense `qwen3` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
+| Qwen3.5 family | `qwen35`; aliases `qwen3_5`, `qwen3.5`, `qwen36`, `qwen3_6`, `qwen3.6`, `qwen38`, `qwen3_8`, `qwen3.8` | ✅ dense layouts | Portable fixtures; native runtime unverified | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 real GGUF; Qwen3 opt-in pending | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | DeepSeek | `deepseek2`, `deepseek3` | ✅ | ⚠️ scheduled opt-in | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | GLM | `glm4moe` | ✅ | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
-| Gemma | `gemma` | ✅ fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
+| Gemma | `gemma`, `gemma2`, `gemma3`, text-only `gemma4` | ✅ | Portable conversion fixtures; native runtime unverified | Gemma4 MoE layout supported | — | ✅ generic package/verify | ❌ |
 | Phi | `phi3` | ✅ Phi-3 4K fixture-validated | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
 | StableLM | `stablelm` | ✅ | ❌ | ❌ | — | ✅ generic package/verify | ❌ |
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
@@ -521,8 +522,10 @@ loading the result in a JANG-compatible runtime. `.mlx` bundle packaging and
 integrity verification are architecture-independent operations on emitted model
 directories and do not assert runtime compatibility.
 
-Gemma 2/3 and Phi-3 LongRoPE are different layouts and are not included in the
-basic Gemma or Phi-3 4K support claim.
+Qwen3.5-family variants share the non-MoE Qwen3.5 tensor contract; Qwen3.x MoE
+and Gemma4 multimodal/audio components are not included in these text-model
+adapters. Native MLX-LM loading of the newly supported variants has not yet been
+validated against real checkpoints.
 
 ### Inspection only (not converted)
 
@@ -531,7 +534,7 @@ These may still be recognized by metadata or `--skip-weights`, but they are
 
 `arctic`, `baichuan`, `bert`, `bitnet`, `bloom`, `chameleon`, `chatglm`,
 `codeshell`, `command-r`, `command-r-plus`, `dbrx`, `exaone`, `falcon`,
-`gemma2`, `gemma3`, `gpt2`, `gptneox`, `granite`, `grok-1`, `jais`, `minicpm`,
+`gpt2`, `gptneox`, `granite`, `grok-1`, `jais`, `minicpm`,
 `minicpm3`, `mpt`, `nemotron`, `olmo`, `olmo2`, `openelm`, `orion`, `phi`,
 `phi2`, `plamo`, `refact`, `smolm`, `starcoder`, `t5`, and `xverse`.
 
@@ -699,8 +702,9 @@ conversion writes FP16 or FP32 safetensors, so a larger output is expected.
 
 ### Are Gemma and Phi supported?
 
-The base `gemma` architecture and standard Phi-3 4K layout have fixture-backed
-adapters. Gemma 2, Gemma 3, Phi-2, Phi-MoE, and Phi-3 LongRoPE remain unsupported.
+Gemma, Gemma 2, Gemma 3, and text-only Gemma 4 have conversion adapters. Gemma 4
+multimodal/audio tensors are not part of the text-only output. Phi-2, Phi-MoE,
+and Phi-3 LongRoPE remain unsupported.
 
 ### Is MLX always faster than llama.cpp?
 

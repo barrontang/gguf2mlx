@@ -101,6 +101,10 @@ def test_phi3_fixture_fuses_split_qkv_weights():
 def test_new_adapters_reject_unknown_tensor_names():
     with pytest.raises(ValueError, match="Unsupported gemma tensor"):
         core._map_tensor_name("blk.0.unknown.weight", "gemma")
+    with pytest.raises(ValueError, match="Unsupported gemma2 tensor"):
+        core._map_tensor_name("blk.0.unknown.weight", "gemma2")
+    with pytest.raises(ValueError, match="Unsupported qwen3 tensor"):
+        core._map_tensor_name("blk.0.unknown.weight", "qwen3")
     with pytest.raises(ValueError, match="Unsupported phi3 tensor"):
         core._map_tensor_name("blk.0.unknown.weight", "phi3")
 
@@ -120,4 +124,136 @@ def test_python_name_detection_prefers_specific_gemma_variants(monkeypatch):
     assert core.detect_architecture(_FakeReader({"general.name": "Gemma-2-9B"})) == "gemma"
     assert core.detect_architecture(_FakeReader({"general.name": "gemma2-9b"})) == "gemma2"
     assert core.detect_architecture(_FakeReader({"general.name": "gemma3-4b"})) == "gemma3"
+    assert core.detect_architecture(_FakeReader({"general.name": "Gemma4-E4B"})) == "gemma4"
+    assert core.detect_architecture(_FakeReader({"general.name": "Qwen3-8B"})) == "qwen3"
+    assert core.detect_architecture(_FakeReader({"general.name": "Qwen3.5-9B"})) == "qwen35"
+    assert core.detect_architecture(_FakeReader({"general.name": "Qwen3.6-9B"})) == "qwen36"
+    assert core.detect_architecture(_FakeReader({"general.name": "Qwen3.8-9B"})) == "qwen38"
     assert core.detect_architecture(_FakeReader({"general.name": "phi2"})) == "phi2"
+
+
+@pytest.mark.parametrize(
+    "arch,model_type",
+    [("gemma2", "gemma2"), ("gemma3", "gemma3")],
+)
+def test_gemma_2_and_3_configuration_and_norm_restore(arch, model_type):
+    metadata = {
+        f"{arch}.vocab_size": 32,
+        f"{arch}.embedding_length": 16,
+        f"{arch}.block_count": 1,
+        f"{arch}.attention.head_count": 4,
+        f"{arch}.attention.head_count_kv": 2,
+        f"{arch}.attention.key_length": 4,
+        f"{arch}.feed_forward_length": 32,
+        f"{arch}.context_length": 128,
+        f"{arch}.attention.layer_norm_rms_epsilon": 1e-6,
+        f"{arch}.attention.sliding_window": 64,
+    }
+    reader = _FakeReader(metadata)
+
+    config = core.build_config(reader, arch)
+
+    assert config["model_type"] == model_type
+    assert config["head_dim"] == 4
+    assert config["hidden_activation"] == "gelu_pytorch_tanh"
+    assert config["sliding_window"] == 64
+    assert config["attention_bias"] is False
+    assert config["tie_word_embeddings"] is True
+    np.testing.assert_array_equal(
+        core._restore_architecture_tensor(
+            "blk.0.attn_norm.weight", np.array([1.5]), arch
+        ),
+        np.array([0.5]),
+    )
+
+
+def test_gemma4_text_configuration_and_tensor_mapping():
+    reader = _FakeReader({
+        "gemma4.vocab_size": 32,
+        "gemma4.embedding_length": 16,
+        "gemma4.block_count": 2,
+        "gemma4.attention.head_count": 4,
+        "gemma4.attention.head_count_kv": 2,
+        "gemma4.attention.key_length": 8,
+        "gemma4.attention.key_length_swa": 4,
+        "gemma4.feed_forward_length": 32,
+        "gemma4.context_length": 128,
+        "gemma4.attention.layer_norm_rms_epsilon": 1e-6,
+        "gemma4.attention.sliding_window_pattern": [1, 0],
+    })
+
+    config = core.build_config(reader, "gemma4")
+
+    assert config["model_type"] == "gemma4_text"
+    assert config["head_dim"] == 4
+    assert config["global_head_dim"] == 8
+    assert config["layer_types"] == ["sliding_attention", "full_attention"]
+    assert core._map_tensor_name("blk.0.attn_post_norm.weight", "gemma4") == (
+        "model.layers.0.post_attention_layernorm.weight"
+    )
+    assert core._map_tensor_name("per_layer_token_embd.weight", "gemma4") == (
+        "model.embed_tokens_per_layer.weight"
+    )
+    assert core._map_tensor_name("blk.0.ffn_gate_inp.weight", "gemma4") == (
+        "model.layers.0.router.proj.weight"
+    )
+
+
+def test_qwen3_dense_and_qwen35_family_mappings_and_configuration():
+    assert core._map_tensor_name("blk.0.attn_q_norm.weight", "qwen3") == (
+        "model.layers.0.self_attn.q_norm.weight"
+    )
+    assert core._map_tensor_name("blk.0.ssm_beta.weight", "qwen35") == (
+        "model.layers.0.linear_attn.in_proj_b.weight"
+    )
+    assert core._map_tensor_name("blk.0.attn_q.weight", "qwen3.6") == (
+        "model.layers.0.self_attn.q_proj.weight"
+    )
+
+    config = core.build_config(_FakeReader({
+        "qwen35.vocab_size": 32,
+        "qwen35.embedding_length": 16,
+        "qwen35.block_count": 4,
+        "qwen35.attention.head_count": 4,
+        "qwen35.attention.head_count_kv": 2,
+        "qwen35.attention.key_length": 4,
+        "qwen35.feed_forward_length": 32,
+        "qwen35.context_length": 128,
+        "qwen35.attention.layer_norm_rms_epsilon": 1e-6,
+        "qwen35.ssm.group_count": 2,
+        "qwen35.ssm.time_step_rank": 4,
+        "qwen35.ssm.state_size": 8,
+        "qwen35.ssm.inner_size": 32,
+        "qwen35.ssm.conv_kernel": 4,
+        "qwen35.full_attention_interval": 4,
+        "qwen35.rope.dimension_sections": [1, 1, 1, 0],
+    }), "qwen3.5")
+
+    assert config["model_type"] == "qwen3_5"
+    assert config["linear_num_key_heads"] == 2
+    assert config["linear_num_value_heads"] == 4
+    assert config["linear_key_head_dim"] == 8
+    assert config["linear_value_head_dim"] == 8
+    assert config["full_attention_interval"] == 4
+
+
+def test_qwen35_restores_exported_gated_delta_parameters():
+    source = np.array([-np.e, -np.e**2], dtype=np.float32)
+
+    np.testing.assert_allclose(
+        core._restore_architecture_tensor("ssm_a", source, "qwen35"),
+        np.array([1.0, 2.0], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        core._restore_architecture_tensor(
+            "blk.0.ssm_norm.weight", np.array([1.25], dtype=np.float16), "qwen35"
+        ),
+        np.array([0.25], dtype=np.float16),
+    )
+
+
+def test_qwen3_dense_adapters_reject_expert_tensors():
+    reader = _FakeReader({}, tensor_names=["blk.0.ffn_gate_exps.weight"])
+
+    assert "dense layouts only" in core.validate_architecture_variant(reader, "qwen3")
+    assert "dense layouts only" in core.validate_architecture_variant(reader, "qwen35")
