@@ -100,12 +100,35 @@ python -m gguf2mlx.mixed_validation ./qwen3-moe-mixed
 # Float32 output
 gguf2mlx --input model.gguf --output ./mlx-model-f32 --dtype float32
 
+# Limit streamed shard payloads to 2 GiB
+gguf2mlx --input model.gguf --output ./mlx-model --max-shard-gb 2
+
 # Inspect metadata without writing weights
 gguf2mlx --input model.gguf --skip-weights
 
 # New command form (equivalent conversion subcommand)
 gguf2mlx convert --input model.gguf --output ./mlx-model
 ```
+
+Conversion reads GGUF tensor data through memory-mapped views and decodes/transforms
+one tensor (or one required fusion group) at a time. Output payloads are spooled to
+disk immediately rather than accumulated in a shard-sized array dictionary. Shard
+boundaries use **converted payload bytes**, including quantized weights, scales,
+and biases; the index records their actual total size.
+
+`--max-shard-gb` accepts a positive, finite size in GiB. Defaults remain 4.5 GB
+(decimal) for floating-point LLM conversion and 256 MiB for direct quantization
+and VLM conversion. A tensor larger than the limit occupies a shard by itself;
+safetensors headers add a small amount beyond the payload limit. This setting
+controls the converter's streaming stage, not a subsequent non-direct `mlx-lm`
+quantization stage.
+
+Memory is bounded by the largest active tensor/fusion group and transformation
+or quantization scratch space, **not strictly by the shard limit**. Header/index
+metadata grows with tensor count, and OS-managed memory-mapped pages may also
+appear in RSS. Finalizing a shard uses a bounded copy buffer and temporarily
+requires up to one extra shard of disk space. Failed conversions still discard
+the staging directory instead of publishing a partial model.
 
 ### VLM conversion: architecture-specific direct or hybrid paths
 
