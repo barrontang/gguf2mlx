@@ -8,7 +8,7 @@ Phase 1: Real weight extraction, safetensors output, architecture detection,
 
 import argparse
 import base64
-import gc
+import gc  # noqa: F401
 import hashlib
 import json
 import re
@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from .rust_backend import classify_architecture as rust_classify_architecture
 from .rust_backend import detect_architecture as rust_detect_architecture
+from .streaming import StreamingShardWriter
 
 # ---------------------------------------------------------------------------
 # Required imports with friendly error messages
@@ -44,7 +45,6 @@ except ImportError:
 
 try:
     from safetensors import safe_open
-    from safetensors.numpy import save_file as save_safetensors
 
     SAFETENSORS_AVAILABLE = True
 except ImportError:
@@ -1819,148 +1819,62 @@ def _finalize_safetensor_shards(output_dir: Path, total_bytes_out: int) -> tuple
     return len(weight_map), total_shards
 
 
-def extract_and_convert_weights(
-    reader: GGUFReader, arch: str, output_dir: Path, dtype: str = "float16"
-) -> None:
-    """Extract GGUF tensors, dequantize, rename, and save as safetensors."""
+def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
+    """Decode lazily, visiting related headers together to bound fusion buffers."""
+    groups: dict[str, list[Any]] = {}
+    for tensor in reader.tensors:
+        group = tensor.name
+        if arch == "phi3":
+            match = re.fullmatch(r"(blk\.\d+)\.attn_[qkv]\.weight", tensor.name)
+            if match:
+                group = match[1] + ".attn_qkv.weight"
+        elif arch in ("deepseek2", "deepseek3", "glm-dsa", "glm4moe"):
+            match = re.fullmatch(r"(blk\.\d+)\.attn_[kv]_b(?:\.weight)?", tensor.name)
+            if match:
+                group = match[1] + ".attn_kv_b.weight"
+        groups.setdefault(group, []).append(tensor)
 
-    print(f"\n  Converting {len(reader.tensors)} tensors...")
-    print(f"  Output dtype: {dtype}")
-
-    weights: dict[str, np.ndarray] = {}
-    all_keys: list[str] = []
-
-    skipped = 0
-    total_bytes_in = 0
-    total_bytes_out = 0
-    shard_idx = 1
-    current_shard_bytes = 0
-    max_shard_bytes = int(4.5 * 1e9)  # 4.5 GB per shard max for safetensors
-
-    # Progress bar
-    pbar = tqdm(total=len(reader.tensors), desc="  Converting", unit="tensor")
-
-    def _shard_filename(idx: int, total_final: int | None = None) -> str:
-        """Generate shard filename. When total is unknown, use NNNNN placeholder."""
-        if total_final is None:
-            return f"model-{idx:05d}-of-NNNNN.safetensors"
-        return f"model-{idx:05d}-of-{total_final:05d}.safetensors"
-
-    def _flush_shard(
-        shard_weights: dict[str, np.ndarray], shard_idx: int, total_shards: int | None
-    ) -> int:
-        """Write current shard to disk, clear dict, return bytes written. Returns byte count."""
-        if not shard_weights:
-            return 0
-        path = output_dir / _shard_filename(shard_idx, total_shards)
-        save_safetensors(shard_weights, str(path))
-        n_bytes = sum(arr.nbytes for arr in shard_weights.values())
-        shard_weights.clear()
-        gc.collect()
-        return n_bytes
-
-    # MLA dims needed for kv_b reconstruction (split k_b/v_b -> combined kv_b_proj)
     mla_dims = _read_mla_dims(reader, arch)
-    # Buffer for split kv_b pairs (deepseek2/3; glm-dsa fallback when combined absent)
     pending_kv_b: dict[str, dict[str, np.ndarray]] = {}
     pending_qkv: dict[str, dict[str, np.ndarray]] = {}
+    with tqdm(total=len(reader.tensors), desc="  Converting", unit="tensor") as pbar:
+        for tensors in groups.values():
+            for tensor in tensors:
+                arr = _decode_tensor_to_array(tensor, dtype, tensor.name)
+                if arr is None:
+                    raise RuntimeError(f"Failed to convert tensor {tensor.name}")
+                pairs = _plan_tensor_emit(
+                    tensor.name, arr, arch, mla_dims, pending_kv_b, pending_qkv,
+                )
+                for name, output in pairs:
+                    yield tensor.name, tensor.tensor_type, name, output
+                    del output
+                del arr, pairs
+                pbar.update(1)
+            if pending_qkv:
+                raise RuntimeError("Incomplete Phi-3 QKV tensor groups")
+            if pending_kv_b:
+                raise RuntimeError("Incomplete split kv_b tensor groups")
 
-    for i, tensor in enumerate(reader.tensors):
-        gguf_name = tensor.name
-        n_bytes = tensor.n_bytes
-        total_bytes_in += n_bytes
 
-        # Progress indicator
-        if (i + 1) % 50 == 0 or i == 0:
-            print(f"    [{i + 1}/{len(reader.tensors)}] Processing...")
-
-        try:
-            arr = _decode_tensor_to_array(tensor, dtype, gguf_name)
-            if arr is None:
-                skipped += 1
-                continue
-
-            # Determine output tensors (may be 0, 1, or many for arch-specific
-            # transforms such as kv_b concat and per-expert split).
-            emit_pairs = _plan_tensor_emit(
-                gguf_name,
-                arr,
-                arch,
-                mla_dims,
-                pending_kv_b,
-                pending_qkv,
-            )
-            for hf_name, out_arr in emit_pairs:
-                weights[hf_name] = out_arr
-                all_keys.append(hf_name)
-                total_bytes_out += out_arr.nbytes
-                current_shard_bytes += out_arr.nbytes
-
-                # Shard when approaching the per-shard byte limit
-                if current_shard_bytes >= max_shard_bytes:
-                    n_bytes = _flush_shard(weights, shard_idx, None)
-                    print(f"\n    ✓ Shard {shard_idx}: {len(all_keys)} tensors so far, {n_bytes / 1e9:.2f} GB")
-                    shard_idx += 1
-                    current_shard_bytes = 0
-                    weights = {}
-            pbar.update(1)
-
-        except Exception as e:  # noqa: BLE001
-            print(f"    ⚠ Error processing {gguf_name}: {e}")
-            skipped += 1
-            continue
-
-    pbar.close()
-
-    # --- Flush any orphaned split-kv_b pairs (defensive; shouldn't happen on valid GGUF) ---
-    if pending_kv_b:
-        for layer_idx, buf in pending_kv_b.items():
-            if "k" in buf and "v" in buf:
-                combined = _reconstruct_kv_b(
-                    buf["k"], buf["v"], mla_dims["num_heads"],
-                    mla_dims["qk_nope_head_dim"], mla_dims["v_head_dim"])
-                hf_name = f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight"
-                weights[hf_name] = combined
-                all_keys.append(hf_name)
-                total_bytes_out += combined.nbytes
-                print(f"    ⚠ Flushed orphaned kv_b for layer {layer_idx}")
-            else:
-                missing = "v" if "k" in buf else "k"
-                print(f"    ⚠ Unpaired {missing}_b at layer {layer_idx} — discarded")
-
-    if pending_qkv:
-        incomplete = ", ".join(
-            f"layer {layer_idx} ({'/'.join(sorted(parts))})"
-            for layer_idx, parts in sorted(pending_qkv.items())
-        )
-        raise RuntimeError(f"Incomplete Phi-3 QKV tensor groups: {incomplete}")
-
-    if skipped:
-        raise RuntimeError(f"Failed to convert {skipped} tensor(s); no partial model was published")
-
-    # --- IndexShare invariant: log Full-indexer layer count (glm-dsa) ---
-    if arch == "glm-dsa":
-        f_layers = _detect_full_indexer_layers(all_keys)
-        if f_layers:
-            print(f"    ℹ IndexShare: {len(f_layers)} Full-indexer layer(s): {f_layers}")
-        else:
-            print("    ℹ IndexShare: no indexer tensors found (all-Shared or non-DSA GGUF)")
-
-    # --- Save remaining tensors as final shard ---
-    if weights:
-        n_bytes = _flush_shard(weights, shard_idx, None)
-        if n_bytes:
-            print(f"    ✓ Shard {shard_idx}: {len(all_keys)} tensors total, {n_bytes / 1e9:.2f} GB")
-            shard_idx += 1
-
-    if not all_keys:
-        raise RuntimeError("No weights extracted!")
-
-    indexed_keys, total_shards = _finalize_safetensor_shards(output_dir, total_bytes_out)
-
-    print(f"\n  ✓ Saved {indexed_keys} weight tensors ({total_shards} shards)")
-    print(f"    Total input:  {total_bytes_in / 1e9:.2f} GB (GGUF)")
-    print(f"    Total output: {total_bytes_out / 1e9:.2f} GB (safetensors)")
+def extract_and_convert_weights(
+    reader: GGUFReader, arch: str, output_dir: Path, dtype: str = "float16",
+    max_shard_bytes: int = int(4.5 * 1e9),
+) -> None:
+    """Extract, transform, and stream tensors without buffering a shard in RAM."""
+    print(f"\n  Converting {len(reader.tensors)} tensors...")
+    print(f"  Output dtype: {dtype}")
+    with StreamingShardWriter(output_dir, max_shard_bytes) as writer:
+        for _, _, name, array in _iter_weight_arrays(reader, arch, dtype):
+            writer.add(name, array)
+            del array
+        if arch == "glm-dsa":
+            layers = _detect_full_indexer_layers(list(writer.weight_map))
+            print(f"    ℹ IndexShare: {len(layers)} Full-indexer layer(s): {layers}")
+        writer.finish()
+    print(f"\n  ✓ Saved {len(writer.weight_map)} weight tensors ({len(writer.files)} shards)")
+    print(f"    Total input:  {sum(t.n_bytes for t in reader.tensors) / 1e9:.2f} GB (GGUF)")
+    print(f"    Total output: {writer.total / 1e9:.2f} GB (safetensors)")
 
 
 def extract_and_convert_weights_direct_quant(
@@ -1974,6 +1888,7 @@ def extract_and_convert_weights_direct_quant(
     architecture_kind: str = "dense",
     moe_router_protect: bool = True,
     mixed_precision: bool = False,
+    max_shard_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Bounded-memory direct quantization path for supported linear weights."""
     if q_bits != 4 or q_group_size != 64 or q_mode != "affine":
@@ -1982,145 +1897,69 @@ def extract_and_convert_weights_direct_quant(
         )
 
     np_dtype = np.float16 if dtype == "float16" else np.float32
-    weights: dict[str, np.ndarray] = {}
-    total_bytes_in = 0
-    total_bytes_out = 0
-    current_shard_bytes = 0
-    shard_idx = 1
-    skipped = 0
     quantized_tensors = 0
     fallback_tensors = 0
     decisions: list[dict[str, Any]] = []
     protected_routers: list[dict[str, Any]] = []
     compressed_experts: list[dict[str, Any]] = []
     unknown_tensors: list[str] = []
-    max_shard_bytes = DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES
+    if max_shard_bytes is None:
+        max_shard_bytes = DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES
 
-    pbar = tqdm(total=len(reader.tensors), desc="  Direct quantizing", unit="tensor")
+    with StreamingShardWriter(output_dir, max_shard_bytes) as writer:
+        for gguf_name, qtype, hf_name, out_arr in _iter_weight_arrays(reader, arch, dtype):
+            category = classify_tensor(gguf_name, hf_name)
+            protected = (
+                architecture_kind in {"moe", "hybrid"}
+                and moe_router_protect
+                and category == "router"
+            ) or (mixed_precision and category in {"router", "attention"})
+            quantizable = _is_direct_quantizable_linear_weight(hf_name, out_arr)
+            should_quantize = quantizable and not protected
+            precision: int | str = 4 if should_quantize else dtype
 
-    def _shard_filename(idx: int, total_final: int | None = None) -> str:
-        if total_final is None:
-            return f"model-{idx:05d}-of-NNNNN.safetensors"
-        return f"model-{idx:05d}-of-{total_final:05d}.safetensors"
+            if should_quantize:
+                qtype_val = int(qtype)
+                if qtype_val not in DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES:
+                    raise RuntimeError(
+                        f"Unsupported source quantization for direct quantization: "
+                        f"{gguf_name} has qtype={qtype_val}; supported: "
+                        f"{sorted(DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES)}"
+                    )
+                packed, scales, biases = _quantize_affine_4bit(out_arr, q_group_size)
+                base = hf_name.removesuffix(".weight")
+                writer.add(f"{base}.weight", packed)
+                writer.add(f"{base}.scales", scales.astype(np_dtype))
+                writer.add(f"{base}.biases", biases.astype(np_dtype))
+                del packed, scales, biases
+                quantized_tensors += 1
+            else:
+                writer.add(hf_name, out_arr)
+                fallback_tensors += 1
+            del out_arr
 
-    def _flush_shard(shard_weights: dict[str, np.ndarray], index: int) -> int:
-        if not shard_weights:
-            return 0
-        path = output_dir / _shard_filename(index, None)
-        save_safetensors(shard_weights, str(path))
-        n_bytes = sum(arr.nbytes for arr in shard_weights.values())
-        shard_weights.clear()
-        gc.collect()
-        return n_bytes
+            decision = {
+                "source_name": gguf_name,
+                "output_name": hf_name,
+                "category": category,
+                "precision": precision,
+                "protected": protected,
+            }
+            decisions.append(decision)
+            if category == "router" and protected:
+                protected_routers.append(decision)
+            if category == "expert_mlp" and should_quantize:
+                compressed_experts.append(decision)
+            if category == "unknown":
+                unknown_tensors.append(gguf_name)
+        writer.finish()
 
-    mla_dims = _read_mla_dims(reader, arch)
-    pending_kv_b: dict[str, dict[str, np.ndarray]] = {}
-    pending_qkv: dict[str, dict[str, np.ndarray]] = {}
-
-    for tensor in reader.tensors:
-        gguf_name = tensor.name
-        total_bytes_in += tensor.n_bytes
-        try:
-            arr = _decode_tensor_to_array(tensor, dtype, gguf_name)
-            if arr is None:
-                skipped += 1
-                continue
-
-            emit_pairs = _plan_tensor_emit(
-                gguf_name,
-                arr,
-                arch,
-                mla_dims,
-                pending_kv_b,
-                pending_qkv,
-            )
-            qtype_val = int(tensor.tensor_type)
-            for hf_name, out_arr in emit_pairs:
-                category = classify_tensor(gguf_name, hf_name)
-                protected = (
-                    architecture_kind in {"moe", "hybrid"}
-                    and moe_router_protect
-                    and category == "router"
-                ) or (mixed_precision and category in {"router", "attention"})
-                quantizable = _is_direct_quantizable_linear_weight(hf_name, out_arr)
-                should_quantize = quantizable and not protected
-                precision: int | str = 4 if should_quantize else dtype
-
-                if should_quantize:
-                    if qtype_val not in DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES:
-                        raise RuntimeError(
-                            f"Unsupported source quantization for direct quantization: "
-                            f"{gguf_name} has qtype={qtype_val}; supported: "
-                            f"{sorted(DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES)}"
-                        )
-                    packed, scales, biases = _quantize_affine_4bit(out_arr, q_group_size)
-                    base = hf_name.removesuffix(".weight")
-                    quantized_entries = {
-                        f"{base}.weight": packed,
-                        f"{base}.scales": scales.astype(np_dtype),
-                        f"{base}.biases": biases.astype(np_dtype),
-                    }
-                    for name, value in quantized_entries.items():
-                        weights[name] = value
-                        total_bytes_out += value.nbytes
-                        current_shard_bytes += value.nbytes
-                    quantized_tensors += 1
-                else:
-                    weights[hf_name] = out_arr
-                    total_bytes_out += out_arr.nbytes
-                    current_shard_bytes += out_arr.nbytes
-                    fallback_tensors += 1
-
-                decision = {
-                    "source_name": gguf_name,
-                    "output_name": hf_name,
-                    "category": category,
-                    "precision": precision,
-                    "protected": protected,
-                }
-                decisions.append(decision)
-                if category == "router" and protected:
-                    protected_routers.append(decision)
-                if category == "expert_mlp" and should_quantize:
-                    compressed_experts.append(decision)
-                if category == "unknown":
-                    unknown_tensors.append(gguf_name)
-
-                if current_shard_bytes >= max_shard_bytes:
-                    _flush_shard(weights, shard_idx)
-                    shard_idx += 1
-                    current_shard_bytes = 0
-            pbar.update(1)
-        except Exception as error:  # noqa: BLE001
-            print(f"    ⚠ Error processing {gguf_name}: {error}")
-            skipped += 1
-
-    pbar.close()
-
-    if pending_qkv:
-        incomplete = ", ".join(
-            f"layer {layer_idx} ({'/'.join(sorted(parts))})"
-            for layer_idx, parts in sorted(pending_qkv.items())
-        )
-        raise RuntimeError(f"Incomplete Phi-3 QKV tensor groups: {incomplete}")
-
-    if pending_kv_b:
-        raise RuntimeError("Incomplete split kv_b tensor groups in direct quantization path")
-
-    if skipped:
-        raise RuntimeError(
-            f"Failed to convert {skipped} tensor(s); no partial model was published"
-        )
-
-    if weights:
-        _flush_shard(weights, shard_idx)
-
-    indexed_keys, total_shards = _finalize_safetensor_shards(output_dir, total_bytes_out)
-    print(f"\n  ✓ Direct quantization wrote {indexed_keys} tensors across {total_shards} shards")
+    print(f"\n  ✓ Direct quantization wrote {len(writer.weight_map)} tensors "
+          f"across {len(writer.files)} shards")
     print(f"    Quantized projection tensors: {quantized_tensors}")
     print(f"    Fallback non-projection tensors: {fallback_tensors}")
-    print(f"    Total input:  {total_bytes_in / 1e9:.2f} GB (GGUF)")
-    print(f"    Total output: {total_bytes_out / 1e9:.2f} GB (safetensors)")
+    print(f"    Total input:  {sum(t.n_bytes for t in reader.tensors) / 1e9:.2f} GB (GGUF)")
+    print(f"    Total output: {writer.total / 1e9:.2f} GB (safetensors)")
     if unknown_tensors:
         print(
             "    ⚠ Unclassified block tensors retained without policy assumptions: "
@@ -2155,6 +1994,7 @@ def _convert_direct_quantized(
     q_mode: str,
     moe_router_protect: bool = True,
     mixed_precision: bool = False,
+    max_shard_bytes: int | None = None,
 ) -> bool:
     """Convert GGUF directly into quantized MLX-LM-compatible shards."""
     gguf_file = Path(gguf_path)
@@ -2207,6 +2047,7 @@ def _convert_direct_quantized(
             architecture_kind=architecture_kind,
             moe_router_protect=moe_router_protect,
             mixed_precision=mixed_precision,
+            max_shard_bytes=max_shard_bytes,
         )
     except Exception as error:  # noqa: BLE001
         print(f"❌ Direct quantization failed: {error}")
@@ -2248,7 +2089,10 @@ def _convert_direct_quantized(
 # ---------------------------------------------------------------------------
 
 
-def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
+def _convert(
+    gguf_path: str, output_dir: str, dtype: str = "float16",
+    max_shard_bytes: int = int(4.5 * 1e9),
+) -> bool:
     """Convert a GGUF file to MLX-compatible safetensors format."""
 
     gguf_file = Path(gguf_path)
@@ -2350,7 +2194,7 @@ def _convert(gguf_path: str, output_dir: str, dtype: str = "float16") -> bool:
     # Step 4: Extract, dequantize, and convert weights
     print("\n[4/5] Extracting and converting weights...")
     try:
-        extract_and_convert_weights(reader, arch, output_path, dtype)
+        extract_and_convert_weights(reader, arch, output_path, dtype, max_shard_bytes)
     except Exception as e:  # noqa: BLE001
         print(f"❌ Weight extraction failed: {e}")
         return False
@@ -2432,8 +2276,19 @@ def convert(
     hf_revision: str = "main",
     offline: bool = False,
     preserve_source_quant: bool = False,
+    max_shard_gb: float | None = None,
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
+    shard_options = {}
+    if max_shard_gb is not None:
+        if not np.isfinite(max_shard_gb) or max_shard_gb <= 0:
+            print("❌ max_shard_gb must be finite and positive")
+            return False
+        max_shard_bytes = int(max_shard_gb * 1024**3)
+        if max_shard_bytes < 1:
+            print("❌ max_shard_gb must specify at least one byte")
+            return False
+        shard_options["max_shard_bytes"] = max_shard_bytes
     if quantize and q_group_size not in SUPPORTED_MLX_LM_Q_GROUP_SIZES:
         supported = ", ".join(str(size) for size in sorted(SUPPORTED_MLX_LM_Q_GROUP_SIZES))
         print(f"❌ Unsupported q_group_size={q_group_size}; supported values: {supported}")
@@ -2503,6 +2358,7 @@ def convert(
                     hf_fallback_vision=hf_fallback_vision,
                     hf_revision=hf_revision,
                     offline=offline,
+                    **shard_options,
                     **vlm_quant_options,
                 )
             except Exception as error:  # noqa: BLE001
@@ -2527,6 +2383,7 @@ def convert(
                     q_mode=q_mode,
                     moe_router_protect=moe_router_protect,
                     mixed_precision=mixed_precision,
+                    **shard_options,
                 )
             except Exception as error:  # noqa: BLE001
                 print(f"❌ Conversion failed: {error}")
@@ -2536,7 +2393,7 @@ def convert(
             final_stage_path = direct_quantized_output_path
         else:
             try:
-                succeeded = _convert(gguf_path, str(fp_output_path), dtype)
+                succeeded = _convert(gguf_path, str(fp_output_path), dtype, **shard_options)
             except Exception as error:  # noqa: BLE001
                 print(f"❌ Conversion failed: {error}")
                 return False
@@ -2806,6 +2663,14 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
         help="Output data type (default: float16)",
     )
     parser.add_argument(
+        "--max-shard-gb",
+        type=float,
+        help=(
+            "Maximum streamed shard payload in GiB (oversized tensors remain whole; "
+            "defaults: float LLM 4.5 GB, direct-quant/VLM 256 MiB)"
+        ),
+    )
+    parser.add_argument(
         "--quantize",
         action="store_true",
         help="Quantize MLX output (VLM requires --direct-quant; quantizes language projections only)",
@@ -2899,6 +2764,7 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         hf_revision=args.hf_revision,
         offline=args.offline,
         preserve_source_quant=args.preserve_source_quant,
+        max_shard_gb=args.max_shard_gb,
     )
     return 0 if success else 1
 

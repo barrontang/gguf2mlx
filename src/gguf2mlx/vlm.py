@@ -18,9 +18,9 @@ import numpy as np
 from gguf import GGMLQuantizationType, GGUFReader
 from gguf.quants import Q4_K, dequantize
 from safetensors import safe_open
-from safetensors.numpy import save_file
 
 from . import gguf2mlx as core
+from .streaming import StreamingShardWriter
 
 # Detection is deliberately broader than the conversion registry.
 VLM_ARCHITECTURES = {
@@ -648,35 +648,12 @@ def _read_hf_tensor(weights: Any, path: Path, name: str) -> np.ndarray:
     return (values.astype(np.uint32) << 16).view(np.float32).reshape(tensor.get_shape())
 
 
-class _ShardWriter:
-    def __init__(self, root: Path):
-        self.root = root
-        self.pending: dict[str, np.ndarray] = {}
-        self.size = 0
-        self.total = 0
-        self.files: list[Path] = []
-        self.weight_map: dict[str, str] = {}
-
-    def add(self, name: str, array: np.ndarray) -> None:
-        if self.pending and self.size + array.nbytes > SHARD_BYTES:
-            self.flush()
-        self.pending[name] = array
-        self.size += array.nbytes
-        self.total += array.nbytes
-
-    def flush(self) -> None:
-        if not self.pending:
-            return
-        name = f"model-{len(self.files) + 1:05d}.safetensors"
-        path = self.root / name
-        save_file(self.pending, str(path), metadata={"format": "np"})
-        self.files.append(path)
-        self.weight_map.update({key: name for key in self.pending})
-        self.pending = {}
-        self.size = 0
+class _ShardWriter(StreamingShardWriter):
+    def __init__(self, root: Path, max_shard_bytes: int | None = None):
+        super().__init__(root, SHARD_BYTES if max_shard_bytes is None else max_shard_bytes)
 
     def finish(self) -> None:
-        self.flush()
+        super().finish()
         if len(self.files) == 1:
             renamed = self.root / "model.safetensors"
             self.files[0].rename(renamed)
@@ -735,6 +712,7 @@ def convert_vlm(
     q_group_size: int = 64,
     q_mode: str = "affine",
     preserve_source_quant: bool = False,
+    max_shard_bytes: int | None = None,
 ) -> None:
     """Convert supported VLMs to mlx-vlm weights in the caller's staging dir."""
     if dtype not in ("float16", "float32"):
@@ -809,7 +787,7 @@ def convert_vlm(
     output_path.mkdir(parents=True, exist_ok=True)
     if any(output_path.iterdir()):
         raise ValueError("VLM conversion output must be an empty staging directory")
-    writer = _ShardWriter(output_path)
+    writer = _ShardWriter(output_path, max_shard_bytes)
     quantized: list[str] = []
     source_precision: dict[str, dict] = {}
     qwen_tensors: dict[str, Any] = {}
