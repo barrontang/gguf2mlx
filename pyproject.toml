@@ -14,9 +14,6 @@ keywords = [
     "llama.cpp",
     "model-conversion",
 ]
-authors = [
-    {name = "Barron Tang", email = "barrontom2011@gmail.com"},
-]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",

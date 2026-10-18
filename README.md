@@ -1012,7 +1012,7 @@ users discover it.
 
 ## License
 
-Apache-2.0 © [Barron Tang](https://github.com/barrontang)
+Apache-2.0
 
 ---
 
