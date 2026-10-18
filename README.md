@@ -9,6 +9,8 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-orange)](https://github.com/barrontang/gguf2mlx)
 [![Validation](https://img.shields.io/badge/conversion-strict-purple)](https://github.com/barrontang/gguf2mlx)
+[![Clones](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fbarrontang%2F69d5290820f2cdef0a444118f04febcb%2Fraw%2Fclones.json)](https://barrontang.github.io/gguf2mlx/stats/)
+[![Views](https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fbarrontang%2F69d5290820f2cdef0a444118f04febcb%2Fraw%2Fviews.json)](https://barrontang.github.io/gguf2mlx/stats/)
 
 **GGUF → HF-style safetensors, with explicit architecture contracts and no silent precision downgrade.**
 
