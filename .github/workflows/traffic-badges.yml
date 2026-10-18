@@ -1,5 +1,7 @@
 # Adapted from github-traffic-tracker v0.3.11-alpha; GPL-3.0-or-later.
 # See LICENSES/GPL-3.0.txt and https://github.com/djdarcy/github-traffic-tracker.
+name: Track Downloads & Clones
+
 on:
   schedule:
     - cron: "0 3 * * *"  # Daily at 3am UTC
@@ -7,7 +9,7 @@ on:
   push:                    # Auto-refresh on push (rate-limited, see freshness check below)
     branches: [main]
   # workflow_run:            # Uncomment and set your CI workflow name to run after CI
-  #   workflows: ["CI"]
+  #   workflows: ["traffic"]
   #   types: [completed]
 
 permissions: {}

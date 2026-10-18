@@ -1,6 +1,6 @@
 # Project Statistics Dashboard
 
-Interactive dashboard showing traffic analytics for [gguf2mlx](https://github.com/barrontang/gguf2mlx).
+Interactive dashboard showing traffic analytics for [Gguf2Mlx](https://github.com/barrontang/gguf2mlx).
 
 ## How It Works
 
