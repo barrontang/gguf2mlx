@@ -24,6 +24,7 @@ uv.lock
 .mypy_cache/
 .ruff_cache/
 rust/gguf2mlx-rs/target/
+.vscode/settings.json
 
 # Tracing artifacts (regenerable: synth via make_synth_trace.py, smoke via run_trace_task_suite.sh, batch via run_trace_suite_batched.sh)
 traces/synth/
