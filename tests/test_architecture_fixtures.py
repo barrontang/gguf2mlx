@@ -40,6 +40,90 @@ def _load_fixture(name: str) -> dict:
     return json.loads((FIXTURE_DIR / f"{name}.json").read_text(encoding="utf-8"))
 
 
+@pytest.fixture
+def deepseek_v2_metadata():
+    return {
+        "deepseek2.vocab_size": 102400,
+        "deepseek2.embedding_length": 2048,
+        "deepseek2.block_count": 27,
+        "deepseek2.context_length": 163840,
+        "deepseek2.attention.head_count": 16,
+        "deepseek2.attention.key_length": 192,
+        "deepseek2.attention.value_length": 128,
+        "deepseek2.attention.kv_lora_rank": 512,
+        "deepseek2.feed_forward_length": 10944,
+        "deepseek2.expert_feed_forward_length": 1408,
+        "deepseek2.expert_count": 64,
+        "deepseek2.expert_shared_count": 2,
+        "deepseek2.expert_used_count": 6,
+        "deepseek2.leading_dense_block_count": 1,
+        "deepseek2.rope.dimension_count": 64,
+        "deepseek2.rope.scaling.type": "yarn",
+        "deepseek2.rope.scaling.factor": 40.0,
+        "deepseek2.rope.scaling.original_context_length": 4096,
+        "deepseek2.rope.scaling.yarn_log_multiplier": 0.0707,
+    }
+
+
+def test_deepseek_v2_config_preserves_mla_dense_experts_and_yarn(deepseek_v2_metadata):
+    config = core.build_config(_FakeReader(deepseek_v2_metadata), "deepseek2")
+    expected = {
+        "intermediate_size": 10944,
+        "moe_intermediate_size": 1408,
+        "n_routed_experts": 64,
+        "n_shared_experts": 2,
+        "first_k_dense_replace": 1,
+        "q_lora_rank": None,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "qk_nope_head_dim": 128,
+        "v_head_dim": 128,
+        "routed_scaling_factor": 1.0,
+        "topk_method": "greedy",
+    }
+    for key, value in expected.items():
+        assert config[key] == value
+    assert config["rope_scaling"]["type"] == "yarn"
+    assert config["rope_scaling"]["factor"] == 40.0
+    assert config["rope_scaling"]["original_max_position_embeddings"] == 4096
+    assert config["rope_scaling"]["mscale"] == pytest.approx(0.707)
+    assert config["rope_scaling"]["mscale_all_dim"] == pytest.approx(0.707)
+
+
+def test_deepseek_v2_config_preserves_query_lora_and_unscaled_rope(deepseek_v2_metadata):
+    deepseek_v2_metadata["deepseek2.attention.q_lora_rank"] = 1536
+    del deepseek_v2_metadata["deepseek2.rope.scaling.type"]
+    config = core.build_config(_FakeReader(deepseek_v2_metadata), "deepseek2")
+    assert config["q_lora_rank"] == 1536
+    assert config["rope_scaling"] == {"type": "yarn", "factor": 1.0}
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("attention.kv_lora_rank", None, "requires positive attention.kv_lora_rank"),
+        ("expert_feed_forward_length", 0, "requires positive expert_feed_forward_length"),
+        ("rope.dimension_count", 192, "rotary dimension"),
+        ("leading_dense_block_count", -1, "dense block count"),
+        ("leading_dense_block_count", 28, "dense block count"),
+        ("expert_shared_count", -1, "shared expert count"),
+        ("attention.q_lora_rank", 0, "query LoRA rank"),
+        ("expert_weights_scale", float("nan"), "expert weights scale"),
+        ("rope.scaling.type", "linear", "Unsupported DeepSeek-V2 rope scaling"),
+        ("rope.scaling.factor", None, "YaRN factor"),
+        ("rope.scaling.factor", float("inf"), "YaRN factor"),
+        ("rope.scaling.yarn_log_multiplier", -0.1, "YaRN log multiplier"),
+        ("rope.scaling.original_context_length", None, "requires positive"),
+    ],
+)
+def test_deepseek_v2_config_rejects_invalid_metadata(
+    deepseek_v2_metadata, key, value, message,
+):
+    deepseek_v2_metadata[f"deepseek2.{key}"] = value
+    with pytest.raises(ValueError, match=message):
+        core.build_config(_FakeReader(deepseek_v2_metadata), "deepseek2")
+
+
 @pytest.mark.parametrize("fixture_name", ["gemma", "phi3", "phi4"])
 def test_architecture_fixture_config_and_tensor_map(fixture_name: str):
     fixture = _load_fixture(fixture_name)

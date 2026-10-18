@@ -516,7 +516,8 @@ def _extract_router_logits(model, token_ids: list[int]) -> np.ndarray:
     def capture(module, *args, **kwargs):
         result = original_call(module, *args, **kwargs)
         if module is gate:
-            captured.append(result)
+            # DeepSeek's gate returns top-k indices/scores, not its raw logits.
+            captured.append(args[0] @ module.weight.T if isinstance(result, tuple) else result)
         return result
 
     with pytest.MonkeyPatch.context() as patch:
@@ -524,6 +525,62 @@ def _extract_router_logits(model, token_ids: list[int]) -> np.ndarray:
         mx.eval(model(mx.array([token_ids], dtype=mx.int32)))
     assert len(captured) == 1, "Expected exactly one first-layer router evaluation"
     return np.asarray(captured[0])
+
+
+@pytest.mark.parametrize("tuple_gate", [False, True])
+def test_router_probe_captures_raw_logits(tuple_gate):
+    from types import SimpleNamespace
+
+    import mlx.core as mx
+
+    class Gate:
+        weight = mx.array([[1.0, 2.0, 3.0], [-3.0, 0.0, 2.0]])
+
+        def __call__(self, inputs):
+            logits = inputs @ self.weight.T
+            if tuple_gate:
+                return mx.argmax(logits, axis=-1), mx.softmax(logits, axis=-1)
+            return logits
+
+    class Model:
+        def __init__(self):
+            self.layers = [SimpleNamespace(mlp=SimpleNamespace(gate=Gate()))]
+
+        def __call__(self, tokens):
+            inputs = mx.broadcast_to(tokens[..., None], (*tokens.shape, 3))
+            result = self.layers[0].mlp.gate(inputs.astype(mx.float32))
+            return result[1] if tuple_gate else result
+
+    logits = _extract_router_logits(Model(), [1, 2])
+    np.testing.assert_array_equal(logits, [[[6.0, -1.0], [12.0, -2.0]]])
+
+
+def _assert_valid_generated_text(output: str) -> None:
+    assert output.strip(), "Generated output is empty or whitespace-only"
+    assert all(
+        character.isprintable() or character in "\n\r\t" for character in output
+    ), "Generated output contains unexpected control characters"
+
+
+@pytest.mark.parametrize(
+    ("output", "valid"),
+    [
+        ("The sky is blue.", True),
+        ("<think>\nReasoning\n</think>\n\nThe sky is blue.", True),
+        ("Line one\r\n\tLine two", True),
+        ("", False),
+        (" \n\r\t", False),
+        ("text\x00", False),
+        ("text\x1b[31m", False),
+        ("text\x7f", False),
+    ],
+)
+def test_generated_text_validation(output: str, valid: bool):
+    if valid:
+        _assert_valid_generated_text(output)
+    else:
+        with pytest.raises(AssertionError):
+            _assert_valid_generated_text(output)
 
 
 @pytest.mark.parametrize("arch", ["qwen2moe", "qwen3moe", "deepseek2"])
@@ -570,7 +627,7 @@ def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
         )
     output = generate(model, tokenizer, prompt=prompt, max_tokens=32)
     generated_tokens = tokenizer.encode(output, add_special_tokens=False)
-    assert output.isprintable()
+    _assert_valid_generated_text(output)
     assert len(set(generated_tokens)) >= max(2, len(generated_tokens) // 8)
     if report_dir := os.getenv("GGUF2MLX_MOE_REPORT_DIR"):
         directory = Path(report_dir)
@@ -598,7 +655,10 @@ def test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output(
             "generated_text": output,
             "generated_token_count": len(generated_tokens),
             "generated_unique_tokens": len(set(generated_tokens)),
-            "generation_checks": "printable and non-degenerate; not a semantic-quality proof",
+            "generation_checks": (
+                "nonempty, printable (allowing line breaks and tabs), and non-degenerate; "
+                "not a semantic-quality proof"
+            ),
             "platform": platform.platform(),
             "packages": {
                 name: importlib.metadata.version(name)

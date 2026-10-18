@@ -770,6 +770,70 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
                         raise ValueError(f"Qwen2MoE {metadata_key} disagrees with tensor shapes")
                     config[config_key] = inferred
 
+    if arch == "deepseek2":
+        def required_int(key: str) -> int:
+            value = get_metadata_int(reader, f"{arch}.{key}")
+            if value is None or value <= 0:
+                raise ValueError(f"DeepSeek-V2 requires positive {key} metadata")
+            return value
+
+        rotary_dim = required_int("rope.dimension_count")
+        key_dim = required_int("attention.key_length")
+        if rotary_dim >= key_dim:
+            raise ValueError("DeepSeek-V2 rotary dimension must be smaller than key length")
+        dense_layers = get_metadata_int(reader, f"{arch}.leading_dense_block_count")
+        dense_layers = 0 if dense_layers is None else dense_layers
+        if not 0 <= dense_layers <= num_layers:
+            raise ValueError("DeepSeek-V2 leading dense block count is out of range")
+        shared_experts = get_metadata_int(reader, f"{arch}.expert_shared_count")
+        if shared_experts is not None and shared_experts < 0:
+            raise ValueError("DeepSeek-V2 shared expert count must be nonnegative")
+        query_rank = get_metadata_int(reader, f"{arch}.attention.q_lora_rank")
+        if query_rank is not None and query_rank <= 0:
+            raise ValueError("DeepSeek-V2 query LoRA rank must be positive when present")
+        routed_scale = get_metadata_float(reader, f"{arch}.expert_weights_scale")
+        routed_scale = 1.0 if routed_scale is None else routed_scale
+        if not np.isfinite(routed_scale) or routed_scale <= 0:
+            raise ValueError("DeepSeek-V2 expert weights scale must be finite and positive")
+        config.update({
+            "intermediate_size": required_int("feed_forward_length"),
+            "moe_intermediate_size": required_int("expert_feed_forward_length"),
+            "n_routed_experts": required_int("expert_count"),
+            "n_shared_experts": shared_experts or None,
+            "first_k_dense_replace": dense_layers,
+            "q_lora_rank": query_rank,
+            "kv_lora_rank": required_int("attention.kv_lora_rank"),
+            "qk_rope_head_dim": rotary_dim,
+            "qk_nope_head_dim": key_dim - rotary_dim,
+            "v_head_dim": required_int("attention.value_length"),
+            "routed_scaling_factor": routed_scale,
+            "topk_method": "greedy",
+        })
+        scaling_type = get_metadata_str(reader, f"{arch}.rope.scaling.type")
+        if scaling_type not in (None, "none", "yarn"):
+            raise ValueError(f"Unsupported DeepSeek-V2 rope scaling type: {scaling_type!r}")
+        # MLX-LM's DeepSeek-V2 attention requires a scaling dictionary even at factor 1.
+        config["rope_scaling"] = {"type": "yarn", "factor": 1.0}
+        if scaling_type == "yarn":
+            factor = get_metadata_float(reader, f"{arch}.rope.scaling.factor")
+            log_multiplier = get_metadata_float(
+                reader, f"{arch}.rope.scaling.yarn_log_multiplier"
+            )
+            log_multiplier = 0.1 if log_multiplier is None else log_multiplier
+            if factor is None or not np.isfinite(factor) or factor <= 0:
+                raise ValueError("DeepSeek-V2 YaRN factor must be finite and positive")
+            if not np.isfinite(log_multiplier) or log_multiplier < 0:
+                raise ValueError("DeepSeek-V2 YaRN log multiplier must be finite and nonnegative")
+            # GGUF stores 0.1 * the HF YaRN mscale coefficient.
+            config["rope_scaling"].update({
+                "factor": factor,
+                "original_max_position_embeddings": required_int(
+                    "rope.scaling.original_context_length"
+                ),
+                "mscale": log_multiplier / 0.1,
+                "mscale_all_dim": log_multiplier / 0.1,
+            })
+
     if arch in {"gemma", "gemma2", "gemma3"}:
         config["head_dim"] = (
             get_metadata_int(reader, f"{arch}.attention.key_length")

@@ -560,8 +560,8 @@ MiniCPM-V 4.7 1B adapter.
 | Llama | `llama`, `mistral` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen | `qwen2`, dense `qwen3` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen3.5 family | `qwen35`; aliases `qwen3_5`, `qwen3.5`, `qwen36`, `qwen3_6`, `qwen3.6`, `qwen38`, `qwen3_8`, `qwen3.8` | ✅ dense layouts | Portable fixtures; native runtime unverified | ❌ | — | ✅ generic package/verify | ❌ |
-| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 real GGUF; Qwen3-30B-A3B uniform 4-bit smoke validated (see caveat below) | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
-| DeepSeek | `deepseek2`, `deepseek3` | ✅ | ⚠️ scheduled opt-in | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 and Qwen3-30B-A3B real-GGUF uniform 4-bit smoke tests | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| DeepSeek | `deepseek2`, `deepseek3` | ✅ | ✅ V2 Lite real Q2_K smoke test; V3 runtime unverified | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | GLM | `glm4moe` | ✅ | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | Gemma | `gemma`, `gemma2`, `gemma3`, text-only `gemma4` | ✅ | Portable conversion fixtures; native runtime unverified | Gemma4 MoE layout supported | — | ✅ generic package/verify | ❌ |
 | Phi | `phi3` (Phi-3 and Phi-4; Phi-4 alias) | ✅ Phi-3 4K/LongRoPE and Phi-4 fixtures | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
@@ -587,31 +587,51 @@ On 2026-10-18, `Qwen3-30B-A3B-Q4_K_M.gguf` from
 was converted and exercised on Apple Silicon with 64 GiB unified memory.
 The source is 18,556,686,912 bytes, with SHA-256
 `9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48`.
-The validation used `gguf` 0.19.0, `mlx` 0.31.2, `mlx-lm` 0.31.3, and
-`numpy` 2.2.6.
+The passing pytest rerun used `gguf` 0.19.0, `mlx` 0.32.2, `mlx-lm` 0.31.3,
+and `numpy` 2.4.6.
 
 | Check | Observed result |
 |---|---|
 | Mixed-precision conversion and artifact contract | Passed; 48 protected router tensors and 144 compressed expert tensors |
 | Uniform direct 4-bit conversion and MLX-LM loading | Passed |
 | Uniform-model logits | All finite; shape `[1, 8, 151936]` |
-| First-layer router logits | Shape `[1, 8, 128]`; normalized entropy `0.895747`, within the required `(0.05, 0.95)` interval |
-| Follow-up generation with `enable_thinking=False` | 128 tokens, 83 unique tokens; explained Rayleigh scattering before reaching the token limit |
+| First-layer router logits | Shape `[1, 8, 128]`; normalized entropy `0.895546`, within the required `(0.05, 0.95)` interval |
+| Default thinking-mode generation | 32 tokens, 28 unique tokens; begins normal `<think>` reasoning before reaching the token limit |
 
-**Test caveat:** the existing real-MoE pytest did not pass: its
-`output.isprintable()` assertion rejects the normal newline after Qwen3's
-`<think>` marker. Both conversions, mixed-artifact validation, finite logits,
-and router entropy passed before that assertion. A separate follow-up on the
-saved uniform model passed text-validity checks allowing line breaks and tabs,
-plus the existing token-diversity threshold. This is a smoke test, not a
-semantic-quality benchmark or a passing result for the unmodified pytest.
+**Historical test failure, now fixed:** the original `output.isprintable()`
+assertion rejected the normal newline after Qwen3's `<think>` marker. The test
+now accepts line breaks and tabs while rejecting empty/whitespace-only output
+and other control characters; eight regression cases cover these boundaries.
+The actual real-MoE pytest now passes without disabling thinking or changing
+its entropy/token-diversity thresholds. A 32-token reasoning fragment does not
+establish answer quality: this remains a smoke test, not a semantic benchmark.
 Mixed-model inference and JANG runtime compatibility remain unverified.
-Retaining the source and both conversions used approximately 52 GiB of disk.
+The source and both conversions require approximately 52 GiB of disk.
 
 Qwen3.5-family variants share the non-MoE Qwen3.5 tensor contract; Qwen3.x MoE
 and Gemma4 multimodal/audio components are not included in these text-model
 adapters. Native MLX-LM loading of the newly supported variants has not yet been
 validated against real checkpoints.
+
+#### DeepSeek-V2 Lite real-model validation
+
+The pinned `DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf` checkpoint also passes
+mixed-artifact validation and uniform direct 4-bit conversion, MLX-LM loading,
+finite-logit checks, router entropy, and generation. Its first routed layer
+has logits of shape `[1, 7, 64]` and normalized entropy `0.883369`; generation
+produced 32 tokens, 29 unique, beginning with an explanation of Rayleigh
+scattering.
+
+Enabling this previously skipped test exposed missing DeepSeek-V2 config:
+conversion now preserves the source's dense/expert FFN sizes, leading dense
+layers, shared/routed experts, query/KV LoRA layout, MLA head dimensions, and
+YaRN scaling (including GGUF's log-multiplier encoding). Invalid required
+metadata fails explicitly. The entropy probe measures raw router logits even
+when the runtime gate returns top-k indices and scores.
+This validates the named V2 Lite checkpoint, not DeepSeek-V3 or mixed-model
+inference in a JANG runtime. The checkpoint's `deepseek-llm` tokenizer profile
+still emits the existing legacy-BPE fallback warning; exact native tokenizer
+parity for DeepSeek was not established by this smoke test.
 
 ### Inspection only (not converted)
 
@@ -850,7 +870,6 @@ pytest -q 'tests/test_e2e.py::test_real_moe_model_has_finite_logits_routing_entr
 
 # Qwen3-30B-A3B fixture (Q4_K_M GGUF, about 18.56 GB)
 # Requires Apple Silicon and sufficient disk for the source and both conversions.
-# Known caveat: normal Qwen3 newlines fail the current output.isprintable() assertion.
 GGUF2MLX_RUN_E2E=1 \
 GGUF2MLX_MOE_MODELS='{"qwen3moe":"/models/Qwen3-30B-A3B-Q4_K_M.gguf"}' \
 GGUF2MLX_MOE_OUTPUT_ROOT=/models/new-qwen3-moe-validation \
@@ -862,6 +881,65 @@ python -m gguf2mlx.chat_validation ./converted-model --expect-marker '<|im_start
 
 # Lint
 ruff check src/ tests/ benchmarks/
+```
+
+### Native validation results (2026-10-18)
+
+All **645 current tests passed across batched runs**, with no remaining skipped
+or unexecuted test cases. The initial full run with both opt-in flags enabled
+passed 614 tests and skipped six for missing real-model fixtures. After fetching
+those fixtures and fixing the Qwen3 text assertion and DeepSeek-V2 config, the
+final coverage was:
+
+| Coverage | Passed |
+|---|---:|
+| Portable and native synthetic tests, including new regressions | 639 |
+| Real Qwen1.5 MoE, Qwen3 MoE, and DeepSeek-V2 Lite conversion/inference | 3 |
+| Real Qwen1.5 MoE and Gemma tokenizer parity against llama.cpp | 2 |
+| Real Qwen2-VL-2B image smoke test | 1 |
+
+The real-model cases were selected separately to avoid repeating large
+conversions; the 639-test run deselected those six cases, rather than skipping
+them. Six existing missing-metadata warnings came from synthetic config tests;
+the DeepSeek run also warned about its legacy tokenizer fallback.
+Validation used Python 3.11.13 on macOS ARM64 with 64 GiB memory,
+`tests/requirements-vlm.txt`, `gguf` 0.19.0, `numpy` 2.4.6, and
+`llama-cpp-python` 0.3.36. The optional `ppl` extra supplies the native tokenizer
+reference runtime:
+
+```bash
+.venv-vlm/bin/python -m pip install -e ".[ppl]" -r tests/requirements-vlm.txt
+```
+
+Real-model inputs were fetched from these pinned Hugging Face repositories:
+
+| Repository | File(s) | Revision |
+|---|---|---|
+| `tensorblock/Qwen1.5-MoE-A2.7B-Chat-GGUF` | `Qwen1.5-MoE-A2.7B-Chat-Q2_K.gguf` | `2b36b746552a7c99c814ee43120f318391e608c5` |
+| `unsloth/Qwen3-30B-A3B-GGUF` | `Qwen3-30B-A3B-Q4_K_M.gguf` | `d5b1d57bd0b504ac62ae6c725904e96ef228dc74` |
+| `bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF` | `DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf` | `8f248fa2072348f77a8bc37754e470de1f61866e` |
+| `mlabonne/gemma-2b-it-GGUF` | `gemma-2b-it.Q4_K_M.gguf` | `bafe4a9c05a88b3486d0d6fa35fa6dec48aa64d5` |
+| `bartowski/Qwen2-VL-2B-Instruct-GGUF` | `Qwen2-VL-2B-Instruct-Q4_K_M.gguf`, `mmproj-Qwen2-VL-2B-Instruct-f16.gguf` | `2160e265f926e84e84dbb1c73e623b5324b23707` |
+
+For Qwen2-VL, the matching local HF assets and astronaut image are the inputs
+documented in the [real-checkpoint acceptance report](docs/qwen2-vl-real-validation.md).
+The smoke test checks finite logits, image sensitivity, and generation, not a
+new twelve-image acceptance run. MoE mixed output is checked only for artifact
+consistency; runtime inference uses the uniform conversion.
+
+After downloading the fixtures into the paths below, enable every current
+opt-in test in one invocation (large conversion outputs use pytest temporary
+directories):
+
+```bash
+GGUF2MLX_RUN_E2E=1 GGUF2MLX_RUN_VLM_E2E=1 HF_HUB_OFFLINE=1 \
+GGUF2MLX_MOE_MODELS='{"qwen2moe":"models/native-validation/qwen2moe/Qwen1.5-MoE-A2.7B-Chat-Q2_K.gguf","qwen3moe":"models/qwen3-moe-validation/gguf/Qwen3-30B-A3B-Q4_K_M.gguf","deepseek2":"models/native-validation/deepseek2/DeepSeek-Coder-V2-Lite-Instruct-Q2_K.gguf"}' \
+GGUF2MLX_GEMMA_GGUF=models/native-validation/gemma/gemma-2b-it.Q4_K_M.gguf \
+GGUF2MLX_VLM_GGUF=models/qwen2-vl-validation/gguf/Qwen2-VL-2B-Instruct-Q4_K_M.gguf \
+GGUF2MLX_VLM_MMPROJ=models/qwen2-vl-validation/gguf/mmproj-Qwen2-VL-2B-Instruct-f16.gguf \
+GGUF2MLX_VLM_HF=models/qwen2-vl-validation/hf \
+GGUF2MLX_VLM_IMAGE=models/qwen2-vl-validation/images/astronaut.png \
+.venv-vlm/bin/python -m pytest -q -ra
 ```
 
 ### Optional Rust extension
