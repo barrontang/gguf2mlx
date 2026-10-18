@@ -752,19 +752,28 @@ jobs:
               "state.json": { content: JSON.stringify(state, null, 2) }
             };
 
+            let outputGistId = gistId;
             if (gistId) {
-              await github.rest.gists.update({ gist_id: gistId, files });
-              console.log(`Updated gist: ${gistId}`);
-            } else {
+              try {
+                await github.rest.gists.update({ gist_id: gistId, files });
+                console.log(`Updated gist: ${gistId}`);
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                console.log(`Configured gist ${gistId} was not found; creating a replacement.`);
+                outputGistId = null;
+              }
+            }
+            if (!outputGistId) {
               const newGist = await github.rest.gists.create({
                 description: `${owner}/${repo} traffic badges`,
                 public: true,
                 files
               });
-              console.log(`Created new gist: ${newGist.data.id}`);
+              outputGistId = newGist.data.id;
+              console.log(`Created ${gistId ? "replacement " : ""}gist: ${outputGistId}`);
               console.log(`⚠️  Set TRAFFIC_GIST_ID repo variable to: ${newGist.data.id}`);
             }
 
             console.log(`\nBadge URLs (after setting GIST_ID):`);
-            const gid = gistId || "<GIST_ID>";
+            const gid = outputGistId || "<GIST_ID>";
             console.log(`Installs: https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/${owner}/${gid}/raw/installs.json`);
