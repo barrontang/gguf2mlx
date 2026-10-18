@@ -560,7 +560,7 @@ MiniCPM-V 4.7 1B adapter.
 | Llama | `llama`, `mistral` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen | `qwen2`, dense `qwen3` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen3.5 family | `qwen35`; aliases `qwen3_5`, `qwen3.5`, `qwen36`, `qwen3_6`, `qwen3.6`, `qwen38`, `qwen3_8`, `qwen3.8` | ✅ dense layouts | Portable fixtures; native runtime unverified | ❌ | — | ✅ generic package/verify | ❌ |
-| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 real GGUF; Qwen3 opt-in pending | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
+| Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 real GGUF; Qwen3-30B-A3B uniform 4-bit smoke validated (see caveat below) | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | DeepSeek | `deepseek2`, `deepseek3` | ✅ | ⚠️ scheduled opt-in | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | GLM | `glm4moe` | ✅ | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | Gemma | `gemma`, `gemma2`, `gemma3`, text-only `gemma4` | ✅ | Portable conversion fixtures; native runtime unverified | Gemma4 MoE layout supported | — | ✅ generic package/verify | ❌ |
@@ -579,6 +579,34 @@ The mixed-precision contract validator checks agreement between
 loading the result in a JANG-compatible runtime. `.mlx` bundle packaging and
 integrity verification are architecture-independent operations on emitted model
 directories and do not assert runtime compatibility.
+
+#### Qwen3 MoE real-model validation
+
+On 2026-10-18, `Qwen3-30B-A3B-Q4_K_M.gguf` from
+[`unsloth/Qwen3-30B-A3B-GGUF`](https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/tree/d5b1d57bd0b504ac62ae6c725904e96ef228dc74)
+was converted and exercised on Apple Silicon with 64 GiB unified memory.
+The source is 18,556,686,912 bytes, with SHA-256
+`9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48`.
+The validation used `gguf` 0.19.0, `mlx` 0.31.2, `mlx-lm` 0.31.3, and
+`numpy` 2.2.6.
+
+| Check | Observed result |
+|---|---|
+| Mixed-precision conversion and artifact contract | Passed; 48 protected router tensors and 144 compressed expert tensors |
+| Uniform direct 4-bit conversion and MLX-LM loading | Passed |
+| Uniform-model logits | All finite; shape `[1, 8, 151936]` |
+| First-layer router logits | Shape `[1, 8, 128]`; normalized entropy `0.895747`, within the required `(0.05, 0.95)` interval |
+| Follow-up generation with `enable_thinking=False` | 128 tokens, 83 unique tokens; explained Rayleigh scattering before reaching the token limit |
+
+**Test caveat:** the existing real-MoE pytest did not pass: its
+`output.isprintable()` assertion rejects the normal newline after Qwen3's
+`<think>` marker. Both conversions, mixed-artifact validation, finite logits,
+and router entropy passed before that assertion. A separate follow-up on the
+saved uniform model passed text-validity checks allowing line breaks and tabs,
+plus the existing token-diversity threshold. This is a smoke test, not a
+semantic-quality benchmark or a passing result for the unmodified pytest.
+Mixed-model inference and JANG runtime compatibility remain unverified.
+Retaining the source and both conversions used approximately 52 GiB of disk.
 
 Qwen3.5-family variants share the non-MoE Qwen3.5 tensor contract; Qwen3.x MoE
 and Gemma4 multimodal/audio components are not included in these text-model
@@ -819,6 +847,15 @@ GGUF2MLX_MOE_MODELS='{"qwen2moe":"/models/Qwen1.5-MoE-A2.7B-Chat.Q2_K.gguf"}' \
 GGUF2MLX_MOE_OUTPUT_ROOT=/models/new-qwen-moe-validation \
 GGUF2MLX_MOE_REPORT_DIR=/reports/qwen-moe \
 pytest -q 'tests/test_e2e.py::test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output[qwen2moe]'
+
+# Qwen3-30B-A3B fixture (Q4_K_M GGUF, about 18.56 GB)
+# Requires Apple Silicon and sufficient disk for the source and both conversions.
+# Known caveat: normal Qwen3 newlines fail the current output.isprintable() assertion.
+GGUF2MLX_RUN_E2E=1 \
+GGUF2MLX_MOE_MODELS='{"qwen3moe":"/models/Qwen3-30B-A3B-Q4_K_M.gguf"}' \
+GGUF2MLX_MOE_OUTPUT_ROOT=/models/new-qwen3-moe-validation \
+GGUF2MLX_MOE_REPORT_DIR=/reports/qwen3-moe \
+pytest -q 'tests/test_e2e.py::test_real_moe_model_has_finite_logits_routing_entropy_and_coherent_output[qwen3moe]'
 
 # Validate an embedded chat template against five conversation shapes
 python -m gguf2mlx.chat_validation ./converted-model --expect-marker '<|im_start|>'
