@@ -1467,6 +1467,116 @@ def _get_chat_template(reader: GGUFReader, arch: str) -> str | None:
     return None
 
 
+def _hf_tokenizer_vocab(tokenizer_json: dict, tokenizer_config: dict) -> dict[int, str]:
+    model = tokenizer_json.get("model")
+    vocab = model.get("vocab") if isinstance(model, dict) else None
+    if isinstance(vocab, dict):
+        token_ids = {token: token_id for token, token_id in vocab.items()}
+    elif isinstance(vocab, list) and all(
+        isinstance(entry, list) and entry and isinstance(entry[0], str) for entry in vocab
+    ):
+        token_ids = {entry[0]: index for index, entry in enumerate(vocab)}
+    else:
+        raise ValueError("HF tokenizer.json must contain a verifiable vocabulary")
+
+    added_tokens = tokenizer_json.get("added_tokens", [])
+    decoder = tokenizer_config.get("added_tokens_decoder", {})
+    if not isinstance(added_tokens, list) or not isinstance(decoder, dict):
+        raise ValueError("HF tokenizer added-token definitions are invalid")
+    for index_text, entry in decoder.items():
+        if not isinstance(index_text, str) or not index_text.isdecimal() or not isinstance(entry, dict):
+            raise ValueError("Invalid HF added_tokens_decoder entry")
+        added_tokens.append({**entry, "id": int(index_text)})
+
+    by_id: dict[int, str] = {}
+    for token, token_id in token_ids.items():
+        if not isinstance(token, str) or isinstance(token_id, bool) or not isinstance(token_id, int):
+            raise ValueError("HF tokenizer contains invalid vocabulary entries")
+        by_id[token_id] = token
+    for added in added_tokens:
+        if not isinstance(added, dict) or not isinstance(added.get("content"), str):
+            raise ValueError("Invalid HF tokenizer added_tokens entry")
+        token, token_id = added["content"], added.get("id")
+        if isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0:
+            raise ValueError("HF tokenizer contains invalid token IDs")
+        if token in token_ids and token_ids[token] != token_id:
+            raise ValueError("HF tokenizer has conflicting added token IDs")
+        if token_id in by_id and by_id[token_id] != token:
+            raise ValueError("HF tokenizer has duplicate token IDs")
+        token_ids[token] = token_id
+        by_id[token_id] = token
+    if not by_id or set(by_id) != set(range(max(by_id) + 1)):
+        raise ValueError("HF tokenizer IDs must be contiguous from zero")
+    return by_id
+
+
+def _copy_hf_tokenizer(
+    reader: GGUFReader,
+    output_dir: Path,
+    hf_repo: str,
+    revision: str,
+    offline: bool,
+) -> None:
+    """Validate original HF tokenizer assets against GGUF, then prefer those assets."""
+    source_dir = Path(hf_repo)
+    if source_dir.is_dir():
+        tokenizer_path = source_dir / "tokenizer.json"
+        config_path = source_dir / "tokenizer_config.json"
+        if not tokenizer_path.is_file() or not config_path.is_file():
+            raise ValueError(f"HF tokenizer source is missing tokenizer.json or tokenizer_config.json: {hf_repo}")
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as error:
+            raise RuntimeError(
+                "Downloading an HF tokenizer requires huggingface_hub; "
+                "install it with `pip install -e '.[vlm]'`."
+            ) from error
+        tokenizer_path = Path(hf_hub_download(
+            hf_repo, "tokenizer.json", revision=revision, local_files_only=offline,
+        ))
+        config_path = Path(hf_hub_download(
+            hf_repo, "tokenizer_config.json", revision=revision, local_files_only=offline,
+        ))
+
+    with tokenizer_path.open(encoding="utf-8") as file:
+        tokenizer_json = json.load(file)
+    with config_path.open(encoding="utf-8") as file:
+        tokenizer_config = json.load(file)
+    if not isinstance(tokenizer_json, dict) or not isinstance(tokenizer_config, dict):
+        raise ValueError("HF tokenizer files must contain JSON objects")
+
+    by_id = _hf_tokenizer_vocab(tokenizer_json, tokenizer_config)
+    gguf_tokens = get_metadata_array_str(reader, "tokenizer.ggml.tokens")
+    if not gguf_tokens:
+        raise ValueError("GGUF has no tokenizer tokens to cross-check against the HF tokenizer")
+    vocab_size = len(gguf_tokens)
+    if len(by_id) > vocab_size:
+        raise ValueError("HF tokenizer vocabulary is larger than the GGUF tokenizer vocabulary")
+    last_hf_id = max(by_id)
+    for token_id, token in enumerate(gguf_tokens):
+        if token_id not in by_id and token_id > last_hf_id and token == f"[PAD{token_id}]":
+            continue
+        if by_id.get(token_id) != token:
+            raise ValueError(
+                f"HF/GGUF tokenizer mismatch at token ID {token_id}; "
+                "use the original matching HF repository."
+            )
+
+    for role in ("bos", "eos", "unk", "pad", "sep", "mask"):
+        token_id = get_metadata_int(reader, f"tokenizer.ggml.{role}_token_id")
+        token_value = tokenizer_config.get(f"{role}_token")
+        if token_id is not None and token_value is not None:
+            if isinstance(token_value, dict):
+                token_value = token_value.get("content")
+            if token_value != gguf_tokens[token_id]:
+                raise ValueError(f"HF/GGUF {role} token definitions differ")
+
+    shutil.copyfile(tokenizer_path, output_dir / "tokenizer.json")
+    shutil.copyfile(config_path, output_dir / "tokenizer_config.json")
+    print(f"  ✓ Using cross-validated HF tokenizer from {hf_repo}@{revision}")
+
+
 def extract_tokenizer(
     reader: GGUFReader,
     output_dir: Path,
@@ -2805,6 +2915,7 @@ def convert(
     mmproj: str | None = None,
     hf_model: str | None = None,
     hf_fallback_vision: str | None = None,
+    hf_repo: str | None = None,
     hf_revision: str = "main",
     offline: bool = False,
     preserve_source_quant: bool = False,
@@ -2851,7 +2962,11 @@ def convert(
         if model_type not in {"auto", "llm", "vlm", "text-encoder"}:
             print(f"❌ Unsupported conversion type: {model_type}")
             return False
-        vlm_options = bool(mmproj or hf_model or hf_fallback_vision or preserve_source_quant)
+        if hf_repo and hf_model and hf_repo != hf_model:
+            print("❌ --hf-repo and --hf-model must refer to the same repository when both are set")
+            return False
+        vlm_hf_model = hf_model or hf_repo
+        vlm_options = bool(mmproj or vlm_hf_model or hf_fallback_vision or preserve_source_quant)
         if model_type == "llm" and vlm_options:
             print("❌ VLM source options cannot be used with --type llm")
             return False
@@ -2916,7 +3031,7 @@ def convert(
                     fp_output_path,
                     dtype,
                     mmproj=mmproj,
-                    hf_model=hf_model,
+                    hf_model=vlm_hf_model,
                     hf_fallback_vision=hf_fallback_vision,
                     hf_revision=hf_revision,
                     offline=offline,
@@ -2978,6 +3093,19 @@ def convert(
                     print(f"❌ Quantization failed: {error}")
                     return False
                 final_stage_path = quantized_output_path
+
+        if hf_repo:
+            if model_type == "vlm" or detected_vlm:
+                pass
+            else:
+                try:
+                    tokenizer_reader = GGUFReader(gguf_path)
+                    _copy_hf_tokenizer(
+                        tokenizer_reader, final_stage_path, hf_repo, hf_revision, offline,
+                    )
+                except Exception as error:  # noqa: BLE001
+                    print(f"❌ HF tokenizer validation failed: {error}")
+                    return False
 
         if output_path.exists():
             output_path.rmdir()
@@ -3204,6 +3332,10 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
         "--hf-model", help="Matching full HF VLM repository or local directory for config/assets",
     )
     parser.add_argument(
+        "--hf-repo",
+        help="Original HF repository or local directory to use its cross-validated tokenizer",
+    )
+    parser.add_argument(
         "--hf-fallback-vision",
         help="Use original vision weights from this matching HF VLM repository/local directory",
     )
@@ -3324,6 +3456,7 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         mmproj=args.mmproj,
         hf_model=args.hf_model,
         hf_fallback_vision=args.hf_fallback_vision,
+        hf_repo=args.hf_repo,
         hf_revision=args.hf_revision,
         offline=args.offline,
         preserve_source_quant=args.preserve_source_quant,
