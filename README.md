@@ -297,7 +297,7 @@ uv tool install gguf2mlx
 #### Optional extras
 
 - `pip install "gguf2mlx[all]"`: Complete bundle including MLX, MLX-LM, and Hugging Face Hub (for VLM models)
-- `pip install "gguf2mlx[vlm]"`: Base converter + Hugging Face Hub for Vision-Language Models
+- `pip install "gguf2mlx[vlm]"`: Base converter + Hugging Face Hub for VLM assets and `--hf-repo` tokenizer downloads
 - `pip install "gguf2mlx[dev]"`: Development toolchain (pytest, ruff, mypy, build, twine)
 
 ### Install from a local checkout
@@ -332,6 +332,9 @@ python -m gguf2mlx.mixed_validation ./qwen3-moe-mixed
 # Float32 output
 gguf2mlx --input model.gguf --output ./mlx-model-f32 --dtype float32
 
+# Use and verify the tokenizer from the original Hugging Face repository
+gguf2mlx --input model.gguf --output ./mlx-model --hf-repo org/model
+
 # Limit streamed shard payloads to 2 GiB
 gguf2mlx --input model.gguf --output ./mlx-model --max-shard-gb 2
 
@@ -347,6 +350,12 @@ one tensor (or one required fusion group) at a time. Output payloads are spooled
 disk immediately rather than accumulated in a shard-sized array dictionary. Shard
 boundaries use **converted payload bytes**, including quantized weights, scales,
 and biases; the index records their actual total size.
+
+`--hf-repo` downloads `tokenizer.json` and `tokenizer_config.json` from the original
+model repository, validates token IDs against the GGUF vocabulary, and uses the HF
+files when they match. Pin the source with `--hf-revision`; `--offline` restricts
+downloads to the local Hugging Face cache. Install `gguf2mlx[vlm]` for the
+`huggingface_hub` client, or pass a local repository directory.
 
 `--max-shard-gb` accepts a positive, finite size in GiB. Defaults remain 4.5 GB
 (decimal) for floating-point LLM conversion and 256 MiB for direct quantization

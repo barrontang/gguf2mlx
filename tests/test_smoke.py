@@ -75,6 +75,7 @@ def test_cli_help():
     assert "--quantize" in result.stdout
     assert "--q-bits" in result.stdout
     assert "--direct-quant" in result.stdout
+    assert "--hf-repo" in result.stdout
 
 
 def test_cli_package_help():

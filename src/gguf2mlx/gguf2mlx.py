@@ -1490,8 +1490,13 @@ def _hf_tokenizer_vocab(tokenizer_json: dict, tokenizer_config: dict) -> dict[in
 
     by_id: dict[int, str] = {}
     for token, token_id in token_ids.items():
-        if not isinstance(token, str) or isinstance(token_id, bool) or not isinstance(token_id, int):
+        if (
+            not isinstance(token, str) or isinstance(token_id, bool)
+            or not isinstance(token_id, int) or token_id < 0
+        ):
             raise ValueError("HF tokenizer contains invalid vocabulary entries")
+        if token_id in by_id and by_id[token_id] != token:
+            raise ValueError("HF tokenizer has duplicate token IDs")
         by_id[token_id] = token
     for added in added_tokens:
         if not isinstance(added, dict) or not isinstance(added.get("content"), str):
@@ -1550,14 +1555,18 @@ def _copy_hf_tokenizer(
     gguf_tokens = get_metadata_array_str(reader, "tokenizer.ggml.tokens")
     if not gguf_tokens:
         raise ValueError("GGUF has no tokenizer tokens to cross-check against the HF tokenizer")
-    vocab_size = len(gguf_tokens)
+    with (output_dir / "config.json").open(encoding="utf-8") as file:
+        model_config = json.load(file)
+    vocab_size = model_config.get("vocab_size")
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError("Converted model config has no valid vocab_size for HF tokenizer validation")
     if len(by_id) > vocab_size:
-        raise ValueError("HF tokenizer vocabulary is larger than the GGUF tokenizer vocabulary")
+        raise ValueError("HF tokenizer vocabulary is larger than the GGUF model vocabulary")
     last_hf_id = max(by_id)
     for token_id, token in enumerate(gguf_tokens):
         if token_id not in by_id and token_id > last_hf_id and token == f"[PAD{token_id}]":
             continue
-        if by_id.get(token_id) != token:
+        if token_id >= vocab_size or by_id.get(token_id) != token:
             raise ValueError(
                 f"HF/GGUF tokenizer mismatch at token ID {token_id}; "
                 "use the original matching HF repository."
@@ -1569,7 +1578,11 @@ def _copy_hf_tokenizer(
         if token_id is not None and token_value is not None:
             if isinstance(token_value, dict):
                 token_value = token_value.get("content")
-            if token_value != gguf_tokens[token_id]:
+            if (
+                token_id >= vocab_size
+                or token_value != by_id.get(token_id)
+                or (token_id < len(gguf_tokens) and token_value != gguf_tokens[token_id])
+            ):
                 raise ValueError(f"HF/GGUF {role} token definitions differ")
 
     shutil.copyfile(tokenizer_path, output_dir / "tokenizer.json")
@@ -2966,7 +2979,7 @@ def convert(
             print("❌ --hf-repo and --hf-model must refer to the same repository when both are set")
             return False
         vlm_hf_model = hf_model or hf_repo
-        vlm_options = bool(mmproj or vlm_hf_model or hf_fallback_vision or preserve_source_quant)
+        vlm_options = bool(mmproj or hf_model or hf_fallback_vision or preserve_source_quant)
         if model_type == "llm" and vlm_options:
             print("❌ VLM source options cannot be used with --type llm")
             return False
@@ -3094,18 +3107,15 @@ def convert(
                     return False
                 final_stage_path = quantized_output_path
 
-        if hf_repo:
-            if model_type == "vlm" or detected_vlm:
-                pass
-            else:
-                try:
-                    tokenizer_reader = GGUFReader(gguf_path)
-                    _copy_hf_tokenizer(
-                        tokenizer_reader, final_stage_path, hf_repo, hf_revision, offline,
-                    )
-                except Exception as error:  # noqa: BLE001
-                    print(f"❌ HF tokenizer validation failed: {error}")
-                    return False
+        if hf_repo and not detected_vlm and model_type != "vlm":
+            try:
+                tokenizer_reader = GGUFReader(gguf_path)
+                _copy_hf_tokenizer(
+                    tokenizer_reader, final_stage_path, hf_repo, hf_revision, offline,
+                )
+            except Exception as error:  # noqa: BLE001
+                print(f"❌ HF tokenizer validation failed: {error}")
+                return False
 
         if output_path.exists():
             output_path.rmdir()
