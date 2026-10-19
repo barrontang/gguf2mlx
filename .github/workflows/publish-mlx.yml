@@ -1,0 +1,175 @@
+name: Convert GGUF and publish MLX
+
+on:
+  workflow_call:
+    inputs:
+      source_repo:
+        description: Hugging Face model repository containing the GGUF and README.md
+        required: true
+        type: string
+      gguf_file:
+        description: Single GGUF filename (including any repository subdirectory)
+        required: true
+        type: string
+      source_revision:
+        description: Uploaded GGUF commit SHA, tag, or branch (resolved to a commit)
+        default: main
+        type: string
+      destination_repo:
+        description: Hugging Face model repository to create or update
+        required: true
+        type: string
+      private:
+        description: Create new destination repositories as private
+        default: true
+        type: boolean
+      quantize:
+        description: Opt in to lossy affine 4-bit direct quantization instead of FP16
+        default: false
+        type: boolean
+      runner:
+        description: macOS Apple Silicon runner label with enough memory and disk
+        default: macos-15
+        type: string
+      converter_version:
+        description: Published gguf2mlx version to install
+        default: "2.1.4"
+        type: string
+    secrets:
+      HF_TOKEN:
+        description: HF token with source read and destination write permissions
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-mlx-${{ inputs.destination_repo }}
+  cancel-in-progress: false
+
+jobs:
+  convert-publish:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Require Apple Silicon
+        shell: bash
+        run: |
+          test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
+            echo "Choose a macOS ARM64 runner for MLX conversion."
+            exit 1
+          }
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install converter and Hugging Face client
+        shell: bash
+        env:
+          CONVERTER_VERSION: ${{ inputs.converter_version }}
+        run: python -m pip install "gguf2mlx[vlm]==${CONVERTER_VERSION}"
+      - name: Download, convert, and publish
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          GGUF_FILE: ${{ inputs.gguf_file }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          DESTINATION_REPO: ${{ inputs.destination_repo }}
+          PRIVATE: ${{ inputs.private }}
+          QUANTIZE: ${{ inputs.quantize }}
+        run: |
+          python - <<'PY'
+          import importlib.metadata
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import subprocess
+          import tempfile
+
+          from huggingface_hub import HfApi, ModelCard, hf_hub_download
+          from huggingface_hub.utils import validate_repo_id
+
+          source = os.environ["SOURCE_REPO"]
+          destination = os.environ["DESTINATION_REPO"]
+          filename = os.environ["GGUF_FILE"]
+          for repo in (source, destination):
+              validate_repo_id(repo)
+          if source.casefold() == destination.casefold():
+              raise ValueError("Source and destination must be different repositories")
+          path = PurePosixPath(filename)
+          if path.is_absolute() or ".." in path.parts or path.suffix.lower() != ".gguf":
+              raise ValueError("gguf_file must be a relative GGUF path without '..'")
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          revision = api.model_info(
+              source, revision=os.environ["SOURCE_REVISION"]
+          ).sha
+          if not revision:
+              raise ValueError("Could not resolve the source to an immutable commit")
+          gguf = hf_hub_download(source, filename, revision=revision)
+          card = ModelCard.load(hf_hub_download(source, "README.md", revision=revision))
+          quantize = os.environ["QUANTIZE"].lower() == "true"
+
+          with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temporary:
+              output = Path(temporary) / "mlx"
+              command = [
+                  "gguf2mlx", "convert", "--type", "llm",
+                  "--input", gguf, "--output", str(output), "--dtype", "float16",
+              ]
+              if quantize:
+                  command += [
+                      "--quantize", "--direct-quant",
+                      "--q-bits", "4", "--q-group-size", "64", "--q-mode", "affine",
+                  ]
+              subprocess.run(command, check=True)
+              if not (output / "config.json").is_file() or not list(
+                  output.glob("*.safetensors")
+              ):
+                  raise RuntimeError("Conversion did not produce an MLX model")
+
+              provenance = {
+                  "source_repo": source,
+                  "source_revision": revision,
+                  "gguf_file": filename,
+                  "gguf2mlx_version": importlib.metadata.version("gguf2mlx"),
+                  "precision": "affine-4bit-group64" if quantize else "float16",
+              }
+              (output / "gguf2mlx-provenance.json").write_text(
+                  json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
+              )
+              card.data.library_name = "mlx"
+              card.data.base_model = source
+              card.data.tags = sorted(
+                  (set(card.data.tags or []) - {"gguf", "GGUF"}) | {"mlx", "gguf2mlx"}
+              )
+              card.text = (
+                  "# MLX conversion\n\n"
+                  "Converted from the GGUF source using gguf2mlx. "
+                  "See `gguf2mlx-provenance.json` for the exact source commit and precision. "
+                  "Conversion cannot recover precision lost in the GGUF source.\n\n"
+                  "## Original source model card\n\n" + card.text
+              )
+              card.save(output / "README.md")
+              # Preserve source license files as well as model-card license metadata.
+              for license_file in api.list_repo_files(source, revision=revision):
+                  if PurePosixPath(license_file).name.upper().startswith(
+                      ("LICENSE", "NOTICE", "COPYING")
+                  ):
+                      license_path = Path(hf_hub_download(
+                          source, license_file, revision=revision
+                      ))
+                      target = output / license_file
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(license_path.read_bytes())
+
+              api.create_repo(
+                  destination, repo_type="model",
+                  private=os.environ["PRIVATE"].lower() == "true", exist_ok=True,
+              )
+              commit = api.upload_folder(
+                  repo_id=destination, repo_type="model", folder_path=str(output),
+                  commit_message=f"Convert {source}@{revision} GGUF to MLX",
+              )
+              print(f"Published MLX model: {commit.commit_url}")
+          PY
