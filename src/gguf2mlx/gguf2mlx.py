@@ -1482,7 +1482,7 @@ def _hf_tokenizer_vocab(tokenizer_json: dict, tokenizer_config: dict) -> dict[in
     added_tokens = tokenizer_json.get("added_tokens", [])
     decoder = tokenizer_config.get("added_tokens_decoder", {})
     if not isinstance(added_tokens, list) or not isinstance(decoder, dict):
-        raise ValueError("HF tokenizer added-token definitions are invalid")
+        raise TypeError("HF tokenizer added-token definitions are invalid")
     for index_text, entry in decoder.items():
         if not isinstance(index_text, str) or not index_text.isdecimal() or not isinstance(entry, dict):
             raise ValueError("Invalid HF added_tokens_decoder entry")
@@ -1500,7 +1500,7 @@ def _hf_tokenizer_vocab(tokenizer_json: dict, tokenizer_config: dict) -> dict[in
         by_id[token_id] = token
     for added in added_tokens:
         if not isinstance(added, dict) or not isinstance(added.get("content"), str):
-            raise ValueError("Invalid HF tokenizer added_tokens entry")
+            raise TypeError("Invalid HF tokenizer added_tokens entry")
         token, token_id = added["content"], added.get("id")
         if isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0:
             raise ValueError("HF tokenizer contains invalid token IDs")
@@ -1549,7 +1549,7 @@ def _copy_hf_tokenizer(
     with config_path.open(encoding="utf-8") as file:
         tokenizer_config = json.load(file)
     if not isinstance(tokenizer_json, dict) or not isinstance(tokenizer_config, dict):
-        raise ValueError("HF tokenizer files must contain JSON objects")
+        raise TypeError("HF tokenizer files must contain JSON objects")
 
     by_id = _hf_tokenizer_vocab(tokenizer_json, tokenizer_config)
     gguf_tokens = get_metadata_array_str(reader, "tokenizer.ggml.tokens")
@@ -1572,9 +1572,12 @@ def _copy_hf_tokenizer(
                 "use the original matching HF repository."
             )
 
-    for role in ("bos", "eos", "unk", "pad", "sep", "mask"):
-        token_id = get_metadata_int(reader, f"tokenizer.ggml.{role}_token_id")
-        token_value = tokenizer_config.get(f"{role}_token")
+    for gguf_role, hf_role in (
+        ("bos", "bos"), ("eos", "eos"), ("unknown", "unk"), ("padding", "pad"),
+        ("separator", "sep"), ("seperator", "sep"), ("mask", "mask"),
+    ):
+        token_id = get_metadata_int(reader, f"tokenizer.ggml.{gguf_role}_token_id")
+        token_value = tokenizer_config.get(f"{hf_role}_token")
         if token_id is not None and token_value is not None:
             if isinstance(token_value, dict):
                 token_value = token_value.get("content")
@@ -1583,10 +1586,22 @@ def _copy_hf_tokenizer(
                 or token_value != by_id.get(token_id)
                 or (token_id < len(gguf_tokens) and token_value != gguf_tokens[token_id])
             ):
-                raise ValueError(f"HF/GGUF {role} token definitions differ")
+                raise ValueError(f"HF/GGUF {hf_role} token definitions differ")
 
+    has_hf_chat_template = bool(tokenizer_config.get("chat_template"))
+    output_config_path = output_dir / "tokenizer_config.json"
+    if not has_hf_chat_template and output_config_path.is_file():
+        with output_config_path.open(encoding="utf-8") as file:
+            generated_config = json.load(file)
+        if generated_config.get("chat_template"):
+            tokenizer_config["chat_template"] = generated_config["chat_template"]
     shutil.copyfile(tokenizer_path, output_dir / "tokenizer.json")
-    shutil.copyfile(config_path, output_dir / "tokenizer_config.json")
+    if not has_hf_chat_template and tokenizer_config.get("chat_template"):
+        output_config_path.write_text(
+            json.dumps(tokenizer_config, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+    else:
+        shutil.copyfile(config_path, output_config_path)
     print(f"  ✓ Using cross-validated HF tokenizer from {hf_repo}@{revision}")
 
 

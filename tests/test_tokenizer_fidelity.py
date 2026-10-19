@@ -217,7 +217,10 @@ class _FakeReader:
 def _write_hf_tokenizer(root, tokens):
     root.mkdir(parents=True, exist_ok=True)
     (root / "tokenizer.json").write_text(json.dumps({
-        "model": {"type": "WordLevel", "vocab": {token: i for i, token in enumerate(tokens)}},
+        "model": {
+            "type": "WordLevel", "vocab": {token: i for i, token in enumerate(tokens)},
+            "unk_token": tokens[0],
+        },
         "added_tokens": [],
     }), encoding="utf-8")
     (root / "tokenizer_config.json").write_text(json.dumps({
@@ -245,6 +248,19 @@ def test_hf_tokenizer_files_replace_gguf_assets_after_id_validation(tmp_path):
     ).read_bytes()
 
 
+def test_hf_tokenizer_fills_incomplete_gguf_vocabulary(tmp_path):
+    tokens = ["<unk>", "<s>", "</s>", "hello"]
+    source = tmp_path / "original"
+    _write_hf_tokenizer(source, tokens)
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "config.json").write_text('{"vocab_size": 4}', encoding="utf-8")
+    reader = _FakeReader({"tokenizer.ggml.tokens": tokens[:2]})
+    core._copy_hf_tokenizer(reader, output, str(source), "main", False)
+    tokenizer = Tokenizer.from_file(str(output / "tokenizer.json"))
+    assert tokenizer.token_to_id("hello") == 3
+
+
 def test_hf_tokenizer_mismatch_does_not_replace_generated_assets(tmp_path):
     source = tmp_path / "original"
     _write_hf_tokenizer(source, ["<unk>", "<s>", "</s>", "wrong"])
@@ -260,6 +276,43 @@ def test_hf_tokenizer_mismatch_does_not_replace_generated_assets(tmp_path):
         core._copy_hf_tokenizer(reader, output, str(source), "main", False)
     assert old_tokenizer.read_text(encoding="utf-8") == "generated tokenizer"
     assert old_config.read_text(encoding="utf-8") == "generated config"
+
+
+def test_hf_tokenizer_special_token_roles_must_match_gguf(tmp_path):
+    tokens = ["<unk>", "<s>", "</s>", "hello"]
+    source = tmp_path / "original"
+    _write_hf_tokenizer(source, tokens)
+    config_path = source / "tokenizer_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["eos_token"] = "hello"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "config.json").write_text('{"vocab_size": 4}', encoding="utf-8")
+    reader = _FakeReader({
+        "tokenizer.ggml.tokens": tokens,
+        "tokenizer.ggml.eos_token_id": 2,
+    })
+    with pytest.raises(ValueError, match="eos token definitions differ"):
+        core._copy_hf_tokenizer(reader, output, str(source), "main", False)
+
+
+def test_hf_tokenizer_preserves_gguf_chat_template_when_hf_has_none(tmp_path):
+    tokens = ["<unk>", "<s>", "</s>", "hello"]
+    source = tmp_path / "original"
+    _write_hf_tokenizer(source, tokens)
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "config.json").write_text('{"vocab_size": 4}', encoding="utf-8")
+    (output / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8",
+    )
+    core._copy_hf_tokenizer(
+        _FakeReader({"tokenizer.ggml.tokens": tokens}), output, str(source), "main", False,
+    )
+    tokenizer_config = json.loads((output / "tokenizer_config.json").read_text())
+    assert tokenizer_config["unk_token"] == "<unk>"
+    assert tokenizer_config["chat_template"] == "{{ messages }}"
 
 
 def test_hf_tokenizer_remote_uses_requested_revision_and_offline_cache(tmp_path, monkeypatch):
