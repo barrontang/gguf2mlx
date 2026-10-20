@@ -44,11 +44,15 @@ jobs:
 
       - name: Validate release version
         id: version
+        env:
+          TARGET: ${{ inputs.target || 'pypi' }}
+          EVENT: ${{ github.event_name }}
         run: |
           python - <<'PY'
           import ast
           import os
           import pathlib
+          import re
           import tomllib
 
           version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
@@ -62,9 +66,27 @@ jobs:
           )
           if runtime_version != version:
               raise SystemExit("Package and runtime versions must match")
+
           ref = os.environ["GITHUB_REF"]
+          target = os.environ["TARGET"]
+          event = os.environ["EVENT"]
+
           if ref.startswith("refs/tags/") and ref != f"refs/tags/v{version}":
               raise SystemExit(f"Tag {ref} does not match package version {version}")
+
+          # Local development builds carry a PEP 440 pre-release suffix. They must
+          # never reach PyPI, and manual publishing must start from main.
+          if target == "pypi" and re.search(r"(\.dev\d*|[ab]\d*|rc\d*)$", version):
+              raise SystemExit(
+                  f"Refusing to publish pre-release {version} to PyPI. "
+                  "Set version to the release number and tag it, or use target=testpypi."
+              )
+          if event == "workflow_dispatch" and ref != "refs/heads/main":
+              raise SystemExit(
+                  f"Manual publishing is only allowed from main, got {ref}. "
+                  "Merge the release commit first, or publish by pushing a vX.Y.Z tag."
+              )
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"version={version}\n")
           PY
