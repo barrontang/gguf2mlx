@@ -139,7 +139,7 @@ def test_explicit_llm_cannot_drop_multimodal_weights(routing):
 def test_existing_llm_conversion_still_routes_to_llm(routing, monkeypatch):
     source, output, state, _ = routing
 
-    def convert_llm(path, stage, dtype):
+    def convert_llm(path, stage, dtype, **_kwargs):
         assert path == str(source)
         assert dtype == "float16"
         stage = core.Path(stage)

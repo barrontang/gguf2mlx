@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### Quality gates that can actually fail and mean it
+
+- Every conversion now writes `conversion_report.json` with a **weight-fidelity
+  gate** (schema 2). Each written tensor is compared position-wise against an
+  independent `gguf.quants.dequantize` decode of the source, with a per-dtype
+  relative-L2 tolerance (fp16 6e-4, bf16 5e-3, fp32 1e-7). A tensor that moved
+  or was mis-mapped fails the conversion instead of shipping silently.
+- Fused, permuted and split tensors are recorded as `transformed` and reported
+  in `conversion.skipped` rather than being counted as verified. A tensor marked
+  `identity` whose stored shape no longer matches the source fails as a
+  `layout_mismatch`.
+- `gguf2mlx verify --model-dir DIR --weights --source model.gguf` replays the
+  audit from the recorded `tensor_layout` without converting again.
+  `gguf2mlx verify --model-dir DIR --load` is the numerical tier: it loads with
+  `mlx_lm`, runs one forward pass and requires finite logits. Both exit non-zero
+  on failure.
+- Perplexity is downgraded to a **report-only** tier. Cross-runtime PPL mixes
+  source quantization noise with conversion error, so it can no longer fail a
+  build; see `docs/quality-gates.md`.
+- `--weight-audit/--no-weight-audit` (default on) controls the extra pass, which
+  roughly doubles conversion time.
+- Quantized output carries the report forward with
+  `artifact.stage = "mlx_lm_quantized"` and states explicitly that the 4-bit
+  weights are not covered by the FP16 weight audit.
+
+### Load matrix: "declared supported" is now testable
+
+- `tests/load_matrix.json` pins real public GGUFs by repo, filename and SHA-256:
+  Llama-3.2-1B, Qwen2.5-0.5B, Qwen3-0.6B, Gemma-2-2B and Phi-3-mini across
+  Q4_0 / Q4_K_M / Q8_0 where published.
+- `tests/test_load_matrix.py` (opt-in via `GGUF2MLX_LOAD_MATRIX=1`) downloads,
+  hash-checks, converts, gates weights, then loads and runs each one.
+- New `Load matrix` workflow runs the Q4_K_M subset nightly on Apple Silicon and
+  the full sweep on manual dispatch.
+
+### Stage 0: repository hygiene
+
+- README reduced from 1,231 to 199 lines; the long-form material moved verbatim
+  into `docs/` (support matrix, VLM, text encoder, publishing, benchmarks, FAQ,
+  development, roadmap, validation logs).
+- Repository traffic tracking (GPL-3.0-or-later workflow, dashboard, badge art
+  and license text) moved to `barrontang/gguf2mlx-traffic`, removing the
+  copyleft surface and the long-lived gist token from this Apache-2.0 repo.
+- Publishing refuses PEP 440 pre-release versions on PyPI and restricts manual
+  `workflow_dispatch` runs to `main`, so a development build cannot be uploaded.
+- GitHub repository description and topics now describe the actual package.
+
 ### Trust and repository hygiene
 
 - Conversion no longer guesses model dimensions: `build_config(..., strict=True)` raises

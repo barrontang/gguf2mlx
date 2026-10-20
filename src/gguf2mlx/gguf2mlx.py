@@ -24,6 +24,7 @@ from typing import Any
 import numpy as np
 from tqdm import tqdm
 
+from . import fidelity
 from .qwen_vl_text import QWEN_VL_TEXT_ARCHES, Qwen3VLTextEncoderConverter
 from .rust_backend import classify_architecture as rust_classify_architecture
 from .rust_backend import detect_architecture as rust_detect_architecture
@@ -2428,7 +2429,10 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
                     tensor.name, arr, arch, mla_dims, pending_kv_b, pending_qkv,
                 )
                 for name, output in pairs:
-                    yield tensor.name, tensor.tensor_type, name, output
+                    # ``output is arr`` means the mapping passed the decoded
+                    # tensor through untouched, which is what makes a
+                    # position-wise fidelity comparison meaningful later.
+                    yield tensor.name, tensor.tensor_type, name, output, output is arr
                     del output
                 del arr, pairs
                 pbar.update(1)
@@ -2441,13 +2445,27 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
 def extract_and_convert_weights(
     reader: GGUFReader, arch: str, output_dir: Path, dtype: str = "float16",
     max_shard_bytes: int = int(4.5 * 1e9),
-) -> None:
-    """Extract, transform, and stream tensors without buffering a shard in RAM."""
+    *,
+    audit: bool = True,
+) -> dict[str, Any]:
+    """Extract, transform, and stream tensors without buffering a shard in RAM.
+
+    Always writes ``conversion_report.json`` next to the weights. When ``audit``
+    is enabled the report carries a deterministic weight-fidelity gate that
+    compares the bytes on disk against an independent decode of the source GGUF;
+    when it is disabled the tier is recorded as ``not_run`` rather than omitted,
+    so downstream tooling can tell "not measured" from "measured and clean".
+    """
     print(f"\n  Converting {len(reader.tensors)} tensors...")
     print(f"  Output dtype: {dtype}")
+    layout: dict[str, dict[str, str]] = {}
     with StreamingShardWriter(output_dir, max_shard_bytes) as writer:
-        for _, _, name, array in _iter_weight_arrays(reader, arch, dtype):
+        for gguf_name, _, name, array, identity in _iter_weight_arrays(reader, arch, dtype):
             writer.add(name, array, **({"dtype": "bfloat16"} if dtype == "bfloat16" else {}))
+            layout[name] = {
+                "source": gguf_name,
+                "layout": "identity" if identity else "transformed",
+            }
             del array
         if arch == "glm-dsa":
             layers = _detect_full_indexer_layers(list(writer.weight_map))
@@ -2456,6 +2474,36 @@ def extract_and_convert_weights(
     print(f"\n  ✓ Saved {len(writer.weight_map)} weight tensors ({len(writer.files)} shards)")
     print(f"    Total input:  {sum(t.n_bytes for t in reader.tensors) / 1e9:.2f} GB (GGUF)")
     print(f"    Total output: {writer.total / 1e9:.2f} GB (safetensors)")
+
+    if audit:
+        print("\n  Auditing written weights against an independent source decode...")
+        audit_result = fidelity.audit_weights(output_dir, reader, layout, dtype)
+    else:
+        audit_result = {
+            "tensors": [],
+            "compared": 0,
+            "skipped": {"not_requested": len(layout)},
+            "total_output_tensors": len(layout),
+        }
+
+    report = fidelity.build_report(
+        architecture=arch,
+        dtype=dtype,
+        audit=audit_result,
+        layout=layout,
+        source=str(getattr(reader, "path", "") or "") or None,
+    )
+    fidelity.write_report(output_dir, report)
+    weight = report["fidelity"]["weight"]
+    marker = {"pass": "✓", "fail": "❌", "not_run": "ℹ"}.get(weight["status"], "ℹ")
+    print(f"  {marker} {fidelity.summarize(report)}")
+    if weight["status"] == "fail":
+        print("    Tensors outside tolerance:")
+        for name in weight["failures"]:
+            print(f"      - {name}")
+        print("    Refusing to publish a conversion whose weights changed unexpectedly.")
+    return report
+
 
 
 def extract_and_convert_weights_direct_quant(
@@ -2488,7 +2536,9 @@ def extract_and_convert_weights_direct_quant(
         max_shard_bytes = DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES
 
     with StreamingShardWriter(output_dir, max_shard_bytes) as writer:
-        for gguf_name, qtype, hf_name, out_arr in _iter_weight_arrays(reader, arch, dtype):
+        for gguf_name, qtype, hf_name, out_arr, _identity in _iter_weight_arrays(
+            reader, arch, dtype
+        ):
             category = classify_tensor(gguf_name, hf_name)
             protected = (
                 architecture_kind in {"moe", "hybrid"}
@@ -2697,6 +2747,7 @@ def _convert_direct_quantized(
 def _convert(
     gguf_path: str, output_dir: str, dtype: str = "float16",
     max_shard_bytes: int = int(4.5 * 1e9),
+    weight_audit: bool = True,
 ) -> bool:
     """Convert a GGUF file to MLX-compatible safetensors format."""
 
@@ -2822,9 +2873,18 @@ def _convert(
     # Step 4: Extract, dequantize, and convert weights
     print("\n[4/5] Extracting and converting weights...")
     try:
-        extract_and_convert_weights(reader, arch, output_path, dtype, max_shard_bytes)
+        report = extract_and_convert_weights(
+            reader, arch, output_path, dtype, max_shard_bytes, audit=weight_audit,
+        )
     except Exception as e:  # noqa: BLE001
         print(f"❌ Weight extraction failed: {e}")
+        return False
+
+    if report.get("gates", {}).get("weight") == "fail":
+        print(
+            "❌ Weight fidelity gate failed: the written tensors do not match the "
+            "source GGUF. See conversion_report.json for the failing tensors."
+        )
         return False
 
     # Step 5: Verify output
@@ -2886,6 +2946,32 @@ def _quantize_output_with_mlx_lm(
     )
 
 
+def _carry_report_forward(source_dir: Path, target_dir: Path) -> None:
+    """Copy the conversion report into the quantized output with an honest note.
+
+    ``mlx_lm.convert`` rebuilds the directory, so the report has to be carried
+    over. The audited weights were the FP16 staging output, not the 4-bit
+    weights that end up here, and the report must say so.
+    """
+    path = source_dir / fidelity.REPORT_NAME
+    if not path.exists():
+        return
+    report = json.loads(path.read_text())
+    report["artifact"] = {
+        "stage": "mlx_lm_quantized",
+        "note": (
+            "weight fidelity was measured on the FP16 staging output. The 4-bit "
+            "weights in this directory were produced by mlx_lm.convert and are "
+            "not covered by that measurement; use `gguf2mlx verify --model-dir "
+            "... --load` to check they at least load and run."
+        ),
+    }
+    report["fidelity"]["weight"]["measured_stage"] = "float16"
+    (target_dir / fidelity.REPORT_NAME).write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def convert(
     gguf_path: str,
     output_dir: str,
@@ -2905,6 +2991,7 @@ def convert(
     offline: bool = False,
     preserve_source_quant: bool = False,
     max_shard_gb: float | None = None,
+    weight_audit: bool = True,
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     shard_options = {}
@@ -3051,7 +3138,10 @@ def convert(
             final_stage_path = direct_quantized_output_path
         else:
             try:
-                succeeded = _convert(gguf_path, str(fp_output_path), dtype, **shard_options)
+                succeeded = _convert(
+                    gguf_path, str(fp_output_path), dtype, weight_audit=weight_audit,
+                    **shard_options,
+                )
             except Exception as error:  # noqa: BLE001
                 print(f"❌ Conversion failed: {error}")
                 return False
@@ -3073,6 +3163,7 @@ def convert(
                 except Exception as error:  # noqa: BLE001
                     print(f"❌ Quantization failed: {error}")
                     return False
+                _carry_report_forward(fp_output_path, quantized_output_path)
                 final_stage_path = quantized_output_path
 
         if output_path.exists():
@@ -3387,6 +3478,16 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Skip weight extraction (metadata + tokenizer only, for inspection)",
     )
+    parser.add_argument(
+        "--weight-audit",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compare every written tensor against an independent decode of the "
+            "source GGUF and fail if they differ (default: enabled; roughly "
+            "doubles conversion time)"
+        ),
+    )
 
 
 def _run_convert_command(args: argparse.Namespace) -> int:
@@ -3424,8 +3525,70 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         offline=args.offline,
         preserve_source_quant=args.preserve_source_quant,
         max_shard_gb=args.max_shard_gb,
+        weight_audit=args.weight_audit,
     )
     return 0 if success else 1
+
+
+def _run_verify_command(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Dispatch `verify` across bundle integrity, weight audit, and runtime load."""
+    emit_json = bool(getattr(args, "json", False))
+
+    if args.bundle:
+        ok = verify_mlx_bundle(args.bundle)
+        if emit_json:
+            print(json.dumps({"mode": "bundle", "status": "pass" if ok else "fail"}))
+        return 0 if ok else 1
+
+    if not args.model_dir:
+        parser.error("verify requires --bundle or --model-dir")
+    if args.load and args.weights:
+        parser.error("--load and --weights are separate checks; run them one at a time")
+    if not args.load and not args.weights:
+        parser.error("with --model-dir, pass --load or --weights")
+
+    if args.load:
+        result = fidelity.load_and_run(args.model_dir)
+        if emit_json:
+            print(json.dumps({"mode": "load", **result}))
+        elif result["status"] == "pass":
+            print(
+                f"✅ {args.model_dir} loads and runs "
+                f"(logits {result['logits_shape']}, all finite)"
+            )
+        else:
+            stage = result.get("stage", "import")
+            print(f"❌ Load check failed at {stage}: {result.get('error')}")
+        return 0 if result["status"] == "pass" else 1
+
+    if not args.source:
+        parser.error("--weights needs --source <model.gguf>")
+    try:
+        result = fidelity.verify_weights(args.model_dir, args.source)
+    except (FileNotFoundError, ValueError) as error:
+        print(f"❌ {error}")
+        return 1
+
+    gate = result["gate"]
+    if emit_json:
+        print(json.dumps({
+            "mode": "weights",
+            "status": result["status"],
+            "compared": result["compared"],
+            "skipped": result["skipped"],
+            "gate": gate,
+        }))
+    elif result["status"] == "pass":
+        print(
+            f"✅ weights match the source decode "
+            f"({result['compared']} tensors, max relative L2 "
+            f"{gate['max_relative_l2']:.2e} vs tolerance {gate['tolerance']:.1e})"
+        )
+    else:
+        print(f"❌ weight mismatch in {gate['failure_count']} tensor(s)")
+        for name in gate["failures"]:
+            print(f"  - {name}")
+    return 0 if result["status"] == "pass" else 1
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -3452,9 +3615,32 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         verify_parser = subparsers.add_parser(
-            "verify", help="Verify .mlx bundle manifest and SHA-256 integrity"
+            "verify",
+            help="Verify a .mlx bundle, an artifact's weights, or that it loads",
         )
-        verify_parser.add_argument("--bundle", "-b", required=True, help="Path to .mlx bundle")
+        verify_parser.add_argument("--bundle", "-b", help="Path to .mlx bundle")
+        verify_parser.add_argument(
+            "--model-dir", "-m", help="Converted MLX model directory"
+        )
+        verify_parser.add_argument(
+            "--source", "-s", help="Source GGUF that produced --model-dir"
+        )
+        verify_parser.add_argument(
+            "--load",
+            action="store_true",
+            help="Load with mlx_lm and run one forward pass (requires MLX)",
+        )
+        verify_parser.add_argument(
+            "--weights",
+            action="store_true",
+            help=(
+                "Re-audit stored tensors against --source; needs the "
+                "conversion_report.json written by conversion"
+            ),
+        )
+        verify_parser.add_argument(
+            "--json", action="store_true", help="Emit a JSON result instead of text"
+        )
 
         args = parser.parse_args(argv)
         if args.command == "convert":
@@ -3462,7 +3648,7 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "package":
             exit_code = 0 if package_mlx_directory(args.model_dir, args.output) else 1
         else:
-            exit_code = 0 if verify_mlx_bundle(args.bundle) else 1
+            exit_code = _run_verify_command(args, verify_parser)
         if exit_code:
             sys.exit(exit_code)
         return

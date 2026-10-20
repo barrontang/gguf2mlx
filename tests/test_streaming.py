@@ -165,7 +165,7 @@ def test_fusion_reads_headers_without_buffering_across_layers(monkeypatch):
 
     monkeypatch.setattr(core, "_decode_tensor_to_array", decode)
     reader = SimpleNamespace(tensors=tensors, get_field=lambda name: None)
-    for _, _, name, array in core._iter_weight_arrays(reader, "phi3", "float16"):
+    for _, _, name, array, _identity in core._iter_weight_arrays(reader, "phi3", "float16"):
         assert name.endswith("qkv_proj.weight")
         assert array.shape == (6, 4)
         del array

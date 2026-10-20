@@ -2,16 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/barrontang/gguf2mlx/conversion-report.schema.json",
   "title": "gguf2mlx conversion report",
+  "description": "Written as conversion_report.json next to every conversion. Schema 2 adds the three-tier fidelity block; schema 1 reports (architecture_kind, tensor_decisions) remain valid because those fields are optional here.",
   "type": "object",
-  "required": [
-    "schema_version",
-    "architecture",
-    "architecture_kind",
-    "router_protection",
-    "tensor_decisions"
-  ],
+  "required": ["schema_version", "architecture"],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "architecture": {"type": "string"},
     "architecture_kind": {"enum": ["dense", "moe", "hybrid"]},
     "mixed_precision": {"type": "boolean"},
@@ -19,7 +14,51 @@
     "protected_router_tensors": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
     "compressed_expert_tensors": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
     "unknown_tensors": {"type": "array", "items": {"type": "string"}},
-    "tensor_decisions": {"type": "array", "items": {"$ref": "#/$defs/decision"}}
+    "tensor_decisions": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
+
+    "dtype": {"type": "string"},
+    "source": {"type": ["string", "null"]},
+    "conversion": {
+      "type": "object",
+      "properties": {
+        "output_tensors": {"type": "integer"},
+        "compared_tensors": {"type": "integer"},
+        "skipped": {"type": "object", "additionalProperties": {"type": "integer"}}
+      }
+    },
+    "fidelity": {
+      "type": "object",
+      "required": ["weight", "numerical", "perplexity"],
+      "properties": {
+        "weight": {"$ref": "#/$defs/weightGate"},
+        "numerical": {"$ref": "#/$defs/tier"},
+        "perplexity": {"$ref": "#/$defs/tier"}
+      }
+    },
+    "gates": {
+      "type": "object",
+      "properties": {"weight": {"enum": ["pass", "fail", "not_run"]}}
+    },
+    "tensor_layout": {
+      "type": "object",
+      "description": "Audit plan: output tensor -> source GGUF tensor and whether it was written through unchanged.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["source", "layout"],
+        "properties": {
+          "source": {"type": "string"},
+          "layout": {"enum": ["identity", "transformed"]}
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "description": "Present when the audited weights are not the ones in this directory (e.g. after mlx_lm quantization).",
+      "properties": {
+        "stage": {"type": "string"},
+        "note": {"type": "string"}
+      }
+    }
   },
   "$defs": {
     "decision": {
@@ -33,6 +72,37 @@
         },
         "precision": {"oneOf": [{"type": "integer"}, {"type": "string"}]},
         "protected": {"type": "boolean"}
+      }
+    },
+    "tier": {
+      "type": "object",
+      "required": ["status", "gated"],
+      "properties": {
+        "status": {"type": "string"},
+        "gated": {"type": "boolean"},
+        "note": {"type": "string"},
+        "stage": {"type": "string"},
+        "error": {"type": "string"},
+        "logits_shape": {"type": "array", "items": {"type": "integer"}},
+        "logits_finite": {"type": "boolean"}
+      }
+    },
+    "weightGate": {
+      "type": "object",
+      "required": ["status", "gated", "tolerance", "dtype"],
+      "properties": {
+        "status": {"enum": ["pass", "fail", "not_run"]},
+        "gated": {"type": "boolean"},
+        "dtype": {"type": "string"},
+        "tolerance": {"type": "number"},
+        "tensors_compared": {"type": "integer"},
+        "tensors_total": {"type": "integer"},
+        "bit_exact_tensors": {"type": "integer"},
+        "max_relative_l2": {"type": ["number", "null"]},
+        "worst_tensor": {"type": ["string", "null"]},
+        "failures": {"type": "array", "items": {"type": "string"}},
+        "failure_count": {"type": "integer"},
+        "measured_stage": {"type": "string"}
       }
     }
   }

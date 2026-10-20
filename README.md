@@ -85,6 +85,30 @@ print(generate(model, tok, prompt="Hello from MLX", max_tokens=32))
 See [How conversion works](docs/how-conversion-works.md) for streaming, sharding
 and offline tokenizer reconstruction.
 
+## Is the output trustworthy?
+
+Every conversion writes `conversion_report.json` and gates on **weight
+fidelity**: each written tensor is compared position-wise against an
+independent decode of the source GGUF, with a per-dtype relative-L2 tolerance.
+Fused or permuted tensors are reported as `transformed` rather than silently
+counted as verified.
+
+```bash
+# Re-audit an existing artifact against the GGUF it came from
+gguf2mlx verify --model-dir ./mlx-model --weights --source model.gguf
+
+# Load it with mlx_lm and require finite logits from one forward pass
+gguf2mlx verify --model-dir ./mlx-model --load
+
+# Skip the (roughly 2x) audit cost
+gguf2mlx convert --input model.gguf --output ./mlx-model --no-weight-audit
+```
+
+Perplexity is recorded but never gated: cross-runtime PPL mixes quantization
+noise with conversion error, so it cannot prove a converter correct. Nightly,
+the pinned [load matrix](tests/load_matrix.json) converts real GGUF models and
+proves each one loads and runs.
+
 ## Supported models
 
 Conversion is adapter-based, not "any GGUF". Rows marked ⚠️ convert but still
@@ -144,20 +168,10 @@ Qwen3-VL **text-only** extraction is a separate `--type text-encoder` contract
 
 ## Documentation
 
-| Page | Contents |
-|---|---|
-| [Support matrix](docs/support-matrix.md) | Every architecture, its status, validation evidence |
-| [How conversion works](docs/how-conversion-works.md) | Pipeline, streaming, tokenizer reconstruction |
-| [VLM conversion](docs/vlm-conversion.md) | LLaVA / Qwen2-VL / MiniCPM-V flags and limits |
-| [Text conditioning](docs/text-encoder.md) | Qwen-VL text encoder contract |
-| [Publishing](docs/publishing.md) | Reusable `publish-mlx` workflow, PyPI releases |
-| [`.mlx` bundles](docs/mlx-bundle.md) | Packaging and integrity verification |
-| [Capabilities](docs/capabilities.md) | Feature status table |
-| [Benchmarks](docs/benchmarks.md) | Conversion/RSS/PPL harness |
-| [FAQ](docs/faq.md) | Common questions |
-| [Roadmap](docs/roadmap.md) | Done, and open for contributors |
-| [Validation](docs/validation/) | Native run logs and real-model reports |
-| [Development](docs/development.md) | Test suites, opt-in fixtures, Rust extension |
+[Quality gates](docs/quality-gates.md) · [Support matrix](docs/support-matrix.md) · [How conversion works](docs/how-conversion-works.md) ·
+[VLM conversion](docs/vlm-conversion.md) · [Text conditioning](docs/text-encoder.md) · [Publishing](docs/publishing.md) ·
+[`.mlx` bundles](docs/mlx-bundle.md) · [Capabilities](docs/capabilities.md) · [Benchmarks](docs/benchmarks.md) ·
+[FAQ](docs/faq.md) · [Roadmap](docs/roadmap.md) · [Validation logs](docs/validation/) · [Development](docs/development.md)
 
 ## Development
 

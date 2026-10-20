@@ -1,0 +1,90 @@
+[
+  {
+    "arch": "llama",
+    "qtype": "q4_0",
+    "repo_id": "bartowski/Llama-3.2-1B-Instruct-GGUF",
+    "filename": "Llama-3.2-1B-Instruct-Q4_0.gguf",
+    "sha256": "fa0390e7c043f89ae1847bd6682d748041a99d4ef3de0e0b27d33b6af97a8be8",
+    "size": 773025920
+  },
+  {
+    "arch": "llama",
+    "qtype": "q4_k_m",
+    "repo_id": "bartowski/Llama-3.2-1B-Instruct-GGUF",
+    "filename": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+    "sha256": "6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83",
+    "size": 807694464
+  },
+  {
+    "arch": "llama",
+    "qtype": "q8_0",
+    "repo_id": "bartowski/Llama-3.2-1B-Instruct-GGUF",
+    "filename": "Llama-3.2-1B-Instruct-Q8_0.gguf",
+    "sha256": "432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3",
+    "size": 1321083008
+  },
+  {
+    "arch": "qwen2",
+    "qtype": "q4_0",
+    "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "filename": "qwen2.5-0.5b-instruct-q4_0.gguf",
+    "sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
+    "size": 428730208
+  },
+  {
+    "arch": "qwen2",
+    "qtype": "q4_k_m",
+    "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+    "size": 491400032
+  },
+  {
+    "arch": "qwen2",
+    "qtype": "q8_0",
+    "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "filename": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "size": 675710816
+  },
+  {
+    "arch": "qwen3",
+    "qtype": "q8_0",
+    "repo_id": "Qwen/Qwen3-0.6B-GGUF",
+    "filename": "Qwen3-0.6B-Q8_0.gguf",
+    "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+    "size": 639446688
+  },
+  {
+    "arch": "gemma2",
+    "qtype": "q4_k_m",
+    "repo_id": "bartowski/gemma-2-2b-it-GGUF",
+    "filename": "gemma-2-2b-it-Q4_K_M.gguf",
+    "sha256": "e0aee85060f168f0f2d8473d7ea41ce2f3230c1bc1374847505ea599288a7787",
+    "size": 1708582752
+  },
+  {
+    "arch": "gemma2",
+    "qtype": "q8_0",
+    "repo_id": "bartowski/gemma-2-2b-it-GGUF",
+    "filename": "gemma-2-2b-it-Q8_0.gguf",
+    "sha256": "2d448a9aab894b8e8e18168cf3f490cb9f65632222f29f93514ac9ecc754debe",
+    "size": 2784495456
+  },
+  {
+    "arch": "phi3",
+    "qtype": "q4_k_m",
+    "repo_id": "bartowski/Phi-3-mini-4k-instruct-GGUF",
+    "filename": "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+    "sha256": "28a89b4ddb5766355f24e362ae4078b4c35b9ca9568df5fc9e6d9aeee4dee834",
+    "size": 2393231360
+  },
+  {
+    "arch": "phi3",
+    "qtype": "q8_0",
+    "repo_id": "bartowski/Phi-3-mini-4k-instruct-GGUF",
+    "filename": "Phi-3-mini-4k-instruct-Q8_0.gguf",
+    "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47",
+    "size": 4061221376
+  }
+]

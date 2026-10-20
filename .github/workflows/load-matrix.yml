@@ -1,0 +1,72 @@
+name: Load matrix
+
+# P0-2: turn "declared supported" into "actually loads".
+# Nightly runs the cheap half (Q4_K_M, Apple Silicon); the full sweep of every
+# pinned qtype is a manual dispatch so it does not burn runner time daily.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      qtypes:
+        description: "Comma-separated quantization types to test"
+        required: false
+        default: "q4_0,q4_k_m,q8_0"
+
+concurrency:
+  group: load-matrix-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: Convert, load, forward
+    # Apple Silicon is required: mlx_lm cannot even import on Intel.
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package with MLX
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[mlx,vlm]" pytest
+
+      - name: Require an Apple Silicon runtime
+        run: |
+          python - <<'PY'
+          import platform
+          import mlx.core as mx
+          import mlx_lm  # noqa: F401
+
+          if platform.machine() != "arm64":
+              raise SystemExit(f"mlx_lm needs arm64, got {platform.machine()}")
+          print("mlx", mx.__version__ if hasattr(mx, "__version__") else "?")
+          print("machine", platform.machine())
+          PY
+
+      - name: Run load matrix
+        env:
+          GGUF2MLX_LOAD_MATRIX: "1"
+          # Nightly: the single most common qtype. Manual: whatever was asked.
+          GGUF2MLX_LOAD_MATRIX_QTYPES: ${{ inputs.qtypes || 'q4_k_m' }}
+        run: pytest tests/test_load_matrix.py -q -ra
+
+      - name: Upload conversion reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: load-matrix-reports
+          path: |
+            **/conversion_report.json
+          if-no-files-found: ignore
+          retention-days: 14

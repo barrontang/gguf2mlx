@@ -237,7 +237,7 @@ def test_convert_refuses_nonempty_output_without_starting(tmp_path: Path, monkey
 def test_convert_cleans_staging_directory_after_failure(tmp_path: Path, monkeypatch):
     output_dir = tmp_path / "model"
 
-    def fake_convert(_input, staging_dir, _dtype):
+    def fake_convert(_input, staging_dir, _dtype, **_kwargs):
         (Path(staging_dir) / "partial.json").write_text("{}")
         return False
 
@@ -251,7 +251,7 @@ def test_convert_cleans_staging_directory_after_failure(tmp_path: Path, monkeypa
 def test_convert_returns_false_and_cleans_up_after_exception(tmp_path: Path, monkeypatch):
     output_dir = tmp_path / "model"
 
-    def fake_convert(_input, staging_dir, _dtype):
+    def fake_convert(_input, staging_dir, _dtype, **_kwargs):
         (Path(staging_dir) / "partial.json").write_text("{}")
         raise RuntimeError("conversion error")
 
@@ -265,7 +265,7 @@ def test_convert_quantizes_output_with_mlx_lm(tmp_path: Path, monkeypatch):
     output_dir = tmp_path / "model"
     quantize_calls = []
 
-    def fake_convert(_input, staging_dir, _dtype):
+    def fake_convert(_input, staging_dir, _dtype, **_kwargs):
         staging_path = Path(staging_dir)
         staging_path.mkdir(parents=True, exist_ok=True)
         (staging_path / "config.json").write_text("{}")
@@ -325,7 +325,7 @@ def test_convert_quantize_rejects_unsupported_group_size_before_starting(
 def test_convert_quantize_requires_mlx_lm(tmp_path: Path, monkeypatch):
     output_dir = tmp_path / "model"
 
-    def fake_convert(_input, staging_dir, _dtype):
+    def fake_convert(_input, staging_dir, _dtype, **_kwargs):
         staging_path = Path(staging_dir)
         staging_path.mkdir(parents=True, exist_ok=True)
         (staging_path / "config.json").write_text("{}")
@@ -342,7 +342,7 @@ def test_convert_quantize_requires_mlx_lm(tmp_path: Path, monkeypatch):
 def test_convert_cleans_staging_directory_after_quantization_failure(tmp_path: Path, monkeypatch):
     output_dir = tmp_path / "model"
 
-    def fake_convert(_input, staging_dir, _dtype):
+    def fake_convert(_input, staging_dir, _dtype, **_kwargs):
         staging_path = Path(staging_dir)
         staging_path.mkdir(parents=True, exist_ok=True)
         (staging_path / "config.json").write_text("{}")
