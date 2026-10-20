@@ -237,7 +237,10 @@ def test_cli_accepts_quant_source_and_the_alias(source_gguf, tmp_path, capsys):
 
 
 def test_mlx_lm_loads_the_mixed_width_artifact(source_gguf, tmp_path):
-    import mlx.core as mx  # noqa: F401  (skip when MLX is unavailable)
+    # Loading the artifact is a numerical check: it needs MLX, which only ships
+    # Apple Silicon wheels. The rest of the preserve suite is numpy-only.
+    pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
     from mlx_lm import load
 
     destination = tmp_path / "out"
