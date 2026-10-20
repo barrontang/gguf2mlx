@@ -104,7 +104,10 @@ jobs:
         env:
           GGUF2MLX_LOAD_MATRIX: "1"
           GGUF2MLX_LOAD_MATRIX_ENTRY: ${{ matrix.entry.arch }}-${{ matrix.entry.qtype }}
-        run: pytest tests/test_load_matrix.py -q -ra
+        # --basetemp stays inside the workspace so the report copy made by the
+        # test is actually visible to upload-artifact (the default pytest
+        # basetemp lives in /private/var/folders and is not searched).
+        run: pytest tests/test_load_matrix.py -q -ra --basetemp=load-matrix-tmp
 
       - name: Upload conversion report
         if: always()

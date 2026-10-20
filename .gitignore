@@ -46,3 +46,6 @@ traces/glm52-coding-en-retr_longctx-*.jsonl
 traces/glm52-coding-en-retr_longctx-*.jsonl.meta.json
 # Local review/roadmap notes, not part of the distributable source.
 gguf2mlx-review-and-roadmap*
+
+# CI-only pytest basetemp for the load matrix (see .github/workflows/load-matrix.yml).
+load-matrix-tmp/
