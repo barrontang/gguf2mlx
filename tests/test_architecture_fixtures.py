@@ -69,6 +69,26 @@ def test_llama_rotary_projection_restores_hf_order(projection, heads):
     np.testing.assert_array_equal(emitted[0][1], original)
 
 
+def test_llama_rotary_projection_leaves_degenerate_tensor_untouched():
+    # Streaming/smoke fixtures use tiny tensors that cannot represent the head
+    # count declared in metadata; they must pass through instead of raising.
+    arr = np.arange(12, dtype=np.float16).reshape(3, 4)
+    emitted = core._plan_tensor_emit(
+        "blk.0.attn_q.weight", arr, "llama",
+        {"num_heads": 64, "num_key_value_heads": 64}, {}, {},
+    )
+    np.testing.assert_array_equal(emitted[0][1], arr)
+
+
+def test_llama_rotary_projection_rejects_uneven_head_split():
+    arr = np.zeros((12, 8), dtype=np.float16)  # 12 rows / 4 heads -> odd head_dim 3
+    with pytest.raises(ValueError, match="cannot be split into 4 heads"):
+        core._plan_tensor_emit(
+            "blk.0.attn_q.weight", arr, "llama",
+            {"num_heads": 4, "num_key_value_heads": 4}, {}, {},
+        )
+
+
 def test_build_config_strict_rejects_defaulted_dimensions():
     reader = _FakeReader({"llama.vocab_size": 32}, tensor_names=["token_embd.weight"])
     with pytest.raises(ValueError, match="embedding_length"):

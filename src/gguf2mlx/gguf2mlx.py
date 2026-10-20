@@ -2171,10 +2171,23 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
             mla_dims["num_key_value_heads"] if ".attn_k." in gguf_name
             else mla_dims["num_heads"]
         )
-        if arr.ndim != 2 or arr.shape[0] % (2 * heads):
+        rows = arr.shape[0] if arr.ndim == 2 else 0
+        if rows and heads <= 0:
+            raise ValueError(f"Invalid Llama head count for {gguf_name}: {heads}")
+        # llama.cpp stores Q/K row-interleaved per rotary pair, so they have to be
+        # un-permuted for MLX. Synthetic fixtures (and degenerate exports) can
+        # declare more heads than the tensor has rows; there is no head layout to
+        # restore in that case, so leave the tensor untouched.
+        if rows and rows >= heads:
+            if rows % (2 * heads):
+                raise ValueError(
+                    f"Invalid Llama rotary projection shape: {gguf_name}: {arr.shape} "
+                    f"cannot be split into {heads} heads with an even head_dim"
+                )
+            arr = arr.reshape(heads, rows // (2 * heads), 2, arr.shape[1])
+            arr = arr.swapaxes(1, 2).reshape(rows, -1)
+        elif arr.ndim != 2:
             raise ValueError(f"Invalid Llama rotary projection shape: {gguf_name}: {arr.shape}")
-        arr = arr.reshape(heads, arr.shape[0] // (2 * heads), 2, arr.shape[1])
-        arr = arr.swapaxes(1, 2).reshape(-1, arr.shape[-1])
     if arch == "qwen2moe" and re.fullmatch(r"blk\.\d+\.ffn_gate_inp_shexp\.weight", gguf_name):
         arr = arr.reshape(1, -1)
 
