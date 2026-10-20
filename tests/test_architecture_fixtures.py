@@ -69,6 +69,109 @@ def test_llama_rotary_projection_restores_hf_order(projection, heads):
     np.testing.assert_array_equal(emitted[0][1], original)
 
 
+def _reader_with_rope_table(metadata: dict, table, tensors=("token_embd.weight",)):
+    reader = _FakeReader(metadata, tensors)
+    if table is not None:
+        reader.tensors.append(_FakeTensor("rope_freqs.weight", table))
+    return reader
+
+
+def test_llama3_rope_table_becomes_a_scaling_block():
+    """llama.cpp ships llama3 scaling as rop_freqs only; recover the metadata.
+
+    Llama-3.2-1B's real GGUF has no ``llama.rope.scaling.*`` fields at all, so
+    dropping the tensor without this inference would leave plain RoPE in the
+    config and rotate every position slightly wrong.
+    """
+    dim, base, factor, original = 64, 500000.0, 32.0, 8192
+    table = core._rope_freq_multiplier(dim, base, factor, original)
+    metadata = {
+        "llama.vocab_size": 32,
+        "llama.embedding_length": 2048,
+        "llama.block_count": 1,
+        "llama.attention.head_count": 32,
+        "llama.context_length": 131072,
+        "llama.rope.freq_base": base,
+        "llama.rope.dimension_count": dim,
+    }
+    config = core.build_config(_reader_with_rope_table(metadata, table), "llama")
+
+    assert config["rope_scaling"] == {
+        "type": "llama3",
+        "rope_type": "llama3",
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_max_position_embeddings": 8192,
+    }
+    # The inference is only accepted because it regenerates the table.
+    np.testing.assert_allclose(
+        core._rope_freq_multiplier(dim, base, 32.0, 8192), table, rtol=0, atol=1e-12
+    )
+
+
+def test_rope_table_without_a_matching_context_is_rejected():
+    table = core._rope_freq_multiplier(64, 500000.0, 32.0, 8192)
+    table[3] *= 7.0  # not any llama3 table we can express
+    with pytest.raises(ValueError, match="does not match llama3 rope scaling"):
+        core._rope_scaling_from_table(table, 64, 500000.0, "llama")
+
+
+def test_rope_table_is_rejected_for_architectures_without_rope_scaling():
+    table = core._rope_freq_multiplier(64, 500000.0, 32.0, 8192)
+    with pytest.raises(ValueError, match="unsupported for gemma"):
+        core._rope_scaling_from_table(table, 64, 500000.0, "gemma")
+
+
+def test_qwen3_ties_embeddings_when_output_weight_is_absent():
+    # Qwen3-0.6B ships token_embd only; forcing tie_word_embeddings=False made
+    # mlx_lm expect an lm_head the file never had ("Missing 1 parameters").
+    metadata = {
+        "qwen3.embedding_length": 1024,
+        "qwen3.block_count": 28,
+        "qwen3.attention.head_count": 16,
+        "qwen3.context_length": 40960,
+        "qwen3.rope.freq_base": 1000000.0,
+    }
+    tied = core.build_config(_FakeReader(metadata, ["token_embd.weight"]), "qwen3")
+    untied = core.build_config(
+        _FakeReader(metadata, ["token_embd.weight", "output.weight"]), "qwen3"
+    )
+    assert tied["tie_word_embeddings"] is True
+    assert untied["tie_word_embeddings"] is False
+
+
+@pytest.mark.parametrize(
+    ("gguf_name", "expected"),
+    [
+        ("blk.0.attn_norm.weight", "model.layers.0.input_layernorm.weight"),
+        ("blk.0.post_attention_norm.weight",
+         "model.layers.0.post_attention_layernorm.weight"),
+        ("blk.0.ffn_norm.weight", "model.layers.0.pre_feedforward_layernorm.weight"),
+        ("blk.0.post_ffw_norm.weight",
+         "model.layers.0.post_feedforward_layernorm.weight"),
+        ("blk.0.attn_q.weight", "model.layers.0.self_attn.q_proj.weight"),
+    ],
+)
+def test_gemma2_maps_all_four_block_norms(gguf_name, expected):
+    assert core._map_tensor_name(gguf_name, "gemma2") == expected
+
+
+def test_gemma1_keeps_the_two_norm_layout():
+    # Gemma 1 really does use ffn_norm as the post-attention norm.
+    assert core._map_tensor_name("blk.0.ffn_norm.weight", "gemma") == (
+        "model.layers.0.post_attention_layernorm.weight"
+    )
+
+
+def test_gemma_post_norms_are_de_shifted_like_the_other_norms():
+    # llama.cpp stores Gemma RMSNorm weights as 1 + w; mlx_lm adds the 1 back.
+    for name in ("blk.0.post_attention_norm.weight", "blk.0.post_ffw_norm.weight"):
+        arr = np.array([1.5, 2.0], dtype=np.float32)
+        restored = core._restore_architecture_tensor(name, arr, "gemma2")
+        np.testing.assert_allclose(restored, [0.5, 1.0])
+
+
 def test_llama_rotary_projection_leaves_degenerate_tensor_untouched():
     # Streaming/smoke fixtures use tiny tensors that cannot represent the head
     # count declared in metadata; they must pass through instead of raising.

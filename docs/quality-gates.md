@@ -120,14 +120,36 @@ it. Use `--load` on the quantized directory.
 `tests/load_matrix.json` pins real public GGUFs by repository, filename and
 SHA-256. With `GGUF2MLX_LOAD_MATRIX=1`, each entry is downloaded, hash-checked,
 converted, weight-gated, loaded with `mlx_lm` and exercised. The
-`Load matrix` workflow runs the Q4_K_M subset nightly on Apple Silicon and the
-full sweep on manual dispatch.
+`Load matrix` workflow fans the entries out as **one job per (architecture,
+qtype)** on Apple Silicon: a converted FP16 tree is 3-5x its source GGUF and a
+single runner has ~14 GB free, so running the whole sweep in one job ends in
+`ENOSPC` that looks exactly like a conversion bug.
+
+Run a single pinned case locally with
+`GGUF2MLX_LOAD_MATRIX=1 GGUF2MLX_LOAD_MATRIX_ENTRY=llama-q4_k_m pytest
+tests/test_load_matrix.py -q`.
 
 The matrix currently covers Llama-3.2-1B, Qwen2.5-0.5B, Qwen3-0.6B, Gemma-2-2B
 and Phi-3-mini across Q4_0 / Q4_K_M / Q8_0 where published. MoE architectures are
 excluded from the nightly set because no ≤2B public fixture exists; their
 evidence remains the pinned real-model runs in
 [validation](validation/native-validation-2026-10-18.md).
+
+### What the first full sweep found
+
+The first run of all thirteen cases (2026-10-21, one job, `main` @ `63fe89c`)
+passed **4 of 11** e2e cases. Everything it caught was invisible to the unit
+suite, which is the point of the gate:
+
+| Symptom at load | Root cause | Fix |
+|---|---|---|
+| `Received 1 parameters not in model: rope_freqs.weight` (llama ×3) | llama.cpp carries llama3 rope scaling as a precomputed table with **no** `llama.rope.scaling.*` metadata, and the mapper passed the tensor through. The config also lost the scaling, so positions would have rotated wrongly even after dropping the tensor | infer `factor` / `original_max_position_embeddings` from the table, **verify by regenerating it**, emit `rope_scaling: llama3`, drop the tensor |
+| `Missing 1 parameters: lm_head.weight` (qwen3) | `build_config` forced `tie_word_embeddings=False` for qwen3 while Qwen3-0.6B ships no `output.weight` | tie/untie follows the tensor list for every architecture |
+| `Unsupported gemma2 tensor: blk.0.post_attention_norm.weight` | the Llama mapper only knows two norms per block; Gemma 2/3 has four (`attn_norm`, `post_attention_norm`, `ffn_norm`, `post_ffw_norm`) and `ffn_norm` is the *pre*-FFN norm | dedicated Gemma 2/3 mapper plus the `-1` de-shift for both post norms |
+| `25165824 requested and 0 written` (phi3 Q8_0) | disk exhaustion: twelve downloads plus their FP16 outputs on one 14 GB runner | one job per entry, and drop the converted tree after each case |
+
+Re-run after the fixes: llama-q4_0, qwen3-q8_0 and gemma2-q4_k_m convert, pass
+the weight gate and load with finite logits locally.
 
 ## What is still not covered
 

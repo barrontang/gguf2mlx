@@ -550,6 +550,110 @@ def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[st
     return config
 
 
+# Architectures whose runtime rope layer understands an HF ``rope_scaling``
+# block. Anything else has no place to put a llama3 frequency table.
+ROPE_SCALING_ARCHES = {
+    "llama", "mistral", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "stablelm",
+}
+# Plausible ``original_max_position_embeddings`` values for llama3 scaling.
+_ROPE_ORIGINAL_CONTEXT_CANDIDATES = tuple(
+    1024 * 2**power for power in range(9)  # 1024 .. 262144
+)
+
+
+def _rope_freq_multiplier(
+    dim: int, base: float, factor: float, original_context: int,
+    low_freq_factor: float = 1.0, high_freq_factor: float = 4.0,
+) -> np.ndarray:
+    """Reproduce llama.cpp's ``rope_freqs`` table for llama3 rope scaling.
+
+    The tensor is a per-pair multiplier on ``base ** (arange(0, dim, 2) / dim)``:
+    1.0 below the high-frequency wavelength, ``factor`` above the low-frequency
+    one, and a smooth ramp in between. Deriving it is how we prove an inferred
+    ``rope_scaling`` block matches the table the file actually shipped.
+    """
+    freqs = base ** (np.arange(0, dim, 2, dtype=np.float64) / dim)
+    wavelen = 2 * np.pi * freqs
+    low_wavelen = original_context / low_freq_factor
+    high_wavelen = original_context / high_freq_factor
+    multiplier = np.ones_like(freqs)
+    multiplier[wavelen > low_wavelen] = factor
+    middle = (wavelen > high_wavelen) & (wavelen < low_wavelen)
+    if np.any(middle):
+        smooth = (original_context / wavelen[middle] - low_freq_factor) / (
+            high_freq_factor - low_freq_factor
+        )
+        multiplier[middle] = 1.0 / ((1.0 - smooth) / factor + smooth)
+    return multiplier
+
+
+def _rope_scaling_from_table(
+    table: np.ndarray, dim: int, base: float, arch: str,
+) -> dict[str, Any] | None:
+    """Infer an HF ``rope_scaling`` block from a ``rope_freqs.weight`` tensor.
+
+    llama.cpp carries llama3 scaling as a precomputed table instead of metadata
+    keys, so a GGUF with the tensor has no ``*.rope.scaling.*`` fields at all.
+    Dropping the tensor would silently leave plain RoPE in the config, and
+    copying it is impossible (MLX has no per-pair frequency parameter). So the
+    parameters are recovered and then *verified* by regenerating the table: an
+    inference that does not reproduce the file bit-for-bit is rejected.
+    """
+    values = np.asarray(table, dtype=np.float64).reshape(-1)
+    if values.size != dim // 2:
+        raise ValueError(
+            f"rope_freqs.weight has {values.size} values but the rotary dimension "
+            f"is {dim} (expected {dim // 2})"
+        )
+    if not np.all(np.isfinite(values)) or np.any(values <= 0):
+        raise ValueError("rope_freqs.weight contains non-positive or non-finite values")
+    if np.allclose(values, 1.0, rtol=0, atol=1e-5):
+        return None  # plain RoPE; nothing to describe
+    if arch not in ROPE_SCALING_ARCHES:
+        raise ValueError(
+            f"rope_freqs.weight is unsupported for {arch}: no rope_scaling block "
+            "can carry it, so converting would rotate positions differently"
+        )
+
+    factor = float(values.max())
+    rounded = round(factor)
+    if rounded < 2 or abs(factor - rounded) > 1e-3 * rounded:
+        raise ValueError(
+            f"rope_freqs.weight implies a non-integer llama3 factor ({factor:.6g})"
+        )
+
+    matches = [
+        original for original in _ROPE_ORIGINAL_CONTEXT_CANDIDATES
+        if np.allclose(
+            _rope_freq_multiplier(dim, base, float(rounded), original),
+            values, rtol=1e-5, atol=1e-4,
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "rope_freqs.weight does not match llama3 rope scaling for any known "
+            f"original context (factor={rounded}, candidates={matches or 'none'}); "
+            "refusing to convert with a rope this file did not use"
+        )
+
+    return {
+        "type": "llama3",
+        "rope_type": "llama3",
+        "factor": float(rounded),
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_max_position_embeddings": matches[0],
+    }
+
+
+def _rope_freqs_tensor(reader: GGUFReader) -> np.ndarray | None:
+    """Return the ``rope_freqs.weight`` payload, if the file ships one."""
+    for tensor in reader.tensors:
+        if tensor.name == "rope_freqs.weight":
+            return np.asarray(tensor.data).reshape(-1)
+    return None
+
+
 def build_config(
     reader: GGUFReader,
     arch: str,
@@ -698,6 +802,20 @@ def build_config(
     if norm_eps is None:
         norm_eps = 1e-6
 
+    # llama.cpp stores llama3 scaling as a precomputed table plus nothing else;
+    # recover the HF spelling now so the tensor itself can be dropped later.
+    rope_table = _rope_freqs_tensor(reader)
+    table_rope_scaling = None
+    if rope_table is not None:
+        rope_dim = (
+            get_metadata_int(reader, f"{arch}.rope.dimension_count")
+            or get_metadata_int(reader, "llama.rope.dimension_count")
+            or rope_table.size * 2
+        )
+        table_rope_scaling = _rope_scaling_from_table(
+            rope_table, rope_dim, rope_theta, arch
+        )
+
     file_type = get_metadata_int(reader, "general.file_type") or 1
     model_name = get_metadata_str(reader, "general.name") or "unknown"
     bos_id = get_metadata_int(reader, "tokenizer.ggml.bos_token_id")
@@ -709,13 +827,20 @@ def build_config(
 
     # --- Build config ---
     # Detect tied embeddings (many Qwen, Gemma, etc. models have this)
-    tie_embeddings = arch in (
-        "qwen2", "qwen2moe", "gemma", "gemma2", "gemma3",
-        "olmo", "olmo2", "openelm",
-    )
-    if arch == "llama" and reader.tensors:
-        tensor_names = {tensor.name for tensor in reader.tensors}
-        tie_embeddings = "token_embd.weight" in tensor_names and "output.weight" not in tensor_names
+    tensor_names = {tensor.name for tensor in reader.tensors}
+    # A GGUF that omits ``output.weight`` is tied by construction: llama.cpp
+    # reuses the token embedding as the output projection. Deriving this from
+    # the tensor list (not a per-architecture guess) is what keeps Qwen3-0.6B
+    # from being converted with an ``lm_head`` the file never had.
+    if "token_embd.weight" in tensor_names and "output.weight" not in tensor_names:
+        tie_embeddings = True
+    elif "output.weight" in tensor_names:
+        tie_embeddings = False
+    else:
+        tie_embeddings = arch in (
+            "qwen2", "qwen2moe", "gemma", "gemma2", "gemma3",
+            "olmo", "olmo2", "openelm",
+        )
 
     # Detect attention bias. Gemma projections are bias-free; Phi-3 uses a fused,
     # bias-free QKV projection in MLX-LM.
@@ -748,6 +873,8 @@ def build_config(
         "_gguf_file_type": file_type,
         "_original_name": model_name,
     }
+    if table_rope_scaling is not None:
+        config["rope_scaling"] = table_rope_scaling
 
     # --- Architecture-specific overrides ---
     if arch in (
@@ -1011,7 +1138,8 @@ def build_config(
             or hidden_size // num_heads
         )
         config["attention_bias"] = False
-        config["tie_word_embeddings"] = False
+        # Tie/untie follows the tensor list (Qwen3-0.6B ships no output.weight),
+        # so do not force a value here.
 
     if arch in QWEN35_ARCHES:
         config["model_type"] = "qwen3_5"
@@ -1241,6 +1369,28 @@ def _map_llama_tensor_name(gguf_name: str) -> str:
     return gguf_name
 
 
+def _map_gemma_tensor_name(gguf_name: str) -> str:
+    """Map Gemma 2/3 tensors: four norms per block, not two.
+
+    llama.cpp writes ``attn_norm``/``ffn_norm``/``post_attention_norm``/
+    ``post_ffw_norm``. The Llama mapper sends ``ffn_norm`` to
+    ``post_attention_layernorm``, which is the Gemma-1 layout; for Gemma 2/3 it
+    is the *pre*-FFN norm, and the two post norms have no Llama equivalent.
+    """
+    match = re.fullmatch(r"blk\.(\d+)\.(.+)", gguf_name)
+    if match is not None:
+        layer_idx, rest = match.groups()
+        suffix = {
+            "attn_norm.weight": "input_layernorm.weight",
+            "post_attention_norm.weight": "post_attention_layernorm.weight",
+            "ffn_norm.weight": "pre_feedforward_layernorm.weight",
+            "post_ffw_norm.weight": "post_feedforward_layernorm.weight",
+        }.get(rest)
+        if suffix is not None:
+            return f"model.layers.{layer_idx}.{suffix}"
+    return _map_llama_tensor_name(gguf_name)
+
+
 def _find_phi3_rope_factor_tensors(reader: GGUFReader) -> dict[str, list[float]]:
     """Read and validate the shared LongRoPE factor tensors from a Phi GGUF."""
     factors: dict[str, list[float]] = {}
@@ -1294,7 +1444,10 @@ def _restore_architecture_tensor(gguf_name: str, arr: np.ndarray, arch: str) -> 
     """Undo architecture-specific transformations applied during HF-to-GGUF export."""
     if arch in {"gemma", "gemma2", "gemma3"} and (
         gguf_name == "output_norm.weight"
-        or re.fullmatch(r"blk\.\d+\.(attn_norm|ffn_norm)\.weight", gguf_name)
+        or re.fullmatch(
+            r"blk\.\d+\.(attn_norm|ffn_norm|post_attention_norm|post_ffw_norm)\.weight",
+            gguf_name,
+        )
     ):
         return cast(np.ndarray, arr - np.array(1, dtype=arr.dtype))
     if arch in QWEN35_ARCHES:
@@ -1459,6 +1612,8 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
         }[gguf_name]
     elif arch in PHI_ARCHES:
         mapped = _map_phi3_tensor_name(gguf_name)
+    elif arch in {"gemma2", "gemma3"}:
+        mapped = _map_gemma_tensor_name(gguf_name)
     elif arch == "qwen2moe" and (
         match := re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down|gate_inp)_shexp\.weight", gguf_name)
     ):
@@ -2406,6 +2561,13 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
     """Decode lazily, visiting related headers together to bound fusion buffers."""
     groups: dict[str, list[Any]] = {}
     for tensor in reader.tensors:
+        if tensor.name == "rope_freqs.weight":
+            # llama.cpp's precomputed llama3 table. MLX has no per-pair
+            # frequency parameter, so build_config turned it into an equivalent
+            # rope_scaling block and verified the round-trip; emitting the
+            # tensor itself would only make mlx_lm reject the model.
+            print("    Skipping rope_freqs.weight (reproduced from config)")
+            continue
         if arch in PHI_ARCHES and re.fullmatch(
             r"(?:blk\.\d+\.)?rope_factors_(?:long|short)(?:\.weight)?",
             tensor.name,

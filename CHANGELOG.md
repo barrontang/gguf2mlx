@@ -28,6 +28,37 @@
   as an empty string, which is not valid JSON. It now parses `""` as "nothing
   configured" and exits with the variable name and expected format.
 
+### What the first full load-matrix sweep caught
+
+The matrix had never executed. The first sweep of all thirteen pinned cases
+passed 4 of 11 end-to-end conversions and exposed four defects that no unit
+test could see:
+
+- **llama3 rope scaling was being dropped.** llama.cpp ships llama3 scaling as
+  a `rope_freqs.weight` table with no `llama.rope.scaling.*` metadata. The
+  mapper passed the tensor through unchanged, so `mlx_lm` rejected the model
+  ("Received 1 parameters not in model"), and the config had no scaling at all.
+  The table is now read, the equivalent `rope_scaling` block is inferred and
+  **verified by regenerating the table**, and the tensor is not emitted. A
+  table that cannot be reproduced fails the conversion instead of rotating
+  positions differently.
+- **Qwen3-0.6B got an `lm_head` it never had.** `build_config` forced
+  `tie_word_embeddings=False` for qwen3 while the file ships no `output.weight`.
+  Tie/untie is now derived from the tensor list for every architecture
+  ("Missing 1 parameters: lm_head.weight").
+- **Gemma 2/3 lost two of their four block norms.** The Llama mapper maps
+  `ffn_norm` to `post_attention_layernorm`, which is the Gemma-1 layout;
+  Gemma 2/3 needs `post_attention_norm` and `post_ffw_norm` as well, and its
+  `ffn_norm` is the *pre*-FFN norm. Both post norms also need the same `-1`
+  de-shift as the others (llama.cpp stores `1 + w`).
+- **The job ran out of disk, not out of correctness.** A 4 GB GGUF becomes an
+  8 GB FP16 tree, and one `macos-14` runner has ~14 GB. The workflow now fans
+  out one job per (architecture, qtype) and the test drops the converted tree
+  after each case while keeping the report.
+
+`docs/quality-gates.md` records the symptom → cause → fix table, and the
+workflow is a real matrix (`plan` job → `strategy.matrix`) rather than a loop.
+
 ### Version
 
 - `2.2.0` replaces `2.1.5.dev0`. `publish-mlx.yml`'s `converter_version`

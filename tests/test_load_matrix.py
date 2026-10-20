@@ -13,6 +13,12 @@ Restrict the quantization types with:
 
     GGUF2MLX_LOAD_MATRIX=1 GGUF2MLX_LOAD_MATRIX_QTYPES=q4_k_m \
       pytest tests/test_load_matrix.py -q
+
+or run a single pinned case (this is how CI fans the matrix out, one runner per
+entry):
+
+    GGUF2MLX_LOAD_MATRIX=1 GGUF2MLX_LOAD_MATRIX_ENTRY=llama-q4_k_m \
+      pytest tests/test_load_matrix.py -q
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -38,7 +45,20 @@ def _selected_qtypes() -> set[str]:
 
 def _selected() -> list[dict]:
     wanted = _selected_qtypes()
-    return [entry for entry in ALL_ENTRIES if not wanted or entry["qtype"] in wanted]
+    only = os.environ.get("GGUF2MLX_LOAD_MATRIX_ENTRY", "").strip()
+    entries = [entry for entry in ALL_ENTRIES if not wanted or entry["qtype"] in wanted]
+    if only:
+        entries = [
+            entry for entry in entries
+            if f"{entry['arch']}-{entry['qtype']}" == only
+        ]
+        if not entries:
+            known = [f"{entry['arch']}-{entry['qtype']}" for entry in ALL_ENTRIES]
+            raise RuntimeError(
+                f"GGUF2MLX_LOAD_MATRIX_ENTRY={only} matches no pinned entry; "
+                f"known ids: {known}"
+            )
+    return entries
 
 
 ENTRIES = _selected()
@@ -94,16 +114,25 @@ def test_converted_model_loads_and_runs(entry, tmp_path):
     )
 
     output = tmp_path / "converted"
-    assert core.convert(str(source), str(output)) is True
+    try:
+        assert core.convert(str(source), str(output)) is True
 
-    report = json.loads((output / fidelity.REPORT_NAME).read_text())
-    weight = report["fidelity"]["weight"]
-    assert weight["status"] == "pass", (
-        f"weight fidelity failed: {weight['failures']} "
-        f"(max relative L2 {weight['max_relative_l2']})"
-    )
-    assert weight["tensors_compared"] > 0
+        report = json.loads((output / fidelity.REPORT_NAME).read_text())
+        weight = report["fidelity"]["weight"]
+        assert weight["status"] == "pass", (
+            f"weight fidelity failed: {weight['failures']} "
+            f"(max relative L2 {weight['max_relative_l2']})"
+        )
+        assert weight["tensors_compared"] > 0
 
-    result = fidelity.load_and_run(output)
-    assert result["status"] == "pass", result
-    assert result["logits_finite"] is True
+        result = fidelity.load_and_run(output)
+        assert result["status"] == "pass", result
+        assert result["logits_finite"] is True
+    finally:
+        # Keep the (small) report for the artifact and the failure message, drop
+        # the multi-GB weights: one runner has ~14 GB total and the converted
+        # FP16 tree is 3-5x the source GGUF.
+        report_path = output / fidelity.REPORT_NAME
+        if report_path.is_file():
+            shutil.copy2(report_path, tmp_path / "conversion_report.json")
+        shutil.rmtree(output, ignore_errors=True)

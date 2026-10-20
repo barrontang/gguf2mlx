@@ -3,6 +3,11 @@ name: Load matrix
 # P0-2: turn "declared supported" into "actually loads".
 # Nightly runs the cheap half (Q4_K_M, Apple Silicon); the full sweep of every
 # pinned qtype is a manual dispatch so it does not burn runner time daily.
+#
+# One job per (architecture, qtype) on purpose: a converted FP16 model is 3-5x
+# the GGUF it came from, and a single macos-14 runner only has ~14 GB free. The
+# first full sweep ran all thirteen cases in one job and died of ENOSPC partway
+# through, which looked like a conversion bug.
 
 on:
   schedule:
@@ -22,11 +27,47 @@ permissions:
   contents: read
 
 jobs:
+  plan:
+    name: Plan entries
+    runs-on: ubuntu-latest
+    outputs:
+      entries: ${{ steps.select.outputs.entries }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - id: select
+        env:
+          QTYPES: ${{ inputs.qtypes || 'q4_k_m' }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          wanted = {q.strip() for q in os.environ["QTYPES"].split(",") if q.strip()}
+          entries = json.load(open("tests/load_matrix.json", encoding="utf-8"))
+          selected = [e for e in entries if not wanted or e["qtype"] in wanted]
+          known = {e["qtype"] for e in entries}
+          unknown = wanted - known
+          if unknown:
+              raise SystemExit(f"unknown qtypes {sorted(unknown)}; known: {sorted(known)}")
+          if not selected:
+              raise SystemExit("no matrix entries selected")
+          print(f"entries={json.dumps(selected, separators=(',', ':'))}")
+          print(f"selected {len(selected)} entries", flush=True)
+          PY
+
   matrix:
-    name: Convert, load, forward
+    name: ${{ matrix.entry.arch }}-${{ matrix.entry.qtype }}
+    needs: plan
     # Apple Silicon is required: mlx_lm cannot even import on Intel.
     runs-on: macos-14
-    timeout-minutes: 180
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        entry: ${{ fromJSON(needs.plan.outputs.entries) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -35,6 +76,9 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Report free disk
+        run: df -h /
 
       - name: Install package with MLX
         run: |
@@ -57,15 +101,14 @@ jobs:
       - name: Run load matrix
         env:
           GGUF2MLX_LOAD_MATRIX: "1"
-          # Nightly: the single most common qtype. Manual: whatever was asked.
-          GGUF2MLX_LOAD_MATRIX_QTYPES: ${{ inputs.qtypes || 'q4_k_m' }}
+          GGUF2MLX_LOAD_MATRIX_ENTRY: ${{ matrix.entry.arch }}-${{ matrix.entry.qtype }}
         run: pytest tests/test_load_matrix.py -q -ra
 
-      - name: Upload conversion reports
+      - name: Upload conversion report
         if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: load-matrix-reports
+          name: load-matrix-${{ matrix.entry.arch }}-${{ matrix.entry.qtype }}
           path: |
             **/conversion_report.json
           if-no-files-found: ignore
