@@ -11,6 +11,7 @@ import base64
 import gc  # noqa: F401
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -3965,13 +3966,47 @@ def _run_verify_command(args: argparse.Namespace, parser: argparse.ArgumentParse
     return 0 if result["status"] == "pass" else 1
 
 
+def _run_publish_command(args: argparse.Namespace) -> int:
+    from .publish import PublishError, publish
+
+    try:
+        result = publish(
+            args.source,
+            args.gguf,
+            args.dest,
+            source_revision=args.source_revision,
+            private=args.private,
+            quantize=args.quantize,
+            quant_source=args.quant_source,
+            q_bits=args.q_bits,
+            q_group_size=args.q_group_size,
+            q_mode=args.q_mode,
+            dtype=args.dtype,
+            token=args.token or os.environ.get("HF_TOKEN"),
+            work_dir=args.work_dir,
+            keep_work_dir=args.keep_work_dir,
+        )
+    except PublishError as error:
+        print(f"❌ Publish failed: {error}")
+        return 1
+    print(f"✅ Published {result.destination} ({len(result.files)} files)")
+    if result.commit_url:
+        print(f"   {result.commit_url}")
+    print(f"   converter {result.provenance['gguf2mlx_version']}, "
+          f"{len(result.shards)} source shard(s)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(argv) if argv is not None else sys.argv[1:]
     command = argv[0] if argv else None
 
-    if command in {"convert", "package", "verify"}:
+    if command in {"convert", "package", "verify", "publish"}:
         parser = argparse.ArgumentParser(
-            description="gguf2mlx command suite for conversion, packaging, and verification"
+            description=(
+                "gguf2mlx command suite for conversion, packaging, publishing, "
+                "and verification"
+            )
         )
         subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -4016,11 +4051,72 @@ def main(argv: list[str] | None = None) -> None:
             "--json", action="store_true", help="Emit a JSON result instead of text"
         )
 
+        publish_parser = subparsers.add_parser(
+            "publish",
+            help="Convert a GGUF hosted on the Hub and publish the MLX model",
+            description=(
+                "Download a GGUF from the Hugging Face Hub, convert it to MLX, "
+                "and upload the result with a provenance record and the source "
+                "license files. Split GGUFs are merged; a partial shard set is "
+                "rejected before anything is downloaded."
+            ),
+        )
+        publish_parser.add_argument(
+            "--source", required=True, help="Hugging Face repo holding the GGUF"
+        )
+        publish_parser.add_argument(
+            "--gguf", required=True, help="GGUF path inside --source (any shard of a split set)"
+        )
+        publish_parser.add_argument(
+            "--dest", required=True, help="Hugging Face repo to create or update"
+        )
+        publish_parser.add_argument(
+            "--source-revision",
+            default="main",
+            help="Source branch, tag, or commit resolved to an immutable SHA",
+        )
+        publish_parser.add_argument(
+            "--private",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Create a missing destination repository as private (default: private)",
+        )
+        publish_parser.add_argument(
+            "--quantize",
+            action="store_true",
+            help="Emit affine 4-bit weights instead of float16 (requires MLX on macOS)",
+        )
+        publish_parser.add_argument(
+            "--quant-source",
+            choices=QUANT_SOURCE_CHOICES,
+            default="requant",
+            help="Preserve the source GGUF blocks instead of quantizing float16 again",
+        )
+        publish_parser.add_argument("--q-bits", type=int, default=4, choices=[4, 6, 8])
+        publish_parser.add_argument(
+            "--q-group-size", type=int, default=None, choices=[32, 64, 128]
+        )
+        publish_parser.add_argument("--q-mode", default="affine", choices=["affine"])
+        publish_parser.add_argument("--dtype", default="float16", choices=["float16"])
+        publish_parser.add_argument(
+            "--token", default=None, help="Hugging Face token (default: HF_TOKEN)"
+        )
+        publish_parser.add_argument(
+            "--work-dir", default=None, help="Directory for the temporary download/convert tree"
+        )
+        publish_parser.add_argument(
+            "--keep-work-dir",
+            action="store_true",
+            help="Keep the temporary tree after the run (debugging)",
+        )
+
         args = parser.parse_args(argv)
         if args.command == "convert":
             exit_code = _run_convert_command(args)
         elif args.command == "package":
             exit_code = 0 if package_mlx_directory(args.model_dir, args.output) else 1
+        elif args.command == "publish":
+            exit_code = _run_publish_command(args)
         else:
             exit_code = _run_verify_command(args, verify_parser)
         if exit_code:

@@ -53,6 +53,7 @@ mlx = [
     "mlx-lm>=0.29.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 vlm = ["huggingface-hub>=1.0.1"]
+publish = ["huggingface-hub>=1.0.1"]
 ppl = ["llama-cpp-python==0.3.36"]
 all = [
     "mlx>=0.18.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
@@ -62,6 +63,7 @@ all = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov",
+    "pyyaml",
     "ruff",
     "mypy",
     "build",

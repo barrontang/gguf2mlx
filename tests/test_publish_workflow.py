@@ -1,177 +1,104 @@
-"""Exercise the reusable workflow's Python payload without MLX or HF access."""
+"""Contract tests for the reusable publish workflow (a thin shell over the CLI)."""
 
-import importlib.metadata
-import runpy
-import subprocess
-import sys
-import textwrap
+from __future__ import annotations
+
+import re
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
 
-import pytest
+import yaml
 
-WORKFLOW = (
+WORKFLOW_PATH = (
     Path(__file__).resolve().parents[1] / ".github" / "workflows" / "publish-mlx.yml"
-).read_text()
-PAYLOAD = textwrap.dedent(WORKFLOW.split("python - <<'PY'\n", 1)[1].rsplit("          PY", 1)[0])
+)
+WORKFLOW = WORKFLOW_PATH.read_text()
+PARSED = yaml.safe_load(WORKFLOW)
+JOB = PARSED["jobs"]["convert-publish"]
+STEPS = JOB["steps"]
 
 
-@pytest.fixture
-def publishing(monkeypatch, tmp_path):
-    environment = {
-        "SOURCE_REPO": "publisher/model-GGUF",
-        "DESTINATION_REPO": "mlx-community/model-MLX",
-        "GGUF_FILE": "weights/model.gguf",
-        "SOURCE_REVISION": "uploaded-commit",
-        "HF_TOKEN": "test-placeholder",
-        "PRIVATE": "true",
-        "QUANTIZE": "false",
-        "RUNNER_TEMP": str(tmp_path),
+def _step(name: str) -> dict:
+    for step in STEPS:
+        if step.get("name") == name:
+            return step
+    raise AssertionError(f"step {name!r} not found")
+
+
+def _run_bodies() -> list[str]:
+    return [step["run"] for step in STEPS if "run" in step]
+
+
+def test_workflow_delegates_to_the_publish_subcommand():
+    publish_step = _step("Download, convert, and publish")
+    body = publish_step["run"]
+    assert "gguf2mlx publish" in body
+    # The pipeline lives in Python, not in a heredoc inside the workflow.
+    assert "python - <<" not in WORKFLOW
+    assert "import " not in WORKFLOW
+    for flag in ("--source", "--gguf", "--dest", "--source-revision"):
+        assert flag in body
+
+
+def test_untrusted_inputs_reach_the_shell_only_through_the_environment():
+    for body in _run_bodies():
+        assert "${{ inputs." not in body
+        assert "${{ secrets." not in body
+    # ``runs-on`` is a workflow expression, not a shell body, so it is exempt.
+    publish_step = _step("Download, convert, and publish")
+    env = publish_step["env"]
+    assert env["SOURCE_REPO"] == "${{ inputs.source_repo }}"
+    assert env["GGUF_FILE"] == "${{ inputs.gguf_file }}"
+    assert env["DESTINATION_REPO"] == "${{ inputs.destination_repo }}"
+    assert env["HF_TOKEN"] == "${{ secrets.HF_TOKEN }}"
+
+
+def test_workflow_declares_the_expected_call_interface():
+    inputs = PARSED[True]["workflow_call"]["inputs"]
+    assert set(inputs) == {
+        "source_repo",
+        "gguf_file",
+        "source_revision",
+        "destination_repo",
+        "private",
+        "quantize",
+        "runner",
+        "converter_version",
     }
-    for key, value in environment.items():
-        monkeypatch.setenv(key, value)
-    state = SimpleNamespace(
-        downloads=[], commands=[], creates=[], uploads=[], events=[], fail=False, incomplete=False,
-    )
-    card = SimpleNamespace(
-        data=SimpleNamespace(tags=["gguf", "text-generation"], license="apache-2.0"),
-        text="Original model card and license information.",
-    )
-    card.save = lambda path: path.write_text(card.text)
-    state.card = card
-
-    def model_info(repo, revision):
-        assert (repo, revision) == ("publisher/model-GGUF", "uploaded-commit")
-        return SimpleNamespace(sha="immutable-source-commit")
-
-    def download(repo, filename, revision):
-        assert repo == "publisher/model-GGUF"
-        state.downloads.append((filename, revision))
-        path = tmp_path / "cache" / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("source content")
-        return str(path)
-
-    def convert(command, check):
-        assert check is True
-        state.commands.append(command)
-        state.events.append("convert")
-        if state.fail:
-            raise subprocess.CalledProcessError(1, command)
-        output = Path(command[command.index("--output") + 1])
-        output.mkdir()
-        (output / "config.json").write_text("{}")
-        if not state.incomplete:
-            (output / "model.safetensors").write_bytes(b"weights")
-
-    def create_repo(repo, **kwargs):
-        state.creates.append((repo, kwargs))
-        state.events.append("create")
-
-    def upload_folder(**kwargs):
-        state.events.append("upload")
-        output = Path(kwargs["folder_path"])
-        state.uploads.append({
-            "arguments": kwargs,
-            "files": {str(p.relative_to(output)): p.read_bytes() for p in output.rglob("*")
-                      if p.is_file()},
-        })
-        return SimpleNamespace(commit_url="https://huggingface.co/commit/example")
-
-    api = SimpleNamespace(
-        model_info=model_info, create_repo=create_repo, upload_folder=upload_folder,
-        list_repo_files=lambda *args, **kwargs: ["README.md", "LICENSE", "legal/NOTICE.txt"],
-    )
-    hub = ModuleType("huggingface_hub")
-    hub.HfApi = lambda token: api
-    hub.ModelCard = SimpleNamespace(load=lambda path: card)
-    hub.hf_hub_download = download
-    utils = ModuleType("huggingface_hub.utils")
-
-    def validate_repo_id(repo):
-        if repo.count("/") != 1:
-            raise ValueError("Invalid repository")
-
-    utils.validate_repo_id = validate_repo_id
-    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
-    monkeypatch.setitem(sys.modules, "huggingface_hub.utils", utils)
-    monkeypatch.setattr(subprocess, "run", convert)
-    monkeypatch.setattr(importlib.metadata, "version", lambda name: "2.1.4")
-    payload_path = tmp_path / "workflow_payload.py"
-    payload_path.write_text(PAYLOAD)
-    state.run = lambda: runpy.run_path(str(payload_path))
-    return state
+    assert inputs["quantize"]["default"] is False
+    assert inputs["private"]["default"] is True
+    assert PARSED[True]["workflow_call"]["secrets"]["HF_TOKEN"]["required"] is True
 
 
-def test_publish_pins_downloads_and_preserves_license(publishing):
-    import json
-
-    publishing.run()
-    assert publishing.events == ["convert", "create", "upload"]
-    assert all(revision == "immutable-source-commit" for _, revision in publishing.downloads)
-    assert publishing.creates == [
-        ("mlx-community/model-MLX", {"repo_type": "model", "private": True, "exist_ok": True})
+def test_float16_runs_on_linux_and_only_quantization_requires_apple_silicon():
+    assert JOB["runs-on"] == "${{ inputs.quantize && inputs.runner || 'ubuntu-latest' }}"
+    guard = _step("Require Apple Silicon for quantization")
+    assert guard["if"] == "inputs.quantize"
+    assert 'test "$(uname -m)" = arm64' in guard["run"]
+    # The guard must be conditional; an unconditional check would block Linux.
+    unconditional = [
+        step for step in STEPS if 'test "$(uname -m)" = arm64' in step.get("run", "")
     ]
-    files = publishing.uploads[0]["files"]
-    assert set(files) == {
-        "config.json", "model.safetensors", "README.md",
-        "gguf2mlx-provenance.json", "LICENSE", "legal/NOTICE.txt",
-    }
-    provenance = json.loads(files["gguf2mlx-provenance.json"])
-    assert provenance["source_revision"] == "immutable-source-commit"
-    assert provenance["gguf_file"] == "weights/model.gguf"
-    assert provenance["precision"] == "float16"
-    assert b"Original model card" in files["README.md"]
-    assert publishing.card.data.license == "apache-2.0"
-    assert publishing.card.data.library_name == "mlx"
-    assert publishing.card.data.base_model == "publisher/model-GGUF"
-    assert publishing.card.data.tags == ["gguf2mlx", "mlx", "text-generation"]
-    assert "--quantize" not in publishing.commands[0]
-    assert not Path(publishing.uploads[0]["arguments"]["folder_path"]).exists()
+    assert all(step.get("if") for step in unconditional)
 
 
-def test_quantization_is_explicit(publishing, monkeypatch):
-    monkeypatch.setenv("QUANTIZE", "true")
-    monkeypatch.setenv("PRIVATE", "false")
-    publishing.run()
-    assert publishing.commands[0][-8:] == [
-        "--quantize", "--direct-quant", "--q-bits", "4",
-        "--q-group-size", "64", "--q-mode", "affine",
-    ]
-    assert publishing.creates[0][1]["private"] is False
-    assert b"affine-4bit-group64" in publishing.uploads[0]["files"]["gguf2mlx-provenance.json"]
+def test_converter_version_is_pinned():
+    install = _step("Install converter and Hugging Face client")
+    assert install["env"]["CONVERTER_VERSION"] == "${{ inputs.converter_version }}"
+    assert re.search(r'pip install "gguf2mlx\[vlm\]==\$\{CONVERTER_VERSION\}"', install["run"])
+    default = PARSED[True]["workflow_call"]["inputs"]["converter_version"]["default"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", str(default))
 
 
-@pytest.mark.parametrize("incomplete", [False, True])
-def test_failed_conversion_never_creates_or_uploads(publishing, incomplete):
-    publishing.fail = not incomplete
-    publishing.incomplete = incomplete
-    with pytest.raises((subprocess.CalledProcessError, RuntimeError)):
-        publishing.run()
-    assert not publishing.creates
-    assert not publishing.uploads
+def test_publication_is_serialised_per_destination():
+    assert PARSED["concurrency"]["group"] == "publish-mlx-${{ inputs.destination_repo }}"
+    assert PARSED["concurrency"]["cancel-in-progress"] is False
+    assert PARSED["permissions"] == {"contents": "read"}
 
 
-@pytest.mark.parametrize("filename", ["../model.gguf", "/model.gguf", "model.bin"])
-def test_invalid_paths_fail_before_download(publishing, monkeypatch, filename):
-    monkeypatch.setenv("GGUF_FILE", filename)
-    with pytest.raises(ValueError):
-        publishing.run()
-    assert not publishing.downloads
-    assert not publishing.uploads
-
-
-def test_source_cannot_be_destination(publishing, monkeypatch):
-    monkeypatch.setenv("DESTINATION_REPO", "PUBLISHER/model-GGUF")
-    with pytest.raises(ValueError, match="different repositories"):
-        publishing.run()
-    assert not publishing.downloads
-
-
-def test_untrusted_inputs_are_not_interpolated_in_scripts():
-    for block in WORKFLOW.split("run: ")[1:]:
-        script = block.split("\n      - ", 1)[0]
-        assert "${{ inputs." not in script
-        assert "${{ secrets." not in script
-    assert "cancel-in-progress: false" in WORKFLOW
-    assert 'test "$(uname -m)" = arm64' in WORKFLOW
+def test_shell_fails_fast_and_does_not_word_split_caller_text():
+    body = _step("Download, convert, and publish")["run"]
+    assert body.startswith("set -euo pipefail")
+    # Only the literal flag accumulation is intentionally unquoted.
+    for token in re.findall(r"\$\w[\w]*", body):
+        if token == "$extra":
+            continue
+        assert f'"{token}' in body, f"{token} must be quoted"
