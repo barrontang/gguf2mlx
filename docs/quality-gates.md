@@ -148,8 +148,29 @@ suite, which is the point of the gate:
 | `Unsupported gemma2 tensor: blk.0.post_attention_norm.weight` | the Llama mapper only knows two norms per block; Gemma 2/3 has four (`attn_norm`, `post_attention_norm`, `ffn_norm`, `post_ffw_norm`) and `ffn_norm` is the *pre*-FFN norm | dedicated Gemma 2/3 mapper plus the `-1` de-shift for both post norms |
 | `25165824 requested and 0 written` (phi3 Q8_0) | disk exhaustion: twelve downloads plus their FP16 outputs on one 14 GB runner | one job per entry, and drop the converted tree after each case |
 
-Re-run after the fixes: llama-q4_0, qwen3-q8_0 and gemma2-q4_k_m convert, pass
-the weight gate and load with finite logits locally.
+Re-run after the fixes, all 11 entries green on
+[run 39505897872](https://github.com/barrontang/gguf2mlx/actions/runs/39505897872)
+(`main` @ `40ef9f5`, 2026-10-21, 11 jobs × ~5 min wall clock, ~11 min total):
+
+| Entry | Weight gate | Tensors compared | Bit-exact | Max relative L2 | Tolerance |
+|---|---|---|---|---|---|
+| llama-q4_0 | pass | 114/146 | 32 | 2.04e-04 | 6e-04 |
+| llama-q4_k_m | pass | 114/146 | 32 | 2.08e-04 | 6e-04 |
+| llama-q8_0 | pass | 114/146 | 32 | 2.07e-04 | 6e-04 |
+| qwen2-q4_0 | pass | 291/291 | 122 | 2.07e-04 | 6e-04 |
+| qwen2-q4_k_m | pass | 291/291 | 121 | 2.18e-04 | 6e-04 |
+| qwen2-q8_0 | pass | 291/291 | 121 | 2.15e-04 | 6e-04 |
+| qwen3-q8_0 | pass | 310/310 | 113 | 2.08e-04 | 6e-04 |
+| gemma2-q4_k_m | pass | 183/288 | 0 | 2.08e-04 | 6e-04 |
+| gemma2-q8_0 | pass | 183/288 | 0 | 2.10e-04 | 6e-04 |
+| phi3-q4_k_m | pass | 195/195 | 65 | 2.08e-04 | 6e-04 |
+| phi3-q8_0 | pass | 195/195 | 65 | 2.07e-04 | 6e-04 |
+
+Every case also loaded with `mlx_lm` and produced finite logits. The compared
+fraction is the honest part of the table: `llama` excludes the 32 rotary
+Q/K projections (row-permuted) and Gemma 2 excludes its 104 de-shifted norms,
+because the audit only compares tensors written byte-for-byte. Both transforms
+are covered by fixture tests, but they are not *value*-checked here.
 
 ## What is still not covered
 

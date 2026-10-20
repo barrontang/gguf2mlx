@@ -18,14 +18,14 @@ MiniCPM-V 4.7 1B adapter.
 
 | Family | GGUF architecture IDs | Conversion | End-to-end | MoE | Mixed precision | `.mlx` bundle | VLM |
 |---|---|---|---|---|---|---|---|
-| Llama | `llama`, `mistral` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
-| Qwen | `qwen2`, dense `qwen3` | ✅ | ⚠️ direct-quant synthetic | ❌ | — | ✅ generic package/verify | ❌ |
+| Llama | `llama`, `mistral` | ✅ | ✅ Llama-3.2-1B Q4_0/Q4_K_M/Q8_0 real GGUF in CI | ❌ | — | ✅ generic package/verify | ❌ |
+| Qwen | `qwen2`, dense `qwen3` | ✅ | ✅ Qwen2.5-0.5B Q4_0/Q4_K_M/Q8_0 and Qwen3-0.6B Q8_0 in CI | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen3.5 family | `qwen35`; aliases `qwen3_5`, `qwen3.5`, `qwen36`, `qwen3_6`, `qwen3.6`, `qwen38`, `qwen3_8`, `qwen3.8` | ✅ dense layouts | Portable fixtures; native runtime unverified | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 and Qwen3-30B-A3B real-GGUF uniform 4-bit smoke tests | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | DeepSeek | `deepseek2`, `deepseek3` | ✅ | ✅ V2 Lite real Q2_K smoke test; V3 runtime unverified | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | GLM | `glm4moe` | ✅ | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
-| Gemma | `gemma`, `gemma2`, `gemma3`, text-only `gemma4` | ✅ | Portable conversion fixtures; native runtime unverified | Gemma4 MoE layout supported | — | ✅ generic package/verify | ❌ |
-| Phi | `phi3` (Phi-3 and Phi-4; Phi-4 alias) | ✅ Phi-3 4K/LongRoPE and Phi-4 fixtures | ✅ synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
+| Gemma | `gemma`, `gemma2`, `gemma3`, text-only `gemma4` | ✅ | ✅ Gemma-2-2B Q4_K_M/Q8_0 real GGUF in CI (`gemma`, `gemma3`, `gemma4` stay fixture-only) | Gemma4 MoE layout supported | — | ✅ generic package/verify | ❌ |
+| Phi | `phi3` (Phi-3 and Phi-4; Phi-4 alias) | ✅ Phi-3 4K/LongRoPE and Phi-4 fixtures | ✅ Phi-3-mini Q4_K_M/Q8_0 real GGUF in CI plus synthetic GGUF | ❌ | — | ✅ generic package/verify | ❌ |
 | StableLM | `stablelm` | ✅ | ❌ | ❌ | — | ✅ generic package/verify | ❌ |
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | Tiny image-path parity; pretrained quality unverified | ❌ | Language-only 4-bit | ✅ generic package/verify | ✅ Llama + CLIP only |
@@ -40,6 +40,13 @@ The mixed-precision contract validator checks agreement between
 loading the result in a JANG-compatible runtime. `.mlx` bundle packaging and
 integrity verification are architecture-independent operations on emitted model
 directories and do not assert runtime compatibility.
+
+The ✅ end-to-end cells are produced by the `Load matrix` workflow, which
+downloads each pinned GGUF by SHA-256, converts it, runs the weight-fidelity
+gate, loads the result with `mlx_lm` and requires finite logits. Evidence:
+[run 39505897872](https://github.com/barrontang/gguf2mlx/actions/runs/39505897872)
+(11/11 entries green, 2026-10-21). The entry list lives in
+`tests/load_matrix.json`, and each job uploads the conversion report it produced.
 
 #### Qwen3 MoE real-model validation
 
