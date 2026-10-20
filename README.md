@@ -32,11 +32,11 @@ GGUF's quantization error.
 Conversion itself only needs `numpy`, `gguf` and `safetensors`, so it runs fine
 on Linux servers and CI; MLX is required only for `--quantize`.
 
-> **Important:** the default output is FP16/BF16 safetensors, and the optional
-> 4-bit modes **re-quantize**; they are not bit-for-bit preservation of the
-> original GGUF quantization blocks. The single exception is the Qwen2-VL
-> `--preserve-source-quant` mode documented in the
-> [VLM guide](docs/vlm-conversion.md).
+> **Important:** the default output is FP16/BF16 safetensors. `--quantize`
+> **re-quantizes** from that FP16 copy. To keep the bytes that are already in the
+> GGUF, use `--quant-source preserve`, which re-expresses the source blocks as
+> MLX affine weights for `llama`, `qwen2`, `qwen3` and `mistral` (see
+> [Preserve GGUF quantization](#preserve-gguf-quantization)).
 
 ## Install
 
@@ -46,8 +46,8 @@ pipx install gguf2mlx           # isolated CLI
 uv tool install gguf2mlx        # or with uv
 ```
 
-Extras: `[vlm]` adds Hugging Face Hub for VLM conversion, `[all]` everything,
-`[dev]` the test/lint toolchain.
+Extras: `[vlm]`/`[publish]` add Hugging Face Hub, `[all]` everything, `[dev]`
+the test/lint toolchain.
 
 ## Quick start
 
@@ -62,6 +62,10 @@ gguf2mlx --input model-Q4_K_M.gguf --output ./mlx-model-4bit \
 # Bounded-memory direct quantization (no FP16 staging directory)
 gguf2mlx --input model-Q4_K_M.gguf --output ./mlx-model-4bit \
   --quantize --direct-quant --q-bits 4 --q-group-size 64 --q-mode affine
+
+# Reuse the GGUF blocks instead of quantizing the FP16 copy again
+gguf2mlx convert --input model-Q4_K_M.gguf --output ./mlx-model-preserved \
+  --quant-source preserve
 
 # Inspect metadata without writing weights
 gguf2mlx --input model.gguf --skip-weights
@@ -109,6 +113,49 @@ noise with conversion error, so it cannot prove a converter correct. Nightly,
 the pinned [load matrix](tests/load_matrix.json) converts real GGUF models and
 proves each one loads and runs.
 
+## Preserve GGUF quantization
+
+`--quant-source preserve` re-expresses the GGUF blocks that are already there as
+MLX affine groups (`w = scale * code + bias`) on the 32-value group grid the
+blocks use, instead of decoding to FP16 and quantizing again. The integer codes
+are kept; only the fp16 rounding of the scale and bias is new. Measured against
+`gguf.quants.dequantize`, per-tensor relative L2 is 2.0-2.4e-4 for Q4_K, 0.0
+(bit-exact) for Q8_0, and 2.2e-4 for Q6_K when a 32-value group's two 16-value
+sub-block scales agree.
+
+Q6_K has a structural limit: its sub-block scales are 16 values wide, so when
+they disagree inside a 32-value group it cannot be represented exactly. Those
+tensors are flagged `exact: false` and kept in **FP16** rather than silently
+requantized, and `conversion_report.json` records the decision plus per-tensor
+max abs error, relative L2 and an aggregate 1e-3 gate. Modules end up with mixed
+4/6/8-bit widths, which `mlx-lm` loads via per-module `quantization` entries.
+
+Preserve fails closed: `llama`, `qwen2`, `qwen3` and `mistral` are supported, and
+any other architecture errors out naming the arch instead of falling back to
+requantization. `--preserve-source-quant` still works as a deprecated alias.
+
+```bash
+gguf2mlx convert --input model-Q8_0.gguf --output ./mlx-model-q8 --quant-source preserve
+```
+
+## Publish to the Hugging Face Hub
+
+`gguf2mlx publish` downloads a hosted GGUF, converts it, and uploads the result
+with a provenance record and the source license files. Split GGUFs are merged;
+a partial shard set is rejected before anything is downloaded, and the
+destination repository is only created once conversion produced weights.
+
+```bash
+pip install "gguf2mlx[publish]"
+gguf2mlx publish --source bartowski/Model-GGUF --gguf Model-Q8_0.gguf \
+  --dest my-org/Model-MLX --source-revision main
+# add --quantize --q-bits 4 --q-group-size 64 for affine 4-bit (needs MLX)
+```
+
+The reusable `publish-mlx.yml` workflow is a thin shell around the same module:
+float16 runs on `ubuntu-latest`, and only `quantize: true` needs a macOS Apple
+Silicon runner. Details: [Publishing](docs/publishing.md).
+
 ## Supported models
 
 Conversion is adapter-based, not "any GGUF". Rows marked ⚠️ convert but still
@@ -116,8 +163,8 @@ need opt-in real-checkpoint validation.
 
 | Family | GGUF architecture IDs | Convert | End-to-end evidence |
 |---|---|---|---|
-| Llama | `llama`, `mistral` | ✅ | synthetic direct-quant; SmolLM2-135M HF parity |
-| Qwen | `qwen2`, dense `qwen3` | ✅ | synthetic direct-quant |
+| Llama | `llama`, `mistral` | ✅ + preserve | synthetic direct-quant; SmolLM2-135M HF parity |
+| Qwen | `qwen2`, dense `qwen3` | ✅ + preserve | synthetic direct-quant |
 | Qwen3.5 family | `qwen35` + aliases | ✅ | portable fixtures |
 | Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | real GGUF: Qwen1.5-MoE, Qwen3-30B-A3B |
 | DeepSeek | `deepseek2`, `deepseek3` | ✅ | real GGUF: V2 Lite Q2_K |
@@ -126,6 +173,9 @@ need opt-in real-checkpoint validation.
 | Phi | `phi3` (Phi-3, Phi-4) | ✅ | synthetic GGUF |
 | StableLM | `stablelm` | ✅ | none |
 | LLaVA / Qwen2-VL / MiniCPM-V | mmproj pairs | ✅ | Qwen2-VL-2B real-image acceptance |
+
+`preserve` in the Convert column means `--quant-source preserve` is available
+(Q4_K, Q6_K, Q8_0). Other architectures convert, but must requantize.
 
 **Inspection-only** (recognized via metadata, rejected on conversion): `arctic`,
 `bert`, `bitnet`, `bloom`, `dbrx`, `falcon`, `gpt2`, `gptneox`, `mpt`, `olmo`,
@@ -157,8 +207,9 @@ Qwen3-VL **text-only** extraction is a separate `--type text-encoder` contract
 
 ## Limits worth knowing before you start
 
-- **4-bit output is a second quantization** unless you use the Qwen2-VL
-  preserve mode; it does not repack original GGUF blocks.
+- **`--quantize` is a second quantization.** Use `--quant-source preserve` to
+  keep the original blocks; for Q6_K tensors whose sub-block scales disagree,
+  that still means FP16.
 - **Conversion cannot restore precision** lost in the source GGUF.
 - **Tokenizer fidelity depends on GGUF metadata**; embedded HF tokenizer JSON is
   preserved when present, otherwise reconstructed from the header.

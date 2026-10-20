@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+### Preserve the GGUF quantization instead of requantizing
+
+- New `--quant-source preserve|requant` on `convert`. `requant` remains the
+  default, so existing conversions are unchanged; `preserve` re-expresses the
+  source GGUF blocks as MLX affine weights on a 32-value grid instead of
+  decoding to FP16 and quantizing again.
+- `src/gguf2mlx/quantize/gguf_codes.py` decodes Q4_K, Q6_K and Q8_0 blocks and
+  re-encodes the *same* integer codes with an fp16 scale and bias. Measured
+  per-tensor relative L2 against `gguf.quants.dequantize`: Q4_K 2.0-2.4e-4,
+  Q8_0 0.0 (bit-exact), Q6_K ~2.2e-4 when a group's two sub-block scales agree.
+- Q6_K scales 16 values at a time, so a 32-value affine group cannot represent
+  it exactly when those scales disagree (1.1-1.5e-2). Those tensors report
+  `exact: false` and stay in FP16 instead of being silently requantized.
+- Preserve fails closed: `llama`, `qwen2`, `qwen3` and `mistral` only. Any other
+  architecture errors out naming the arch rather than falling back to
+  requantization.
+- `conversion_report.json` gains a `preserve` block: per-tensor relative L2 and
+  max abs error, `preserved_by_qtype`/`preserved_by_bits`, the decisions to keep
+  a tensor in FP16, and an aggregate gate at 1e-3 (fp16 scale rounding only).
+  `docs/conversion-report.schema.json` describes it.
+- Mixed 4/6/8-bit module widths are emitted as per-module `quantization`
+  overrides in `config.json`; `mlx-lm` loads them as `QuantizedLinear`.
+- `--preserve-source-quant` keeps working as a deprecated alias that warns and
+  resolves to `--quant-source preserve`. On multimodal GGUFs the Qwen2-VL
+  preserve path still requires `--quantize --direct-quant` and keeps its
+  affine 4-bit / group-64 layout.
+
+### `gguf2mlx publish` and split GGUF support
+
+- New `publish` subcommand: `gguf2mlx publish --source <repo> --gguf <file>
+  --dest <repo> [--source-revision] [--quantize] [--quant-source]`. The pipeline
+  moved out of the workflow's heredoc payload into `src/gguf2mlx/publish.py`;
+  `.github/workflows/publish-mlx.yml` is now a thin shell around the same code.
+- Split GGUFs (`-00001-of-0000N`) are discovered from any shard, merged back
+  into one file before conversion, and a partial shard set fails with an error
+  naming the missing indices instead of publishing a truncated model.
+- Safety properties are unchanged and now unit-tested: repository-id and path
+  validation before the first network call, source ≠ destination, immutable
+  source revision, provenance file, source license/notice files copied, and the
+  destination repository created only after conversion produced weights.
+- Float16 conversion needs only `numpy`/`gguf`/`safetensors`, so the workflow's
+  default runner is now `ubuntu-latest`; only `quantize: true` requires a macOS
+  Apple Silicon runner.
+- New `publish` extra (`huggingface-hub`), and the provenance record now carries
+  the GGUF SHA-256, byte size, shard list, quant source and converter version.
+
 ### Quality gates that can actually fail and mean it
 
 - Every conversion now writes `conversion_report.json` with a **weight-fidelity
