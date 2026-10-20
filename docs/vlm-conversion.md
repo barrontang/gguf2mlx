@@ -128,7 +128,8 @@ gguf2mlx convert --type vlm \
   `--quantize` alone and MoE `--mixed-precision` are rejected for VLMs.
   The report lists quantized modules, logical/stored tensor counts and layouts.
 - For Qwen2-VL with Q4_K language projections, add `--preserve-source-quant`
-  to keep their original four-bit codes and **32-element** groups. This option
+  (now an alias of `--quant-source preserve`; both are accepted here) to keep
+  their original four-bit codes and **32-element** groups. This option
   overrides the default 64-element re-quantization layout; leave `--q-*` at their
   defaults. Other language projections (including Q6_K) are decoded to the
   requested floating dtype, not reduced to four bits. Vision/projector and
