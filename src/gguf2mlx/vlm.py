@@ -869,7 +869,9 @@ def convert_vlm(
                     return
                 packed, scales, biases = _repack_q4_k(source_tensor, dtype)
             else:
-                packed, scales, biases = core._quantize_affine_4bit(array, q_group_size)
+                packed, scales, biases = core._quantize_affine_4bit(
+                    array, q_group_size, tensor_name=name,
+                )
             writer.add(name, packed)
             writer.add(stem + ".scales", _cast_finite(scales, stem + ".scales", dtype))
             writer.add(stem + ".biases", _cast_finite(biases, stem + ".biases", dtype))

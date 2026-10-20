@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Trust and repository hygiene
+
+- Conversion no longer guesses model dimensions: `build_config(..., strict=True)` raises
+  with the missing `llama.*` / `<arch>.*` keys instead of silently falling back to
+  4096/32/32/32000. `inspect` keeps the lenient behaviour.
+- Missing `gguf` / `safetensors` now raise `ImportError` at import time instead of calling
+  `sys.exit(1)`, so notebooks, CI wrappers and the publish pipeline can catch it;
+  `python -m gguf2mlx` still exits 1 with a single-line message.
+- GLM-5.2 `generation_config.json` is derived from the GGUF tokenizer metadata
+  (`tokenizer.ggml.eos_token_id` / `eos_token_ids`) instead of hardcoded EOS ids and a
+  fabricated `transformers_version`; the file is skipped when the metadata is absent.
+- Affine 4-bit quantization rounds half away from zero (`std::round` semantics used by
+  MLX) instead of `np.round`'s half-to-even, and rejects groups containing NaN/Inf with the
+  offending tensor name instead of writing silent garbage.
+- Version bumped to `2.1.5.dev0` so local builds no longer collide with the published
+  2.1.4 wheel.
+- Removed 1,211 tracked `rust/gguf2mlx-rs/target/` build artifacts from the repository.
+- CI now exercises Python 3.10/3.12/3.13 and enforces an 80% coverage floor.
+
 ### Vision support
 
 - Add a strict Qwen2-VL adapter for combined or split GGUFs: reconstruct fused

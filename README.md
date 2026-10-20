@@ -342,6 +342,15 @@ gguf2mlx --input model.gguf --skip-weights
 gguf2mlx convert --input model.gguf --output ./mlx-model
 ```
 
+SmolLM2-135M uses the Llama tensor layout with tied embeddings. Llama GGUF
+conversion detects a missing separate output head and restores exported Q/K
+rotary projection ordering. A local HF -> FP16 GGUF -> MLX conversion was
+validated against the original model cast to FP16: all 272 parameter tensors,
+logits on six tokenizer/Unicode/code prompts, and two greedy generations matched
+exactly. Preserve the original tokenizer JSON in GGUF when exporting to avoid
+losing source normalization semantics. This is conversion parity, not a broad
+model-quality benchmark.
+
 Conversion reads GGUF tensor data through memory-mapped views and decodes/transforms
 one tensor (or one required fusion group) at a time. Output payloads are spooled to
 disk immediately rather than accumulated in a shard-sized array dictionary. Shard

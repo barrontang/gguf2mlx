@@ -40,6 +40,57 @@ def _load_fixture(name: str) -> dict:
     return json.loads((FIXTURE_DIR / f"{name}.json").read_text(encoding="utf-8"))
 
 
+@pytest.mark.parametrize("separate_output", [False, True])
+def test_llama_config_detects_tied_embeddings_from_tensor_layout(separate_output):
+    metadata = {
+        "llama.vocab_size": 32,
+        "llama.embedding_length": 64,
+        "llama.block_count": 1,
+        "llama.attention.head_count": 4,
+        "llama.context_length": 8192,
+        "llama.rope.freq_base": 100000.0,
+    }
+    tensors = ["token_embd.weight"]
+    if separate_output:
+        tensors.append("output.weight")
+    config = core.build_config(_FakeReader(metadata, tensors), "llama")
+    assert config["tie_word_embeddings"] is not separate_output
+    assert config["rope_theta"] == 100000.0
+
+
+@pytest.mark.parametrize(("projection", "heads"), [("q", 4), ("k", 2)])
+def test_llama_rotary_projection_restores_hf_order(projection, heads):
+    original = np.arange(heads * 8 * 16, dtype=np.float16).reshape(heads * 8, 16)
+    gguf_weight = original.reshape(heads, 2, 4, 16).swapaxes(1, 2).reshape(original.shape)
+    emitted = core._plan_tensor_emit(
+        f"blk.0.attn_{projection}.weight", gguf_weight, "llama",
+        {"num_heads": 4, "num_key_value_heads": 2}, {}, {},
+    )
+    np.testing.assert_array_equal(emitted[0][1], original)
+
+
+def test_build_config_strict_rejects_defaulted_dimensions():
+    reader = _FakeReader({"llama.vocab_size": 32}, tensor_names=["token_embd.weight"])
+    with pytest.raises(ValueError, match="embedding_length"):
+        core.build_config(reader, "llama", strict=True)
+
+    config = core.build_config(reader, "llama")  # inspect-style call stays lenient
+    assert config["hidden_size"] == 4096
+    assert config["num_hidden_layers"] == 32
+    assert config["num_attention_heads"] == 32
+
+
+def test_build_config_strict_accepts_vocab_from_tokenizer():
+    metadata = {
+        "llama.embedding_length": 64,
+        "llama.block_count": 1,
+        "llama.attention.head_count": 4,
+        "tokenizer.ggml.tokens": ["<s>", "</s>", "a"],
+    }
+    config = core.build_config(_FakeReader(metadata), "llama", strict=True)
+    assert config["vocab_size"] == 3
+
+
 @pytest.fixture
 def deepseek_v2_metadata():
     return {

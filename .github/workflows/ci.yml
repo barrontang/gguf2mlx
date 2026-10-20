@@ -11,15 +11,21 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install -e ".[dev]"
       - run: python -m build
+        if: matrix.python-version == '3.12'
       - run: python -m twine check --strict dist/*
+        if: matrix.python-version == '3.12'
       - run: ruff check src/ tests/ benchmarks/
-      - run: pytest
+      - run: pytest --cov=gguf2mlx --cov-report=term-missing --cov-fail-under=80
       - run: cargo test --manifest-path rust/gguf2mlx-rs/Cargo.toml

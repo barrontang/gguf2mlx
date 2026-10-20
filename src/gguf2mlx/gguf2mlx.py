@@ -39,19 +39,21 @@ try:
     from gguf.quants import dequantize
 
     GGUF_AVAILABLE = True
-except ImportError:
+except ImportError as gguf_import_error:  # pragma: no cover - depends on environment
     GGUF_AVAILABLE = False
-    print("❌ gguf library required. Install: pip install gguf>=0.18.0")
-    sys.exit(1)
+    raise ImportError(
+        "gguf library is required. Install it with: pip install 'gguf>=0.18.0'"
+    ) from gguf_import_error
 
 try:
     from safetensors import safe_open
 
     SAFETENSORS_AVAILABLE = True
-except ImportError:
+except ImportError as safetensors_import_error:  # pragma: no cover - depends on environment
     SAFETENSORS_AVAILABLE = False
-    print("❌ safetensors library required. Install: pip install safetensors")
-    sys.exit(1)
+    raise ImportError(
+        "safetensors library is required. Install it with: pip install safetensors"
+    ) from safetensors_import_error
 
 try:
     from mlx_lm import convert as mlx_lm_convert
@@ -537,8 +539,20 @@ def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[st
     return config
 
 
-def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[str, Any]:
-    """Build MLX-compatible config.json from GGUF metadata."""
+def build_config(
+    reader: GGUFReader,
+    arch: str,
+    dtype: str = "float16",
+    *,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Build MLX-compatible config.json from GGUF metadata.
+
+    ``strict`` is used by the conversion path: model dimensions that cannot be
+    read from the GGUF must fail loudly instead of being replaced by plausible
+    defaults (which silently produce an unloadable model). Callers that only
+    inspect metadata keep the lenient behaviour.
+    """
     if arch == "phi4":
         original_reader = reader
 
@@ -570,8 +584,17 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
 
         reader = Qwen35Metadata()
 
+    missing_keys: list[str] = []
+
     def _warn(key: str, value: Any) -> None:
         warnings.warn(f"  ⚠ '{key}' not found in GGUF metadata, using default: {value}")
+
+    def _dimension(key: str, value: Any) -> None:
+        """Record a defaulted model dimension; fatal when ``strict``."""
+        if strict:
+            missing_keys.append(key)
+        else:
+            _warn(key, value)
 
     # --- Basic params ---
     vocab_size = get_metadata_int(reader, "llama.vocab_size") or get_metadata_int(
@@ -585,28 +608,37 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
             vocab_size = len(tokens)
         else:
             vocab_size = 32000
-            _warn("vocab_size", 32000)
+            _dimension("vocab_size", 32000)
 
     hidden_size = get_metadata_int(reader, "llama.embedding_length") or get_metadata_int(
         reader, f"{arch}.embedding_length"
     )
     if hidden_size is None:
         hidden_size = 4096
-        _warn("embedding_length", 4096)
+        _dimension("embedding_length", 4096)
 
     num_layers = get_metadata_int(reader, "llama.block_count") or get_metadata_int(
         reader, f"{arch}.block_count"
     )
     if num_layers is None:
         num_layers = 32
-        _warn("block_count", 32)
+        _dimension("block_count", 32)
 
     num_heads = get_metadata_int(reader, "llama.attention.head_count") or get_metadata_int(
         reader, f"{arch}.attention.head_count"
     )
     if num_heads is None:
         num_heads = 32
-        _warn("head_count", 32)
+        _dimension("head_count", 32)
+
+    if missing_keys:
+        raise ValueError(
+            "GGUF metadata is missing required model dimensions: "
+            + ", ".join(missing_keys)
+            + f" (looked for 'llama.<key>' and '{arch}.<key>'). "
+            "Refusing to guess values during conversion; re-export the file with "
+            "llama.cpp's converter, or call build_config(strict=False) to inspect it anyway."
+        )
 
     num_kv_heads = get_metadata_int(
         reader, "llama.attention.head_count_kv"
@@ -671,6 +703,9 @@ def build_config(reader: GGUFReader, arch: str, dtype: str = "float16") -> dict[
         "qwen2", "qwen2moe", "gemma", "gemma2", "gemma3",
         "olmo", "olmo2", "openelm",
     )
+    if arch == "llama" and reader.tensors:
+        tensor_names = {tensor.name for tensor in reader.tensors}
+        tie_embeddings = "token_embd.weight" in tensor_names and "output.weight" not in tensor_names
 
     # Detect attention bias. Gemma projections are bias-free; Phi-3 uses a fused,
     # bias-free QKV projection in MLX-LM.
@@ -2076,6 +2111,8 @@ def _read_mla_dims(reader: GGUFReader, arch: str) -> dict[str, int]:
     qk_nope = _g("attention.qk_nope_head_dim") or 192
     v_head = _g("attention.value_length") or _g("attention.v_head_dim") or qk_nope
     dims = {"num_heads": n_heads, "qk_nope_head_dim": qk_nope, "v_head_dim": v_head}
+    if arch == "llama":
+        dims["num_key_value_heads"] = _g("attention.head_count_kv") or n_heads
     if arch == "gemma4":
         dims["num_attention_heads"] = (
             get_metadata_int(reader, "gemma4.attention.head_count") or 8
@@ -2129,6 +2166,15 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
     Returns [] when the tensor is buffered (waiting for its kv_b pair).
     """
     arr = _restore_architecture_tensor(gguf_name, arr, arch)
+    if arch == "llama" and re.fullmatch(r"blk\.\d+\.attn_[qk]\.weight", gguf_name):
+        heads = (
+            mla_dims["num_key_value_heads"] if ".attn_k." in gguf_name
+            else mla_dims["num_heads"]
+        )
+        if arr.ndim != 2 or arr.shape[0] % (2 * heads):
+            raise ValueError(f"Invalid Llama rotary projection shape: {gguf_name}: {arr.shape}")
+        arr = arr.reshape(heads, arr.shape[0] // (2 * heads), 2, arr.shape[1])
+        arr = arr.swapaxes(1, 2).reshape(-1, arr.shape[-1])
     if arch == "qwen2moe" and re.fullmatch(r"blk\.\d+\.ffn_gate_inp_shexp\.weight", gguf_name):
         arr = arr.reshape(1, -1)
 
@@ -2256,9 +2302,18 @@ def _is_direct_quantizable_linear_weight(hf_name: str, arr: np.ndarray) -> bool:
 
 
 def _quantize_affine_4bit(
-    arr: np.ndarray, q_group_size: int, *, floating_dtype: str = "float16",
+    arr: np.ndarray,
+    q_group_size: int,
+    *,
+    floating_dtype: str = "float16",
+    tensor_name: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Quantize an array of linear weights into affine 4-bit groups."""
+    """Quantize an array of linear weights into affine 4-bit groups.
+
+    Rounding follows MLX / ``std::round`` semantics (half away from zero). The
+    previous ``np.round`` implementation used banker's rounding, which differs
+    by one code for values landing exactly on .5.
+    """
     if arr.ndim < 2:
         raise ValueError(f"Direct quantization expects at least 2D tensors, got {arr.ndim}D")
     leading_shape, cols = arr.shape[:-1], arr.shape[-1]
@@ -2270,6 +2325,12 @@ def _quantize_affine_4bit(
     grouped = arr.astype(np.float32).reshape(
         *leading_shape, cols // q_group_size, q_group_size
     )
+    if not np.isfinite(grouped).all():
+        label = tensor_name or "<unnamed tensor>"
+        raise ValueError(
+            f"Tensor {label} contains non-finite values (NaN/Inf); refusing to quantize "
+            "it because the result would be silently corrupted"
+        )
     mins = grouped.min(axis=-1)
     maxs = grouped.max(axis=-1)
     scales = (maxs - mins) / 15.0
@@ -2277,7 +2338,9 @@ def _quantize_affine_4bit(
     safe_scales = scales.copy()
     safe_scales[zero_scale] = 1.0
 
-    q = np.round((grouped - mins[..., None]) / safe_scales[..., None])
+    # (grouped - mins) / scale is always >= 0, so floor(x + 0.5) is exactly
+    # "round half away from zero" as used by MLX's C++ quantizer.
+    q = np.floor((grouped - mins[..., None]) / safe_scales[..., None] + 0.5)
     q = np.clip(q, 0, 15).astype(np.uint8)
     q[zero_scale[..., None].repeat(q_group_size, axis=-1)] = 0
 
@@ -2439,7 +2502,7 @@ def extract_and_convert_weights_direct_quant(
                 )
                 quant_options = {"floating_dtype": "float32"} if preserve_float_range else {}
                 packed, scales, biases = _quantize_affine_4bit(
-                    out_arr, q_group_size, **quant_options,
+                    out_arr, q_group_size, tensor_name=gguf_name, **quant_options,
                 )
                 base = hf_name.removesuffix(".weight")
                 writer.add(f"{base}.weight", packed)
@@ -2546,7 +2609,11 @@ def _convert_direct_quantized(
         return False
 
     print("\n[direct-quant] Building config and tokenizer...")
-    config = build_config(reader, arch, dtype)
+    try:
+        config = build_config(reader, arch, dtype, strict=True)
+    except ValueError as error:
+        print(f"❌ {error}")
+        return False
     _write_runtime_adapter(output_path, arch, config)
     with open(output_path / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -2667,7 +2734,11 @@ def _convert(
     print(f"  Architecture: {arch} ({architecture_kind}; HF type: {hf_type})")
     print(f"  Model name:   {model_name_full}")
 
-    config = build_config(reader, arch, dtype)
+    try:
+        config = build_config(reader, arch, dtype, strict=True)
+    except ValueError as error:
+        print(f"❌ {error}")
+        return False
     print(
         f"  Config: {config['num_hidden_layers']} layers, "
         f"{config['hidden_size']} hidden, "
@@ -2697,20 +2768,32 @@ def _convert(
         json.dump(config, f, indent=2)
     print("  ✓ Saved config.json")
 
-    # GLM-5.2: write generation_config.json with the multi-EOS array (matches
-    # the published zai-org/GLM-5.2 generation_config.json).
+    # GLM-5.2: generation_config.json is derived from the GGUF tokenizer
+    # metadata only. Hardcoding EOS ids here silently mis-generated configs for
+    # every other GLM checkpoint; when the metadata is absent we write nothing
+    # and let the tokenizer config drive generation.
     if arch == "glm-dsa":
-        gen_cfg = {
-            "_from_model_config": True,
-            "eos_token_id": [154820, 154827, 154829],
-            "pad_token_id": 154820,
-            "temperature": 1.0,
-            "top_p": 0.95,
-            "transformers_version": "5.12.0",
-        }
-        with open(output_path / "generation_config.json", "w") as f:
-            json.dump(gen_cfg, f, indent=2)
-        print("  ✓ Saved generation_config.json (GLM-5.2 multi-EOS)")
+        eos_ids = get_metadata_array_int(reader, "tokenizer.ggml.eos_token_ids")
+        if not eos_ids:
+            single_eos = get_metadata_int(reader, "tokenizer.ggml.eos_token_id")
+            eos_ids = [single_eos] if single_eos is not None else []
+        if eos_ids:
+            pad_token_id = get_metadata_int(reader, "tokenizer.ggml.padding_token_id")
+            gen_cfg: dict[str, Any] = {
+                "_from_model_config": True,
+                "eos_token_id": eos_ids if len(eos_ids) > 1 else eos_ids[0],
+                "pad_token_id": pad_token_id if pad_token_id is not None else eos_ids[0],
+                "temperature": 1.0,
+                "top_p": 0.95,
+            }
+            with open(output_path / "generation_config.json", "w") as f:
+                json.dump(gen_cfg, f, indent=2)
+            print(f"  ✓ Saved generation_config.json (EOS ids from GGUF: {eos_ids})")
+        else:
+            print(
+                "  ⚠ No tokenizer.ggml.eos_token_id in GGUF metadata; "
+                "skipping generation_config.json"
+            )
 
     # Step 3: Extract tokenizer
     print("\n[3/5] Extracting tokenizer...")

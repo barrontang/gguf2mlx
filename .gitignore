@@ -41,3 +41,5 @@ traces/glm52-coding-en-retr_full_smoke-*.jsonl
 traces/glm52-coding-en-retr_full_smoke-*.jsonl.meta.json
 traces/glm52-coding-en-retr_longctx-*.jsonl
 traces/glm52-coding-en-retr_longctx-*.jsonl.meta.json
+# Local review/roadmap notes, not part of the distributable source.
+gguf2mlx-review-and-roadmap*
