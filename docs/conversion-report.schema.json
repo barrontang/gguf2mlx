@@ -37,7 +37,75 @@
     },
     "gates": {
       "type": "object",
-      "properties": {"weight": {"enum": ["pass", "fail", "not_run"]}}
+      "properties": {
+        "weight": {"enum": ["pass", "fail", "not_run"]},
+        "preserve": {"enum": ["pass", "fail", "not_run"]}
+      }
+    },
+    "quant_source": {
+      "enum": ["requant", "preserve"],
+      "description": "Requant (the default) decodes the GGUF and quantizes from scratch; preserve re-expresses the source block codes on MLX's affine grid. Absent on artifacts written before the flag existed, which were all requantized."
+    },
+    "preserve": {
+      "type": "object",
+      "description": "Present only for --quant-source preserve: one record per tensor whose GGUF block codes were reused.",
+      "required": [
+        "gate", "tolerance", "tensors_compared", "aggregate_relative_l2",
+        "preserved_by_qtype", "preserved_by_bits", "group_size", "tensors"
+      ],
+      "properties": {
+        "gate": {"enum": ["pass", "fail", "not_run"]},
+        "tolerance": {"type": "number"},
+        "tensors_compared": {"type": "integer"},
+        "tensors_total": {"type": "integer"},
+        "bit_exact_tensors": {"type": "integer"},
+        "aggregate_relative_l2": {"type": ["number", "null"]},
+        "max_relative_l2": {"type": ["number", "null"]},
+        "worst_tensor": {"type": ["string", "null"]},
+        "failures": {"type": "array", "items": {"type": "string"}},
+        "preserved_by_qtype": {
+          "type": "object",
+          "description": "How many tensors kept their codes, per GGUF block type.",
+          "additionalProperties": {"type": "integer"}
+        },
+        "preserved_by_bits": {
+          "type": "object",
+          "description": "Affine width histogram, e.g. {\"4\": 120, \"8\": 4}.",
+          "additionalProperties": {"type": "integer"}
+        },
+        "group_size": {"const": 32},
+        "tensors": {"type": "array", "items": {"$ref": "#/$defs/preservedTensor"}},
+        "kept_float16": {
+          "type": "object",
+          "description": "Tensors that could not keep their codes, with the reason. They are decoded, never requantized.",
+          "properties": {
+            "counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+            "tensors": {"type": "array", "items": {"type": "object"}}
+          }
+        },
+        "plan": {
+          "type": "object",
+          "description": "Audit plan: output tensor -> source tensor, block type, affine width and row layout.",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["source", "qtype", "bits", "group_size"],
+            "properties": {
+              "source": {"type": "string"},
+              "qtype": {"enum": ["Q4_K", "Q6_K", "Q8_0"]},
+              "bits": {"enum": [4, 6, 8]},
+              "group_size": {"const": 32},
+              "shape": {"type": "array", "items": {"type": "integer"}},
+              "rows": {"enum": ["identity", "rotary"]},
+              "heads": {"type": "integer"}
+            }
+          }
+        },
+        "module_bits": {
+          "type": "object",
+          "description": "mlx-lm module path -> affine width, mirroring config.json.",
+          "additionalProperties": {"enum": [4, 6, 8]}
+        }
+      }
     },
     "tensor_layout": {
       "type": "object",
@@ -103,6 +171,25 @@
         "failures": {"type": "array", "items": {"type": "string"}},
         "failure_count": {"type": "integer"},
         "measured_stage": {"type": "string"}
+      }
+    },
+    "preservedTensor": {
+      "type": "object",
+      "required": [
+        "name", "source", "qtype", "bits", "group_size", "relative_l2",
+        "max_abs_error", "bit_exact"
+      ],
+      "properties": {
+        "name": {"type": "string"},
+        "source": {"type": "string"},
+        "qtype": {"enum": ["Q4_K", "Q6_K", "Q8_0"]},
+        "bits": {"enum": [4, 6, 8]},
+        "group_size": {"const": 32},
+        "elements": {"type": "integer"},
+        "relative_l2": {"type": "number"},
+        "max_abs_error": {"type": "number"},
+        "bit_exact": {"type": "boolean"},
+        "finite": {"type": "boolean"}
       }
     }
   }

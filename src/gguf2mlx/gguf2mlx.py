@@ -25,6 +25,7 @@ import numpy as np
 from tqdm import tqdm
 
 from . import fidelity
+from .quantize import gguf_codes
 from .qwen_vl_text import QWEN_VL_TEXT_ARCHES, Qwen3VLTextEncoderConverter
 from .rust_backend import classify_architecture as rust_classify_architecture
 from .rust_backend import detect_architecture as rust_detect_architecture
@@ -308,6 +309,13 @@ DIRECT_QUANT_SUPPORTED_SOURCE_QTYPES = {
     30,  # BF16
 }
 DIRECT_QUANT_DEFAULT_MAX_SHARD_BYTES = 256 * 1024 * 1024
+
+#: ``--quant-source`` modes. ``requant`` is the historical behaviour: decode the
+#: GGUF to float, then quantize from scratch. ``preserve`` re-expresses the
+#: source blocks on MLX's affine grid instead (see quantize/gguf_codes.py).
+QUANT_SOURCE_CHOICES = ("requant", "preserve")
+PRESERVE_SOURCE_ARCHES = gguf_codes.PRESERVE_ARCHES
+PRESERVE_DEFAULT_MAX_SHARD_BYTES = int(4.5 * 1024**3)
 
 _ROUTER_PATTERNS = (
     "ffn_gate_inp.weight",
@@ -2622,6 +2630,295 @@ def extract_and_convert_weights_direct_quant(
     }
 
 
+def _preserve_rotary_heads(
+    gguf_name: str, arch: str, num_heads: int | None, kv_heads: int | None
+) -> int | None:
+    """Head count whose rotary row-interleave applies to this tensor, if any."""
+    if arch != "llama":
+        return None
+    if re.fullmatch(r"blk\.\d+\.attn_q\.weight", gguf_name):
+        return num_heads
+    if re.fullmatch(r"blk\.\d+\.attn_k\.weight", gguf_name):
+        return kv_heads
+    return None
+
+
+def _preserve_skip_reason(
+    shape: tuple[int, ...], qtype: Any
+) -> str | None:
+    """Why a tensor cannot keep its GGUF codes, or ``None`` if it can."""
+    qname = gguf_codes.qtype_name(qtype)
+    if qname is None:
+        return f"{getattr(qtype, 'name', qtype)}_has_no_affine_reexpression"
+    if len(shape) != 2:
+        return "not_a_matrix"
+    block = gguf_codes.block_elements(qtype) or 1
+    if shape[1] % block:
+        return "row_length_not_block_aligned"
+    return None
+
+
+def extract_and_convert_weights_preserve(
+    reader: GGUFReader,
+    arch: str,
+    output_dir: Path,
+    dtype: str,
+    *,
+    num_heads: int | None = None,
+    kv_heads: int | None = None,
+    max_shard_bytes: int | None = None,
+    audit: bool = True,
+) -> dict[str, Any]:
+    """Write MLX weights that reuse the GGUF source's quantization codes.
+
+    Tensors whose block format maps exactly onto MLX affine groups of 32 keep
+    their codes and only gain an ``fp16`` scale and bias. Everything else --
+    unsupported block types, non-matrix tensors, and ``Q6_K`` tensors whose
+    16-value sub-block scales disagree inside a 32-value group -- is decoded to
+    ``float16`` instead. Nothing is ever silently requantized, and the report
+    states which tensors took which path and why.
+    """
+    if dtype != "float16":
+        raise RuntimeError(
+            "preserve mode stores affine scales as float16; use --dtype float16"
+        )
+    if max_shard_bytes is None:
+        max_shard_bytes = PRESERVE_DEFAULT_MAX_SHARD_BYTES
+
+    float_layout: dict[str, dict[str, str]] = {}
+    preserve_plan: dict[str, dict[str, Any]] = {}
+    kept_float: list[dict[str, str]] = []
+    qtype_counts: dict[str, int] = {}
+    bits_counts: dict[int, int] = {}
+    module_bits: dict[str, int] = {}
+
+    with StreamingShardWriter(output_dir, max_shard_bytes) as writer:
+        for tensor in tqdm(reader.tensors, desc="  Preserving", unit="tensor"):
+            gguf_name = str(tensor.name)
+            qtype = tensor.tensor_type
+            name = _map_tensor_name(gguf_name, arch)
+            shape = tuple(int(dim) for dim in reversed(tuple(tensor.shape)))
+            heads = _preserve_rotary_heads(gguf_name, arch, num_heads, kv_heads)
+            qname = gguf_codes.qtype_name(qtype)
+            qtype_counts[qname or getattr(qtype, "name", str(qtype))] = (
+                qtype_counts.get(qname or getattr(qtype, "name", str(qtype)), 0) + 1
+            )
+
+            skip = _preserve_skip_reason(shape, qtype)
+            mapped = None
+            if skip is None:
+                mapped = gguf_codes.map_tensor(tensor.data, qtype, shape)
+                if not mapped.exact:
+                    skip = "sub_block_scales_disagree"
+            if skip is not None:
+                kept_float.append({
+                    "source": gguf_name,
+                    "qtype": str(qname or getattr(qtype, "name", qtype)),
+                    "reason": skip,
+                })
+                if mapped is not None:
+                    kept_float[-1]["inexact_groups"] = str(mapped.inexact_groups)
+
+            if mapped is not None and skip is None:
+                packed, scales, biases = mapped.packed, mapped.scales, mapped.biases
+                if heads:
+                    packed = gguf_codes.llama_rotary_rows(packed, heads)
+                    scales = gguf_codes.llama_rotary_rows(scales, heads)
+                    biases = gguf_codes.llama_rotary_rows(biases, heads)
+                writer.add(f"{name.removesuffix('.weight')}.weight", packed)
+                writer.add(f"{name.removesuffix('.weight')}.scales", scales)
+                writer.add(f"{name.removesuffix('.weight')}.biases", biases)
+                preserve_plan[name] = {
+                    "source": gguf_name,
+                    "qtype": str(mapped.qtype),
+                    "bits": int(mapped.bits),
+                    "group_size": int(mapped.group_size),
+                    "shape": [int(shape[0]), int(shape[1])],
+                    "rows": "rotary" if heads else "identity",
+                    "heads": int(heads or 0),
+                }
+                module_bits[name.removesuffix(".weight")] = int(mapped.bits)
+                bits_counts[int(mapped.bits)] = bits_counts.get(int(mapped.bits), 0) + 1
+                del packed, scales, biases
+                continue
+
+            array = _decode_tensor_to_array(tensor, dtype, gguf_name)
+            if array is None:
+                raise RuntimeError(f"Failed to convert tensor {gguf_name}")
+            array = _restore_architecture_tensor(gguf_name, array, arch)
+            if heads:
+                array = gguf_codes.llama_rotary_rows(array, heads)
+            writer.add(name, array)
+            float_layout[name] = {
+                "source": gguf_name,
+                "layout": "transformed" if heads else "identity",
+            }
+            del array
+        writer.finish()
+
+    print(f"\n  ✓ Preserved {len(preserve_plan)} tensor(s) on the affine grid, "
+          f"{len(float_layout)} kept in {dtype} ({len(writer.files)} shards)")
+    print(f"    Source block types: {', '.join(f'{k}={v}' for k, v in sorted(qtype_counts.items()))}")
+    print(f"    Affine widths: {', '.join(f'{k}-bit={v}' for k, v in sorted(bits_counts.items())) or 'none'}")
+    if kept_float:
+        reasons: dict[str, int] = {}
+        for item in kept_float:
+            reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
+        print("    Float fallbacks: " + ", ".join(f"{k}={v}" for k, v in sorted(reasons.items())))
+    print(f"    Total input:  {sum(t.n_bytes for t in reader.tensors) / 1e9:.2f} GB (GGUF)")
+    print(f"    Total output: {writer.total / 1e9:.2f} GB (safetensors)")
+
+    if audit and float_layout:
+        print("\n  Auditing float tensors against an independent source decode...")
+        float_audit = fidelity.audit_weights(output_dir, reader, float_layout, dtype)
+    else:
+        float_audit = {
+            "tensors": [],
+            "compared": 0,
+            "skipped": {"not_requested": len(float_layout)},
+            "total_output_tensors": len(float_layout),
+        }
+    if audit and preserve_plan:
+        preserve_audit = fidelity.audit_preserved(output_dir, reader, preserve_plan)
+    else:
+        preserve_audit = {
+            "tensors": [],
+            "compared": 0,
+            "mismatches": [],
+            "skipped": {"not_requested": len(preserve_plan)},
+            "total_output_tensors": len(preserve_plan),
+        }
+
+    report = fidelity.build_report(
+        architecture=arch,
+        dtype=dtype,
+        audit=float_audit,
+        layout=float_layout,
+        source=str(getattr(reader, "path", "") or "") or None,
+        preserve=preserve_audit,
+        preserve_plan=preserve_plan,
+        kept_float=kept_float,
+        module_bits=module_bits,
+    )
+    fidelity.write_report(output_dir, report)
+    print(f"  {fidelity.summarize(report)}")
+    preserved = report["preserve"]
+    marker = "✓" if preserved["gate"] == "pass" else "❌"
+    print(
+        f"  {marker} preserved weights: {preserved['gate']} "
+        f"({preserved['tensors_compared']}/{len(preserve_plan)} tensors, "
+        f"aggregate relative L2 {preserved['aggregate_relative_l2']:.2e} vs "
+        f"tolerance {preserved['tolerance']:.1e})"
+    )
+    if preserved["kept_float16"]["counts"]:
+        print(f"    Kept in float16: {preserved['kept_float16']['counts']}")
+    return report
+
+
+def _preserve_quantization_config(report: dict[str, Any]) -> dict[str, Any]:
+    """Build the mlx-lm ``quantization`` block for a preserved artifact.
+
+    mlx-lm resolves one dict per module path, and accepts per-module overrides
+    inside ``config["quantization"]``, which is what lets a single model mix
+    4-bit, 6-bit and 8-bit groups of 32.
+    """
+    module_bits: dict[str, int] = report["preserve"]["module_bits"]
+    if not module_bits:
+        raise RuntimeError("preserve conversion produced no quantized modules")
+    histogram: dict[int, int] = {}
+    for bits in module_bits.values():
+        histogram[bits] = histogram.get(bits, 0) + 1
+    default_bits = max(histogram.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    quantization: dict[str, Any] = {
+        "bits": default_bits,
+        "group_size": gguf_codes.AFFINE_GROUP_SIZE,
+        "mode": "affine",
+        "scheme": "gguf_preserve_v1",
+    }
+    if len({bits for bits in module_bits.values()}) > 1:
+        for module, bits in sorted(module_bits.items()):
+            if bits != default_bits:
+                quantization[module] = {
+                    "bits": bits,
+                    "group_size": gguf_codes.AFFINE_GROUP_SIZE,
+                    "mode": "affine",
+                }
+    return quantization
+
+
+def _convert_preserved(
+    gguf_path: str,
+    output_dir: str,
+    dtype: str,
+    *,
+    max_shard_bytes: int | None = None,
+    weight_audit: bool = True,
+) -> bool:
+    """Convert a GGUF to MLX without requantizing, reusing its codes."""
+    gguf_file = Path(gguf_path)
+    if not gguf_file.exists():
+        print(f"❌ GGUF file not found: {gguf_path}")
+        return False
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    reader = GGUFReader(gguf_path)
+    arch = detect_architecture(reader)
+    if arch not in PRESERVE_SOURCE_ARCHES:
+        supported = ", ".join(sorted(PRESERVE_SOURCE_ARCHES))
+        print(
+            f"❌ --quant-source preserve does not cover architecture '{arch}'; "
+            f"supported: {supported}. Re-run with --quant-source requant."
+        )
+        return False
+    try:
+        validate_moe_layout(reader, arch, classify_architecture(reader, arch))
+    except RuntimeError as error:
+        print(f"❌ {error}")
+        return False
+    variant_error = validate_architecture_variant(reader, arch)
+    if variant_error:
+        print(f"❌ {variant_error}")
+        return False
+
+    print("\n[preserve] Building config and tokenizer...")
+    try:
+        config = build_config(reader, arch, dtype, strict=True)
+    except ValueError as error:
+        print(f"❌ {error}")
+        return False
+    _write_runtime_adapter(output_path, arch, config)
+    with open(output_path / "config.json", "w") as handle:
+        json.dump(config, handle, indent=2)
+    extract_tokenizer(
+        reader, output_path, arch, config["max_position_embeddings"]
+    )
+
+    print("\n[preserve] Re-expressing quantized blocks on the affine grid...")
+    try:
+        report = extract_and_convert_weights_preserve(
+            reader,
+            arch,
+            output_path,
+            dtype,
+            num_heads=int(config.get("num_attention_heads") or 0) or None,
+            kv_heads=int(config.get("num_key_value_heads") or 0) or None,
+            max_shard_bytes=max_shard_bytes,
+            audit=weight_audit,
+        )
+    except Exception as error:  # noqa: BLE001
+        print(f"❌ Preserve conversion failed: {error}")
+        return False
+
+    config["quantization"] = _preserve_quantization_config(report)
+    with open(output_path / "config.json", "w") as handle:
+        json.dump(config, handle, indent=2)
+    if report["preserve"]["gate"] != "pass":
+        print("❌ Refusing to keep an artifact whose preserved weights moved.")
+        return False
+    return True
+
+
 def _write_runtime_adapter(output_path: Path, arch: str, config: dict[str, Any]) -> None:
     if arch == "gemma":
         filename = "gemma_model.py"
@@ -2978,7 +3275,7 @@ def convert(
     dtype: str | None = None,
     quantize: bool = False,
     q_bits: int = 4,
-    q_group_size: int = 64,
+    q_group_size: int | None = None,
     q_mode: str = "affine",
     direct_quant: bool = False,
     moe_router_protect: bool = True,
@@ -2992,8 +3289,35 @@ def convert(
     preserve_source_quant: bool = False,
     max_shard_gb: float | None = None,
     weight_audit: bool = True,
+    quant_source: str | None = None,
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
+    # ``--preserve-source-quant`` used to be a Qwen2-VL-only switch; it is now a
+    # deprecated spelling of ``--quant-source preserve``.
+    if preserve_source_quant:
+        print(
+            "⚠ --preserve-source-quant is deprecated; use --quant-source preserve",
+            file=sys.stderr,
+        )
+        if quant_source not in (None, "preserve"):
+            print(
+                "❌ --preserve-source-quant conflicts with "
+                f"--quant-source {quant_source}; it already means 'preserve'"
+            )
+            return False
+        quant_source = "preserve"
+    quant_source = quant_source or "requant"
+    if quant_source not in QUANT_SOURCE_CHOICES:
+        print(f"❌ Unsupported --quant-source: {quant_source}")
+        return False
+    # ``None`` means "let the code path pick": preserve is pinned to 32 (the GGUF
+    # block width), everything else keeps the historical mlx-lm default of 64.
+    if q_group_size is not None and quantize and (
+        q_group_size not in SUPPORTED_MLX_LM_Q_GROUP_SIZES
+    ):
+        supported = ", ".join(str(size) for size in sorted(SUPPORTED_MLX_LM_Q_GROUP_SIZES))
+        print(f"❌ Unsupported q_group_size={q_group_size}; supported values: {supported}")
+        return False
     shard_options = {}
     if max_shard_gb is not None:
         if not np.isfinite(max_shard_gb) or max_shard_gb <= 0:
@@ -3008,10 +3332,6 @@ def convert(
             print("❌ max_shard_gb must specify at least one byte")
             return False
         shard_options["max_shard_bytes"] = max_shard_bytes
-    if quantize and q_group_size not in SUPPORTED_MLX_LM_Q_GROUP_SIZES:
-        supported = ", ".join(str(size) for size in sorted(SUPPORTED_MLX_LM_Q_GROUP_SIZES))
-        print(f"❌ Unsupported q_group_size={q_group_size}; supported values: {supported}")
-        return False
 
     output_path = Path(output_dir)
     if output_path.exists() and (
@@ -3034,7 +3354,7 @@ def convert(
         if model_type not in {"auto", "llm", "vlm", "text-encoder"}:
             print(f"❌ Unsupported conversion type: {model_type}")
             return False
-        vlm_options = bool(mmproj or hf_model or hf_fallback_vision or preserve_source_quant)
+        vlm_options = bool(mmproj or hf_model or hf_fallback_vision)
         if model_type == "llm" and vlm_options:
             print("❌ VLM source options cannot be used with --type llm")
             return False
@@ -3076,9 +3396,13 @@ def convert(
         if model_type == "llm" and detected_vlm:
             print("❌ Multimodal GGUF detected; use --type vlm with HF assets")
             return False
+        preserve = quant_source == "preserve"
         if model_type == "vlm" or vlm_options or detected_vlm:
-            if preserve_source_quant and not (quantize and direct_quant):
-                print("❌ --preserve-source-quant requires --quantize --direct-quant")
+            if preserve and not (quantize and direct_quant):
+                print(
+                    "❌ --quant-source preserve on a multimodal GGUF requires "
+                    "--quantize --direct-quant (multimodal preservation is Qwen2-VL only)"
+                )
                 return False
             if mixed_precision or quantize != direct_quant:
                 print(
@@ -3087,12 +3411,16 @@ def convert(
                 )
                 return False
             try:
+                # The multimodal adapters keep GGUF k-quant blocks verbatim, so
+                # they stay on the historical affine 4-bit / group-64 layout
+                # rather than the 32-wide LLM preserve grid.
+                vlm_group_size = q_group_size if q_group_size is not None else 64
                 vlm_quant_options = (
                     {"direct_quant": True, "q_bits": q_bits,
-                     "q_group_size": q_group_size, "q_mode": q_mode}
+                     "q_group_size": vlm_group_size, "q_mode": q_mode}
                     if direct_quant else {}
                 )
-                if preserve_source_quant:
+                if preserve:
                     vlm_quant_options["preserve_source_quant"] = True
                 convert_vlm(
                     gguf_path,
@@ -3117,14 +3445,46 @@ def convert(
         if mixed_precision and not (quantize and direct_quant):
             print("❌ --mixed-precision requires --quantize and --direct-quant")
             return False
-        if quantize and direct_quant:
+        requant_group_size = 64 if q_group_size is None else q_group_size
+        if preserve:
+            if mixed_precision:
+                print("❌ --mixed-precision cannot be combined with --quant-source preserve")
+                return False
+            if q_mode != "affine":
+                print(f"❌ --quant-source preserve emits affine groups; got --q-mode {q_mode}")
+                return False
+            if q_group_size is not None and q_group_size != gguf_codes.AFFINE_GROUP_SIZE:
+                print(
+                    "ℹ preserve mode uses 32-value groups (the GGUF block width); "
+                    f"ignoring --q-group-size {q_group_size}"
+                )
+            if quantize:
+                print(
+                    "ℹ --quantize is implied by --quant-source preserve; existing "
+                    "block codes are reused instead of quantizing again"
+                )
+            try:
+                succeeded = _convert_preserved(
+                    gguf_path,
+                    str(direct_quantized_output_path),
+                    dtype,
+                    **shard_options,
+                    weight_audit=weight_audit,
+                )
+            except Exception as error:  # noqa: BLE001
+                print(f"❌ Preserve conversion failed: {error}")
+                return False
+            if not succeeded:
+                return False
+            final_stage_path = direct_quantized_output_path
+        elif quantize and direct_quant:
             try:
                 succeeded = _convert_direct_quantized(
                     gguf_path,
                     str(direct_quantized_output_path),
                     dtype=dtype,
                     q_bits=q_bits,
-                    q_group_size=q_group_size,
+                    q_group_size=requant_group_size,
                     q_mode=q_mode,
                     moe_router_protect=moe_router_protect,
                     mixed_precision=mixed_precision,
@@ -3157,7 +3517,7 @@ def convert(
                         fp_output_path,
                         quantized_output_path,
                         q_bits=q_bits,
-                        q_group_size=q_group_size,
+                        q_group_size=requant_group_size,
                         q_mode=q_mode,
                     )
                 except Exception as error:  # noqa: BLE001
@@ -3434,9 +3794,12 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--q-group-size",
         type=int,
-        default=64,
+        default=None,
         choices=sorted(SUPPORTED_MLX_LM_Q_GROUP_SIZES),
-        help="Quantization group size for mlx-lm (default: 64)",
+        help=(
+            "Quantization group size for mlx-lm (default: 64; preserve mode is "
+            "always 32 because the GGUF blocks are 32 values wide)"
+        ),
     )
     parser.add_argument(
         "--q-mode",
@@ -3454,12 +3817,22 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--quant-source",
+        choices=list(QUANT_SOURCE_CHOICES),
+        default=None,
+        help=(
+            "Where the quantized weights come from: 'requant' (default) decodes the "
+            "GGUF and quantizes from scratch, 'preserve' re-expresses the GGUF "
+            "blocks on MLX's affine grid and only rounds the fp16 scale/bias "
+            f"(supported architectures: {', '.join(sorted(PRESERVE_SOURCE_ARCHES))})"
+        ),
+    )
+    parser.add_argument(
         "--preserve-source-quant",
         action="store_true",
         help=(
-            "Qwen2-VL only, with --quantize --direct-quant: preserve Q4_K codes "
-            "and their 32-value groups; keep other projections floating-point "
-            "(larger mixed-precision output, avoids lossy uniform re-quantization)"
+            "Deprecated alias for --quant-source preserve. Kept so existing "
+            "Qwen2-VL pipelines keep working."
         ),
     )
     parser.add_argument(
@@ -3526,6 +3899,7 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         preserve_source_quant=args.preserve_source_quant,
         max_shard_gb=args.max_shard_gb,
         weight_audit=args.weight_audit,
+        quant_source=getattr(args, "quant_source", None),
     )
     return 0 if success else 1
 

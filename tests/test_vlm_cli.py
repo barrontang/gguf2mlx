@@ -100,17 +100,29 @@ def test_vlm_direct_quantization_options_forwarded(routing):
 
 def test_vlm_source_preserving_options_forwarded(routing):
     source, output, state, _ = routing
+    state["detected"] = True
     assert core.convert(str(source), str(output), quantize=True, direct_quant=True,
                         preserve_source_quant=True)
     assert state["calls"][0][3]["preserve_source_quant"] is True
+    # The multimodal adapters keep their own affine 4-bit / group-64 layout.
+    assert state["calls"][0][3]["q_group_size"] == 64
+
+
+def test_vlm_preserve_is_not_implied_by_the_text_flag(routing):
+    """``--preserve-source-quant`` on a text GGUF stays on the LLM path."""
+    source, output, state, _ = routing
+    assert not core.convert(str(source), str(output), quantize=True, direct_quant=True,
+                            preserve_source_quant=True)
+    assert not state["calls"]
 
 
 @pytest.mark.parametrize("options", [
     {}, {"quantize": True}, {"direct_quant": True},
     {"quantize": True, "direct_quant": True, "model_type": "llm"},
 ])
-def test_source_preserving_requires_vlm_direct_quant(routing, options):
+def test_vlm_preserve_requires_direct_quant(routing, options):
     source, output, state, _ = routing
+    state["detected"] = True
     assert not core.convert(str(source), str(output), preserve_source_quant=True, **options)
     assert not state["calls"]
     assert not output.exists()
