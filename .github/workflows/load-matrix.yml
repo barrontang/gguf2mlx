@@ -40,7 +40,7 @@ jobs:
         env:
           QTYPES: ${{ inputs.qtypes || 'q4_k_m' }}
         run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
+          python - <<'PY'
           import json
           import os
 
@@ -53,8 +53,10 @@ jobs:
               raise SystemExit(f"unknown qtypes {sorted(unknown)}; known: {sorted(known)}")
           if not selected:
               raise SystemExit("no matrix entries selected")
-          print(f"entries={json.dumps(selected, separators=(',', ':'))}")
-          print(f"selected {len(selected)} entries", flush=True)
+          ids = [f"{e['arch']}-{e['qtype']}" for e in selected]
+          print(f"selected {len(selected)} entries: {ids}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"entries={json.dumps(selected, separators=(',', ':'))}\n")
           PY
 
   matrix:
