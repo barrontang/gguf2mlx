@@ -42,7 +42,7 @@ on:
         type: string
       converter_version:
         description: Published gguf2mlx version to install (needs the publish subcommand)
-        default: "2.1.5"
+        default: "2.2.0"
         type: string
     secrets:
       HF_TOKEN:

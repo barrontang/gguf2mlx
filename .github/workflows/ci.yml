@@ -27,5 +27,7 @@ jobs:
       - run: python -m twine check --strict dist/*
         if: matrix.python-version == '3.12'
       - run: ruff check src/ tests/ benchmarks/
+      - run: mypy src
+        if: matrix.python-version == '3.12'
       - run: pytest --cov=gguf2mlx --cov-report=term-missing --cov-fail-under=80
       - run: cargo test --manifest-path rust/gguf2mlx-rs/Cargo.toml

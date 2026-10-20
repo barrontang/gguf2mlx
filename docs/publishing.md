@@ -49,7 +49,7 @@ temporary download/convert tree (defaults to the system temp directory).
 
 ## Publish MLX alongside GGUF on Hugging Face
 
-The reusable [publish-mlx workflow](.github/workflows/publish-mlx.yml) lets model
+The reusable [publish-mlx workflow](../.github/workflows/publish-mlx.yml) lets model
 publishers chain GGUF uploads into MLX publication, including repositories in
 `mlx-community` **when the publisher has write access to that organization**.
 It does not grant organization membership or monitor Hugging Face uploads.
@@ -109,7 +109,7 @@ a GitHub workflow.
   cache, converted weights, and temporary files; FP16 output may be much larger
   than a quantized source. Self-hosted runners must be trusted and their HF
   caches cleaned according to your private-model retention policy.
-- `converter_version` defaults to `2.1.5`, the first release that ships the
+- `converter_version` defaults to `2.2.0`, the first release that ships the
   `publish` subcommand; select a reviewed published version supporting your
   model. The workflow installs `gguf2mlx[vlm]` to obtain the existing Hugging
   Face client extra, but converts **supported text LLMs only**, not

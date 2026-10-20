@@ -39,7 +39,7 @@ import json
 import math
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -234,7 +234,7 @@ class _ShardReader:
         if shard is None:
             raise KeyError(f"{name} is not listed in model.safetensors.index.json")
         try:
-            return self._handle(shard).get_tensor(name)
+            return cast(np.ndarray, self._handle(shard).get_tensor(name))
         except TypeError:
             # safetensors' numpy backend cannot read BF16 ("data type
             # 'bfloat16' not understood"), so widen the raw bit patterns here.
@@ -465,7 +465,10 @@ def load_and_run(model_dir: str | Path, prompt_ids: Iterable[int] = (1, 2, 3)) -
         }
 
     try:
-        model, tokenizer = load(str(model_dir))
+        # ``mlx_lm.load`` returns (model, tokenizer) and, on some versions,
+        # a third config value; index instead of unpacking so both arities work.
+        loaded = load(str(model_dir))
+        model, tokenizer = loaded[0], loaded[1]
     except Exception as exc:  # noqa: BLE001 - report, do not crash the CLI
         return {"status": "fail", "gated": True, "stage": "load", "error": str(exc)}
 

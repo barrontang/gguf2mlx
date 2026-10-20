@@ -808,6 +808,8 @@ def convert_vlm(
                 continue
             if core.get_metadata_str(current, "general.architecture") != "clip":
                 raise ValueError("MiniCPM-V 4.7 requires a separate CLIP projector GGUF")
+            if processor is None:  # pragma: no cover - validate_processor fails first
+                raise ValueError("MiniCPM-V 4.7 is missing its preprocessor config")
             minicpm.validate_vision_metadata(current, processor)
             continue
         projector_type = core.get_metadata_str(current, "clip.projector_type")

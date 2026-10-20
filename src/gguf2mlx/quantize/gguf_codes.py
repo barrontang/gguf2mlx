@@ -72,7 +72,7 @@ CI, where MLX is not installable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -142,8 +142,9 @@ def qtype_name(qtype: Any) -> str | None:
         value = int(qtype)
     except (TypeError, ValueError):
         return None
-    if hasattr(qtype, "name") and qtype.name in _AFFINE_BITS:
-        return qtype.name
+    name = getattr(qtype, "name", None)
+    if isinstance(name, str) and name in _AFFINE_BITS:
+        return name
     return _NAME_BY_ID.get(value)
 
 
@@ -203,11 +204,11 @@ def pack_codes(codes: np.ndarray, bits: int) -> np.ndarray:
     if bits == 4:
         chunks = codes.reshape(rows, cols // 8, 8).astype(np.uint32)
         shifts = np.arange(8, dtype=np.uint32) * 4
-        return np.bitwise_or.reduce(chunks << shifts, axis=-1)
+        return cast(np.ndarray, np.bitwise_or.reduce(chunks << shifts, axis=-1))
     if bits == 8:
         chunks = codes.reshape(rows, cols // 4, 4).astype(np.uint32)
         shifts = np.arange(4, dtype=np.uint32) * 8
-        return np.bitwise_or.reduce(chunks << shifts, axis=-1)
+        return cast(np.ndarray, np.bitwise_or.reduce(chunks << shifts, axis=-1))
     return _pack_bitstream(codes, bits, AFFINE_GROUP_SIZE)
 
 
@@ -269,7 +270,7 @@ def affine_decode(
 
 def _round_half_away_from_zero(values: np.ndarray) -> np.ndarray:
     """C++ ``std::round`` semantics, which MLX and ggml both use."""
-    return np.trunc(values + np.copysign(0.5, values))
+    return cast(np.ndarray, np.trunc(values + np.copysign(0.5, values)))
 
 
 def _blocks(raw: np.ndarray, rows: int, cols: int, qtype: str) -> np.ndarray:

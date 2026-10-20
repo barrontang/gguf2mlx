@@ -23,7 +23,7 @@ quantization; the latter skips the FP16 staging directory. See
 `--quantize --direct-quant --preserve-source-quant` instead keeps those codes
 and 32-element groups, while other projections remain floating-point.
 Coefficient rounding to the output dtype still applies; see the
-[real-checkpoint report](docs/qwen2-vl-real-validation.md).
+[real-checkpoint report](qwen2-vl-real-validation.md).
 
 ### Why is the converted model larger than the GGUF file?
 

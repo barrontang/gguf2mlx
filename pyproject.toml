@@ -1,6 +1,6 @@
 [project]
 name = "gguf2mlx"
-version = "2.1.5.dev0"
+version = "2.2.0"
 description = "Convert verified GGUF models to MLX-LM safetensors on Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -92,6 +92,11 @@ line-length = 100
 target-version = "py310"
 
 [tool.mypy]
-python_version = "3.10"
+# Checked against 3.12 because numpy's bundled stubs use PEP 695 ``type``
+# statements, which a 3.10 target rejects as a syntax error before any of our
+# code is analysed. 3.10/3.13 compatibility is covered by the CI test matrix,
+# not by mypy.
+python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
+ignore_missing_imports = true

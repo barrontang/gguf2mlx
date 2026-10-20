@@ -55,20 +55,20 @@ class StreamingShardWriter:
             array = quantize(
                 np.ascontiguousarray(array, dtype=np.float32), GGMLQuantizationType.BF16,
             ).view(np.uint16).reshape(shape)
-            dtype_name = "BF16"
+            dtype_name: str | None = "BF16"
         else:
             dtype_name = None
-        dtype = array.dtype
-        if dtype.kind not in "fiub" or dtype.itemsize not in (1, 2, 4, 8):
-            raise ValueError(f"Unsupported safetensors dtype: {dtype}")
-        dtype_name = dtype_name or ("BOOL" if dtype.kind == "b" else (
-            f"{'F' if dtype.kind == 'f' else 'I' if dtype.kind == 'i' else 'U'}"
-            f"{dtype.itemsize * 8}"
+        arr_dtype = array.dtype
+        if arr_dtype.kind not in "fiub" or arr_dtype.itemsize not in (1, 2, 4, 8):
+            raise ValueError(f"Unsupported safetensors dtype: {arr_dtype}")
+        dtype_name = dtype_name or ("BOOL" if arr_dtype.kind == "b" else (
+            f"{'F' if arr_dtype.kind == 'f' else 'I' if arr_dtype.kind == 'i' else 'U'}"
+            f"{arr_dtype.itemsize * 8}"
         ))
         if self._header and self.size + array.nbytes > self.max_shard_bytes:
             self.flush()
         # tofile handles strided layouts without building a shard-sized bytes copy.
-        little_endian = array.astype(dtype.newbyteorder("<"), copy=False)
+        little_endian = array.astype(arr_dtype.newbyteorder("<"), copy=False)
         with self._payload.open("ab") as handle:
             little_endian.tofile(handle)
         self._header[name] = {

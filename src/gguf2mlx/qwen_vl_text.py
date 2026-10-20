@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import numpy as np
 
@@ -59,8 +60,11 @@ class Qwen3VLTextEncoderConverter:
                 return reader.get_field(key)
 
         metadata = TextMetadata()
-        scaling_type = get_metadata_str(metadata, "qwen2.rope.scaling.type")
-        scaling_factor = get_metadata_float(metadata, "qwen2.rope.scaling.factor")
+        # The helpers are annotated for ``GGUFReader``; this shim only needs
+        # ``get_field``/``tensors``, so widen the view rather than the helpers.
+        metadata_view: Any = metadata
+        scaling_type = get_metadata_str(metadata_view, "qwen2.rope.scaling.type")
+        scaling_factor = get_metadata_float(metadata_view, "qwen2.rope.scaling.factor")
         if scaling_type not in (None, "none", "default") or scaling_factor not in (None, 1.0):
             raise ValueError(
                 "Nondefault Qwen-VL RoPE scaling is unsupported; "
@@ -70,10 +74,10 @@ class Qwen3VLTextEncoderConverter:
             "embedding_length", "block_count", "attention.head_count",
             "attention.head_count_kv", "feed_forward_length", "context_length",
         ):
-            value = get_metadata_int(metadata, f"qwen2.{suffix}")
+            value = get_metadata_int(metadata_view, f"qwen2.{suffix}")
             if value is None or value <= 0:
                 raise ValueError(f"Missing or invalid Qwen-VL {suffix}")
-        config = build_config(metadata, "qwen2", dtype)
+        config = build_config(metadata_view, "qwen2", dtype)
         name = get_metadata_str(reader, "general.name") or ""
         is_qwen3 = (
             arch in {"qwen3vl", "qwen3_vl"}
@@ -89,7 +93,7 @@ class Qwen3VLTextEncoderConverter:
             "attention_bias": not is_qwen3,
             "tie_word_embeddings": not any(t.name == "output.weight" for t in reader.tensors),
         })
-        head_dim = get_metadata_int(metadata, "qwen2.attention.key_length")
+        head_dim = get_metadata_int(metadata_view, "qwen2.attention.key_length")
         config["head_dim"] = head_dim or config["hidden_size"] // config["num_attention_heads"]
         field = metadata.get_field("qwen2.rope.dimension_sections")
         values = [] if field is None else field.contents()
@@ -123,7 +127,7 @@ class Qwen3VLTextEncoderConverter:
             "vision_start_token_id": "<|vision_start|>",
             "vision_end_token_id": "<|vision_end|>",
         }.items():
-            token_id = get_metadata_int(metadata, f"qwen2.{key}")
+            token_id = get_metadata_int(metadata_view, f"qwen2.{key}")
             if token_id is None:
                 token_id = get_metadata_int(reader, f"tokenizer.ggml.{key}")
             if token_id is None and token in tokens:

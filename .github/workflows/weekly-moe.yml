@@ -29,12 +29,20 @@ jobs:
           import os
           from pathlib import Path
 
-          models = json.loads(os.environ.get("GGUF2MLX_MOE_MODELS", "{}"))
+          # An unset repository variable reaches the job as an empty string,
+          # which is not valid JSON. Treat it as "nothing configured" so the
+          # failure message names the real problem.
+          models = json.loads(os.environ.get("GGUF2MLX_MOE_MODELS") or "{}")
           required = {"qwen3moe", "deepseek2"}
           missing = required - models.keys()
           unavailable = [name for name in required if name in models and not Path(models[name]).is_file()]
           if missing or unavailable:
-              raise SystemExit(f"MoE fixtures missing={sorted(missing)}, unavailable={sorted(unavailable)}")
+              raise SystemExit(
+                  "MoE fixtures missing="
+                  f"{sorted(missing)}, unavailable={sorted(unavailable)}. "
+                  "Set the GGUF2MLX_MOE_MODELS repository variable to a JSON "
+                  'object mapping qwen3moe/deepseek2 to local GGUF paths.'
+              )
           PY
       - name: Run two-family MoE validation
         run: >-

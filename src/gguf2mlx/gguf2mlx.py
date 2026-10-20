@@ -20,7 +20,7 @@ import warnings
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from tqdm import tqdm
@@ -58,10 +58,11 @@ except ImportError as safetensors_import_error:  # pragma: no cover - depends on
         "safetensors library is required. Install it with: pip install safetensors"
     ) from safetensors_import_error
 
+mlx_lm_convert: Any = None
 try:
-    from mlx_lm import convert as mlx_lm_convert
+    from mlx_lm import convert as mlx_lm_convert  # type: ignore[no-redef]
 except ImportError:
-    mlx_lm_convert = None
+    pass
 
 # ---------------------------------------------------------------------------
 # GGUF metadata helpers
@@ -575,7 +576,7 @@ def build_config(
                     field = original_reader.get_field("phi3." + key[len("phi4."):])
                 return field
 
-        reader = Phi4Metadata()
+        reader = cast(Any, Phi4Metadata())
     if arch in QWEN_VL_TEXT_ARCHES:
         return Qwen3VLTextEncoderConverter.build_config(reader, arch, dtype)
     if arch in QWEN35_ARCHES and arch != "qwen35":
@@ -592,7 +593,7 @@ def build_config(
                     )
                 return field
 
-        reader = Qwen35Metadata()
+        reader = cast(Any, Qwen35Metadata())
 
     missing_keys: list[str] = []
 
@@ -672,11 +673,10 @@ def build_config(
             reader, f"{arch}.expert_shared_feed_forward_length"
         ) or ffn_size
     else:
-        ffn_size = get_metadata_int(reader, "llama.feed_forward_length") or get_metadata_int(
-            reader, f"{arch}.feed_forward_length"
-        )
-        if ffn_size is None:
-            ffn_size = hidden_size * 4
+        fallback_ffn = get_metadata_int(
+            reader, "llama.feed_forward_length"
+        ) or get_metadata_int(reader, f"{arch}.feed_forward_length")
+        ffn_size = hidden_size * 4 if fallback_ffn is None else fallback_ffn
         shared_ffn_size = ffn_size
 
     ctx_length = get_metadata_int(reader, "llama.context_length") or get_metadata_int(
@@ -724,7 +724,7 @@ def build_config(
     # Convert model_type to CamelCase architecture class name
     arch_class = "".join(part.capitalize() for part in hf_model_type.split("_")) + "ForCausalLM"
 
-    config = {
+    config: dict[str, Any] = {
         "architectures": [arch_class],
         "model_type": hf_model_type,
         "hidden_size": hidden_size,
@@ -987,17 +987,17 @@ def build_config(
         for suffix, config_key in (
             ("attention.head_count_kv", "num_key_value_heads"),
         ):
-            value = get_metadata_int(reader, f"{arch}.{suffix}")
-            if value is not None:
-                config[config_key] = value
+            head_count_value = get_metadata_int(reader, f"{arch}.{suffix}")
+            if head_count_value is not None:
+                config[config_key] = head_count_value
         final_softcap = get_metadata_float(reader, f"{arch}.final_logit_softcapping")
         if final_softcap is not None:
             config["final_logit_softcapping"] = final_softcap
-        num_experts = get_metadata_int(reader, f"{arch}.expert_count")
-        if num_experts:
+        moe_expert_count = get_metadata_int(reader, f"{arch}.expert_count")
+        if moe_expert_count:
             config.update({
                 "enable_moe_block": True,
-                "num_experts": num_experts,
+                "num_experts": moe_expert_count,
                 "top_k_experts": get_metadata_int(reader, f"{arch}.expert_used_count") or 1,
                 "moe_intermediate_size": (
                     get_metadata_int(reader, f"{arch}.expert_feed_forward_length")
@@ -1120,10 +1120,10 @@ def build_config(
         config["norm_eps"] = stablelm_norm_eps
 
         # partial_rotary_factor = rope_dim / (hidden_size // num_heads)
-        rope_dim = get_metadata_int(reader, "stablelm.rope.dimension_count")
-        if rope_dim is not None and num_heads > 0:
+        stablelm_rope_dim = get_metadata_int(reader, "stablelm.rope.dimension_count")
+        if stablelm_rope_dim is not None and num_heads > 0:
             head_dim = hidden_size // num_heads
-            config["partial_rotary_factor"] = rope_dim / head_dim
+            config["partial_rotary_factor"] = stablelm_rope_dim / head_dim
 
         # qk_layernorm: present when per-head Q/K norm tensors exist in the file.
         tensor_names = {t.name for t in reader.tensors}
@@ -1296,14 +1296,14 @@ def _restore_architecture_tensor(gguf_name: str, arr: np.ndarray, arch: str) -> 
         gguf_name == "output_norm.weight"
         or re.fullmatch(r"blk\.\d+\.(attn_norm|ffn_norm)\.weight", gguf_name)
     ):
-        return arr - np.array(1, dtype=arr.dtype)
+        return cast(np.ndarray, arr - np.array(1, dtype=arr.dtype))
     if arch in QWEN35_ARCHES:
         if gguf_name == "ssm_a":
             if np.any(~np.isfinite(arr)) or np.any(arr >= 0):
                 raise ValueError("Qwen3.5 ssm_a must contain finite negative values")
-            return np.log(-arr).astype(arr.dtype)
+            return cast(np.ndarray, np.log(-arr).astype(arr.dtype))
         if re.fullmatch(r"blk\.\d+\.ssm_norm\.weight", gguf_name):
-            return arr - np.array(1, dtype=arr.dtype)
+            return cast(np.ndarray, arr - np.array(1, dtype=arr.dtype))
     return arr
 
 
@@ -1655,7 +1655,7 @@ def extract_tokenizer(
     }
     if tokenizer_pre:
         tokenizer_config["gguf_tokenizer_pre"] = tokenizer_pre
-    special_tokens = {
+    special_tokens: dict[str, Any] = {
         role: tokens[token_id]
         for role, token_id in (
             ("bos_token", bos_id), ("eos_token", eos_id),
@@ -1753,7 +1753,7 @@ def extract_tokenizer(
             )
             pair_suffix = (
                 [{"SpecialToken": {"id": tokens[end_id], "type_id": 1}}]
-                if model_type == "wordpiece" and suffix else suffix
+                if model_type == "wordpiece" and suffix and end_id is not None else suffix
             )
             tokenizer_json["post_processor"] = {
                 "type": "TemplateProcessing",
@@ -1803,7 +1803,7 @@ def _sentencepiece_bpe_merges(
         token: i for i, token in enumerate(tokens)
         if not token_types or token_types[i] == 1
     }
-    candidates = []
+    candidates: list[tuple[str, str, float]] = []
     for token, token_id in vocab.items():
         splits = [
             (token[:i], token[i:]) for i in range(1, len(token))
@@ -1939,14 +1939,14 @@ def _build_tokenizer_json(
     else:
         raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
 
-    normalizer = (
+    normalizer: dict[str, Any] | None = (
         None if arch in {"qwen2", "qwen2moe", "qwen3moe", *QWEN_VL_TEXT_ARCHES}
         or model_type == "t5"
         else {"type": "NFC"}
     )
     if precompiled_charsmap:
         normalizer = {"type": "Precompiled", "precompiled_charsmap": precompiled_charsmap}
-    pre_tokenizer = {
+    pre_tokenizer: dict[str, Any] | None = {
         "type": "Sequence",
         "pretokenizers": [
             {
@@ -1965,13 +1965,13 @@ def _build_tokenizer_json(
             },
         ],
     }
-    post_processor = {
+    post_processor: dict[str, Any] | None = {
         "type": "ByteLevel",
         "add_prefix_space": False,
         "trim_offsets": False,
         "use_regex": False,
     }
-    decoder = {
+    decoder: dict[str, Any] = {
         "type": "ByteLevel",
         "add_prefix_space": False,
         "trim_offsets": False,
@@ -1987,6 +1987,8 @@ def _build_tokenizer_json(
         elif tokenizer_pre in ("llama-bpe", "llama3", "llama-v3"):
             model_block["ignore_merges"] = True
             normalizer = None
+            # Set immediately above, before any branch can replace it.
+            assert pre_tokenizer is not None
             pre_tokenizer["pretokenizers"][0]["pattern"]["Regex"] = (
                 "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+"
                 "|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*"
@@ -2041,7 +2043,7 @@ def _build_tokenizer_json(
                 ],
             }
         if model_type == "t5":
-            normalizers = []
+            normalizers: list[dict[str, Any]] = []
             if precompiled_charsmap:
                 normalizers = [{
                     "type": "Precompiled", "precompiled_charsmap": precompiled_charsmap,
@@ -2701,9 +2703,8 @@ def extract_and_convert_weights_preserve(
             shape = tuple(int(dim) for dim in reversed(tuple(tensor.shape)))
             heads = _preserve_rotary_heads(gguf_name, arch, num_heads, kv_heads)
             qname = gguf_codes.qtype_name(qtype)
-            qtype_counts[qname or getattr(qtype, "name", str(qtype))] = (
-                qtype_counts.get(qname or getattr(qtype, "name", str(qtype)), 0) + 1
-            )
+            qtype_key = qname or str(getattr(qtype, "name", qtype))
+            qtype_counts[qtype_key] = qtype_counts.get(qtype_key, 0) + 1
 
             skip = _preserve_skip_reason(shape, qtype)
             mapped = None
@@ -3319,7 +3320,7 @@ def convert(
         supported = ", ".join(str(size) for size in sorted(SUPPORTED_MLX_LM_Q_GROUP_SIZES))
         print(f"❌ Unsupported q_group_size={q_group_size}; supported values: {supported}")
         return False
-    shard_options = {}
+    shard_options: dict[str, Any] = {}
     if max_shard_gb is not None:
         if not np.isfinite(max_shard_gb) or max_shard_gb <= 0:
             print("❌ max_shard_gb must be finite and positive")
@@ -3416,7 +3417,7 @@ def convert(
                 # they stay on the historical affine 4-bit / group-64 layout
                 # rather than the 32-wide LLM preserve grid.
                 vlm_group_size = q_group_size if q_group_size is not None else 64
-                vlm_quant_options = (
+                vlm_quant_options: dict[str, Any] = (
                     {"direct_quant": True, "q_bits": q_bits,
                      "q_group_size": vlm_group_size, "q_mode": q_mode}
                     if direct_quant else {}
@@ -3581,7 +3582,7 @@ def package_mlx_directory(model_dir: str, output_bundle: str | None = None) -> b
         print(f"❌ MLX model directory is empty: {model_path}")
         return False
 
-    manifest_files = []
+    manifest_files: list[dict[str, Any]] = []
     for file_path in files:
         rel_path = file_path.relative_to(model_path).as_posix()
         manifest_files.append(

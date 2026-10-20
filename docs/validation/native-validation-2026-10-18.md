@@ -41,7 +41,7 @@ Real-model inputs were fetched from these pinned Hugging Face repositories:
 | `bartowski/Qwen2-VL-2B-Instruct-GGUF` | `Qwen2-VL-2B-Instruct-Q4_K_M.gguf`, `mmproj-Qwen2-VL-2B-Instruct-f16.gguf` | `2160e265f926e84e84dbb1c73e623b5324b23707` |
 
 For Qwen2-VL, the matching local HF assets and astronaut image are the inputs
-documented in the [real-checkpoint acceptance report](docs/qwen2-vl-real-validation.md).
+documented in the [real-checkpoint acceptance report](../qwen2-vl-real-validation.md).
 The smoke test checks finite logits, image sensitivity, and generation, not a
 new twelve-image acceptance run. MoE mixed output is checked only for artifact
 consistency; runtime inference uses the uniform conversion.

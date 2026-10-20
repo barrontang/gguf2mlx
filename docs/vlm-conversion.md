@@ -36,7 +36,7 @@ It keeps Q4_K codes and retains higher-precision source layers as floats, rather
 than forcing every projection to 4-bit. All 729 floating
 output tensors pass the independent weight audit, with exact visual-feature
 parity against HF on those inputs. See the [full report and reproduction
-commands](docs/qwen2-vl-real-validation.md), including the original exact-format failure
+commands](qwen2-vl-real-validation.md), including the original exact-format failure
 and the limited scope. This is not broad visual-quality certification.
 
 ```bash

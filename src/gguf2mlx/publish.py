@@ -351,7 +351,7 @@ class HuggingFaceHub:
         sha = self.api.model_info(repo, revision=revision).sha
         if not sha:
             raise PublishError(f"could not resolve {repo}@{revision} to a commit")
-        return sha
+        return str(sha)
 
     def list_files(self, repo: str, revision: str) -> list[str]:
         return list(self.api.list_repo_files(repo, revision=revision))

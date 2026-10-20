@@ -22,7 +22,7 @@
   llama.cpp **143.58573263274607**, converted FP16 MLX **143.17148969720395**,
   absolute delta **0.41424293554212**. The zero-tolerance gate correctly
   **fails**; tokenizer parity is fixed, but numerical parity is not established.
-  See [the research protocol and results](docs/direct-quant-transcoding.md#gemma-mac-validation-2026-10-06).
+  See [the research protocol and results](../direct-quant-transcoding.md#gemma-mac-validation-2026-10-06).
 - Numerical diagnosis found a dense GGUF row-major decoding bug and a stock
   MLX-LM Gemma erf/tanh GELU mismatch; both are corrected. All 2,506,096,640
   decoded Q4_0 values match native llama.cpp bit-for-bit. Same-weight dense

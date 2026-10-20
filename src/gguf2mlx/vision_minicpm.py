@@ -240,10 +240,10 @@ class MiniCPMV47Adapter:
             ("rope.freq_base", self.text.get("rope_theta")),
             ("attention.layer_norm_rms_epsilon", self.text.get("rms_norm_eps")),
         ):
-            value = core.get_metadata_float(reader, f"qwen35.{suffix}")
+            float_value = core.get_metadata_float(reader, f"qwen35.{suffix}")
             if (
-                expected is None or value is None
-                or not np.isclose(value, expected, rtol=1e-5, atol=0)
+                expected is None or float_value is None
+                or not np.isclose(float_value, expected, rtol=1e-5, atol=0)
             ):
                 raise ValueError(f"GGUF qwen35.{suffix} is incompatible with HF config")
         sections = core.get_metadata_array_int(reader, "qwen35.rope.dimension_sections")

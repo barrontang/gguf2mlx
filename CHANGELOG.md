@@ -1,6 +1,38 @@
 # Changelog
 
-## Unreleased
+## 2.2.0 - 2026-10-21
+
+### Type checking is now a gate, not a configuration file
+
+- `mypy src` runs in CI on Python 3.12 and must report **zero** errors (it
+  previously reported 78 across 8 files and was never executed).
+- `[tool.mypy]` targets 3.12 because numpy's bundled stubs use PEP 695 `type`
+  statements that a 3.10 target rejects as a syntax error. 3.10/3.13 runtime
+  compatibility stays covered by the test matrix.
+- Fixing the errors removed three real hazards: `mlx_lm.load()` is now indexed
+  instead of unpacked into exactly two names, the `streaming.py` writer no
+  longer rebinds its `dtype` parameter to `np.dtype`, and MiniCPM-V validation
+  checks for a missing preprocessor config instead of assuming one exists.
+
+### Documentation links actually resolve
+
+- Eight relative links in `docs/` pointed at `docs/...` or repo-root paths from
+  inside `docs/`, so they 404'd on GitHub (`docs/docs/qwen2-vl-real-validation.md`,
+  `docs/.github/workflows/publish-mlx.yml`, …). All internal links now resolve;
+  `docs/validation/` entries use `../`.
+
+### Scheduled MoE validation reports its real failure
+
+- `Weekly MoE validation` had been failing for three weeks with a bare
+  `JSONDecodeError`: an unset `GGUF2MLX_MOE_MODELS` repository variable arrives
+  as an empty string, which is not valid JSON. It now parses `""` as "nothing
+  configured" and exits with the variable name and expected format.
+
+### Version
+
+- `2.2.0` replaces `2.1.5.dev0`. `publish-mlx.yml`'s `converter_version`
+  default moves to `2.2.0`, the first published release that ships the
+  `publish` subcommand.
 
 ### Preserve the GGUF quantization instead of requantizing
 

@@ -108,9 +108,9 @@ Silicon and fails if the runtime is unavailable instead of silently skipping.
 The random-checkpoint test is a numerical/loader regression, not a visual
 reasoning benchmark. The optional pretrained smoke test checks finite logits,
 image sensitivity and nonempty generation; it does not certify caption accuracy.
-The separate [real Qwen2-VL acceptance harness](benchmarks/validate_vlm.py) audits
+The separate [real Qwen2-VL acceptance harness](../benchmarks/validate_vlm.py) audits
 all floating output weights and compares fixed labeled images against original HF
 and the same GGUF through llama.cpp. It preserves raw answers and exits nonzero
-on its predeclared gate failure; see the [results](docs/qwen2-vl-real-validation.md).
+on its predeclared gate failure; see the [results](qwen2-vl-real-validation.md).
 Image generators such as `mlxgen` / Qwen-Image can supply test images but are not
 substitutes for a matching image-understanding checkpoint.
