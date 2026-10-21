@@ -57,46 +57,85 @@ cannot hide behind a matching bug in the oracle.
 
 ## Preserve tier
 
-`--quant-source preserve` does not quantize: it decodes the Q4_K / Q6_K / Q8_0
-blocks and re-encodes the *same integer codes* as MLX affine groups
-(`w = scale * code + bias`, fp16 scale and bias, 32-value groups). The report
-gains a `preserve` block with the gate and one record per tensor:
+`--quant-source preserve` re-expresses the Q4_K / Q6_K / Q8_0 blocks as MLX
+affine groups (`w = scale * code + bias`, fp16 scale and bias, 32-value groups).
+Where the block layout is expressible it copies the *same integer codes* and
+only rounds the scale and bias to fp16.
+
+`Q6_K` is the exception, and it is the reason this tier has two halves. Q6_K
+scales 16 values at a time; MLX's narrowest group is 32, so a group would need
+two scales. Only 0.7% of groups in a real model have matching pair scales, so
+"copy the codes or give up" meant giving up on 99% of the tensor and writing
+it as FP16 — which turns 0.82 bytes/value into 2 and makes a Q6_K model **2.4x
+the size of the GGUF it came from**. Instead those tensors are re-fitted at the
+source width and gated on their own ceiling:
+
+| Tier | What happened | Ceiling |
+|---|---|---|
+| `exact` | codes copied; only fp16 scale/bias rounding | 1e-3 |
+| `inexact` | re-fitted onto the 32-wide grid | 2.5e-2 (6-bit), 8e-3 (8-bit) |
+
+The `preserve` gate passes only when every measured tier passes, so the two
+numbers can never cover for each other. `--preserve-fallback` chooses the
+width for the inexact tier; `6bit` is the default because it keeps the source
+width:
+
+| Fallback | Q6_K artifact | Relative L2 |
+|---|---|---|
+| `6bit` (default) | **1.067x** the source bytes | 1.7-1.8e-2 |
+| `8bit` | 1.371x | 4.4-4.9e-3 |
+| `float16` | 2.4x | 0 (lossless, 2.44x bytes) |
+
+Measured on Llama-3.2-1B (bartowski Q4_K_M and Q6_K, 113 quantized tensors).
+Fitting is per group: the lower squared error wins between the source lattice
+and a least-squares refit from two starting points, and groups whose pair
+scales do agree keep their codes untouched.
 
 ```json
 "preserve": {
   "gate": "pass",
   "tolerance": 0.001,
-  "tensors_compared": 8,
-  "aggregate_relative_l2": 0.000176,
-  "preserved_by_qtype": {"Q4_K": 7, "Q8_0": 1},
-  "preserved_by_bits": {"4": 7, "8": 1},
+  "fallback": "6bit",
+  "tensors_compared": 9,
+  "aggregate_relative_l2": 0.00774,
+  "size": {"source_bytes": 1294336, "output_bytes": 1397760, "ratio": 1.08},
+  "preserved_by_qtype": {"Q4_K": 7, "Q6_K": 1, "Q8_0": 1},
+  "preserved_by_bits": {"4": 7, "6": 1, "8": 1},
   "group_size": 32,
-  "kept_float16": {"counts": {"F32_has_no_affine_reexpression": 3,
-                              "sub_block_scales_disagree": 1}},
+  "tiers": {
+    "exact":   {"status": "pass", "tolerance": 0.001, "tensors_compared": 8,
+                "max_relative_l2": 0.000241},
+    "inexact": {"status": "pass", "tolerance": 0.025, "tensors_compared": 1,
+                "max_relative_l2": 0.0112}
+  },
+  "kept_float16": {"counts": {"F32_has_no_affine_reexpression": 3}},
   "tensors": [
     {"name": "model.layers.0.self_attn.q_proj.weight", "source": "Q4_K",
-     "bits": 4, "group_size": 32, "relative_l2": 0.00021,
+     "bits": 4, "tier": "exact", "group_size": 32, "relative_l2": 0.00021,
      "max_abs_error": 0.00012, "bit_exact": false}
   ]
 }
 ```
 
-Measured per-tensor relative L2 against `gguf.quants.dequantize`:
+Note that the top-level `tolerance` bounds the `exact` tier only; `inexact`
+tensors are bounded by `tiers.inexact.tolerance`. A tensor is never compared
+against a ceiling its format cannot meet.
+
+Per-tensor relative L2 against `gguf.quants.dequantize`:
 
 | Source | Relative L2 | Why |
 |---|---|---|
 | Q8_0 | 0 (bit-exact) | 8-bit codes map to 8-bit affine codes with `scale = d`, `bias = -128d` |
 | Q4_K | 2.0-2.4e-4 | fp16 rounding of the per-32 scale and min only |
-| Q6_K (sub-block scales agree) | ~2.2e-4 | same, within one 32-value group |
-| Q6_K (sub-block scales disagree) | ~1.1-1.5e-2 | **not representable** on a 32-wide grid |
+| Q6_K (pair scales agree) | ~2.2e-4 | same, within one 32-value group |
+| Q6_K (pair scales disagree, 6-bit) | 1.7-1.8e-2 | **not representable** on a 32-wide grid; re-fitted |
+| Q6_K (pair scales disagree, 8-bit) | 4.4-4.9e-3 | four times finer grid, 1.37x the bytes |
 
-The last row is a structural limit, not a bug: Q6_K scales 16 values at a time,
-so a 32-value affine group would need two scales. Those tensors report
-`exact: false` and are written in **FP16** instead of being requantized; the
-aggregate gate therefore only covers the tensors that were actually preserved.
-The fail-closed rule extends to architectures: only `llama`, `qwen2`, `qwen3`
-and `mistral` are supported, and any other architecture raises an error naming
-it rather than silently requantizing.
+Only block types with no affine re-expression at all (F32 norms, non-matrices,
+unaligned rows) are decoded to float, and the report names the reason. The
+fail-closed rule extends to architectures: only `llama`, `qwen2`, `qwen3` and
+`mistral` are supported, and any other architecture raises an error naming it
+rather than silently requantizing.
 
 ## Re-checking an artifact
 

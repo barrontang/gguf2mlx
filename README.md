@@ -124,11 +124,15 @@ are kept; only the fp16 rounding of the scale and bias is new. Measured against
 sub-block scales agree.
 
 Q6_K has a structural limit: its sub-block scales are 16 values wide, so when
-they disagree inside a 32-value group it cannot be represented exactly. Those
-tensors are flagged `exact: false` and kept in **FP16** rather than silently
-requantized, and `conversion_report.json` records the decision plus per-tensor
-max abs error, relative L2 and an aggregate 1e-3 gate. Modules end up with mixed
-4/6/8-bit widths, which `mlx-lm` loads via per-module `quantization` entries.
+they disagree inside a 32-value group — 99% of groups in a real model — it
+cannot be represented exactly. Those tensors are re-fitted at the source width
+and gated separately (1.7e-2 measured, 2.5e-2 ceiling), which keeps the artifact
+at **1.067x** the GGUF instead of the 2.4x the old FP16 fallback produced.
+`--preserve-fallback 8bit` trades size for error (1.37x, 4.4e-3);
+`--preserve-fallback float16` restores the lossless 2.4x behaviour.
+`conversion_report.json` records the tier, the per-tensor error and the size
+ratio. Modules end up with mixed 4/6/8-bit widths, which `mlx-lm` loads via
+per-module `quantization` entries.
 
 Preserve fails closed: `llama`, `qwen2`, `qwen3` and `mistral` are supported, and
 any other architecture errors out naming the arch instead of falling back to

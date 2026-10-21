@@ -49,3 +49,13 @@ gguf2mlx-review-and-roadmap*
 
 # CI-only pytest basetemp for the load matrix (see .github/workflows/load-matrix.yml).
 load-matrix-tmp/
+
+# Local agent workspace data (project memory + session state). Must stay on disk,
+# must never be committed.
+.workbuddy/
+
+# Per-clone repo metadata written by the ghtraf tool.
+.ghtraf.json
+
+# Converted model directories from local smoke runs (260 MB+).
+smollm2-135m/

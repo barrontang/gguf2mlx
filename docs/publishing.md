@@ -38,8 +38,10 @@ What it does, in order (all validation happens before the first network call):
    conversion produced `config.json` and at least one safetensors shard.
 
 `--quantize` enables lossy affine 4-bit (requires MLX, so Apple Silicon).
-`--quant-source preserve` keeps the source GGUF blocks instead of requantizing
-(see the [quality gates](quality-gates.md#preserve-tier)); it still needs the
+`--quant-source preserve` keeps the source GGUF blocks instead of quantizing
+from scratch: codes are copied verbatim, except for `Q6_K`, whose 16-value
+scales do not fit MLX's 32-value grid and are re-fitted at the same width (see
+the [quality gates](quality-gates.md#preserve-tier)); it still needs the
 result to be loadable by `mlx-lm`, so it is limited to `llama`, `qwen2`,
 `qwen3` and `mistral`. `--keep-work-dir` leaves the temporary tree in place for
 debugging.

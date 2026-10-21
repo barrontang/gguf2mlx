@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### `preserve` stops expanding Q6_K to FP16
+
+`--quant-source preserve` re-expresses GGUF blocks on MLX's affine grid and
+reuses the source integer codes. For Q6_K that only works when a 32-value
+group's two 16-value sub-block scales agree — true for 0.7% of groups in a real
+model. Every other Q6_K tensor was decoded to FP16, turning 0.82 bytes/value
+into 2: **a Q6_K file came out 2.4x the size of the GGUF it came from**, which
+is the opposite of the mode's purpose.
+
+Q6_K is now re-fitted at the source width and emitted as 6-bit affine groups:
+
+| Fallback | Q6_K artifact | Relative L2 |
+|---|---|---|
+| `6bit` (default) | 1.067x the source bytes | 1.7-1.8e-2 |
+| `8bit` | 1.371x | 4.4-4.9e-3 |
+| `float16` | 2.4x (2.44 bytes/value against 0.82) | 0 |
+
+Measured on Llama-3.2-1B (bartowski). On the **Q4_K_M** file, whose Q6_K
+tensors dominate `ffn_down` and `attn_v`, the artifact goes from 1.662x the
+GGUF to **1.092x**. All four artifacts load in `mlx_lm` with finite logits.
+Fitting is per group — the lower squared error of the source lattice and a
+least-squares refit from two starting points — and groups whose pair scales
+match still keep their codes bit for bit.
+
+### Audit changes
+
+- The preserve gate is split into tiers. `exact` (codes copied) is held to
+  1e-3; `inexact` (re-fitted) is held to the ceiling registered for its width.
+  The gate passes only when both do, so a re-fit can neither fail the fp16
+  bound nor hide behind a loose one.
+- `--preserve-fallback {6bit,8bit,float16}` selects the width.
+- `conversion_report.json` records `preserve.tiers`, `preserve.size`
+  (source/output bytes and ratio) and `preserve.fallback`; schema 3.
+- `preserve` plans now record the *source* block type in `qtype` and the target
+  width in `bits`, so `preserved_by_qtype` answers "what came in".
+
+### Fixed
+
+- Preserve conversions of any Llama-3 GGUF wrote `rope_freqs.weight` as a float
+  tensor, so the artifact failed to load ("Received 1 parameters not in model").
+  `build_config` already reproduces that table as a verified `rope_scaling`
+  block; the preserve path now skips the tensor like the float path does.
+- The Q6_K mapping is chunked, so an embedding table with a quarter of a
+  billion values no longer allocates three full-size float32 temporaries.
+
 ## 2.2.0 - 2026-10-21
 
 ### Type checking is now a gate, not a configuration file
