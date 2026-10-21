@@ -2874,6 +2874,12 @@ def extract_and_convert_weights_preserve(
     with StreamingShardWriter(output_dir, max_shard_bytes) as writer:
         for tensor in tqdm(reader.tensors, desc="  Preserving", unit="tensor"):
             gguf_name = str(tensor.name)
+            if gguf_name == "rope_freqs.weight":
+                # Consumed by build_config, which reproduces the llama3 scaling
+                # as a `rope_scaling` block and verifies the round-trip. Emitting
+                # the table itself makes mlx_lm reject the model outright.
+                print("    Skipping rope_freqs.weight (reproduced from config)")
+                continue
             qtype = tensor.tensor_type
             name = _map_tensor_name(gguf_name, arch)
             shape = tuple(int(dim) for dim in reversed(tuple(tensor.shape)))
