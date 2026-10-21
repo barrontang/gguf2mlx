@@ -119,7 +119,52 @@ def test_q6_k_flags_the_error_mlx_group_32_cannot_express():
     oracle = dequantize(raw, GGMLQuantizationType.Q6_K).reshape(4, 256)
     error = _relative_l2(oracle, decoded)
     assert error > gguf_codes.PRESERVE_TOLERANCE
+    # ... but inside the ceiling the pipeline gates this tier on, so the tensor
+    # can stay at 6 bits instead of being expanded to float16.
+    assert error < gguf_codes.PRESERVE_INEXACT_TOLERANCE["6bit"]
     assert np.isfinite(decoded).all()
+
+
+def test_q6_k_output_does_not_depend_on_the_chunk_size(monkeypatch):
+    """Chunking exists for embedding tables; it must not change a single byte."""
+    generator = np.random.default_rng(21)
+    values = generator.normal(0, 0.05, (16, 512)).astype(np.float32)
+    raw = encode_q6_k(values)
+
+    whole = gguf_codes.map_tensor(raw, GGMLQuantizationType.Q6_K, (16, 512))
+    monkeypatch.setattr(gguf_codes, "_CHUNK_VALUES", 512)
+    chunked = gguf_codes.map_tensor(raw, GGMLQuantizationType.Q6_K, (16, 512))
+
+    assert np.array_equal(whole.packed, chunked.packed)
+    assert np.array_equal(whole.scales, chunked.scales)
+    assert np.array_equal(whole.biases, chunked.biases)
+    assert whole.inexact_groups == chunked.inexact_groups
+
+
+def test_refit_to_affine_8bit_is_more_accurate_than_6bit():
+    generator = np.random.default_rng(31)
+    values = generator.normal(0, 0.05, (8, 256)).astype(np.float32)
+
+    six = gguf_codes.refit_tensor_to_affine(values, 6)
+    eight = gguf_codes.refit_tensor_to_affine(values, 8)
+
+    assert six.exact is False and eight.exact is False
+    six_error = _relative_l2(
+        values, gguf_codes.affine_decode(six.packed, six.scales, six.biases, 6)
+    )
+    eight_error = _relative_l2(
+        values, gguf_codes.affine_decode(eight.packed, eight.scales, eight.biases, 8)
+    )
+    assert eight_error < six_error / 2
+    assert six_error < gguf_codes.PRESERVE_INEXACT_TOLERANCE["6bit"]
+    assert eight_error < gguf_codes.PRESERVE_INEXACT_TOLERANCE["8bit"]
+
+
+def test_refit_to_affine_rejects_misaligned_shapes():
+    with pytest.raises(ValueError):
+        gguf_codes.refit_tensor_to_affine(np.zeros((4, 48), dtype=np.float32), 6)
+    with pytest.raises(ValueError):
+        gguf_codes.refit_tensor_to_affine(np.zeros((4, 32, 2), dtype=np.float32), 6)
 
 
 def test_q6_k_rounds_ties_away_from_zero_like_ggml():

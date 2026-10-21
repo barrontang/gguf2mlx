@@ -43,26 +43,50 @@ def test_preserve_reuses_the_source_codes(source_gguf, tmp_path):
     assert report["quant_source"] == "preserve"
     assert report["gates"] == {"weight": "pass", "preserve": "pass"}
     assert report["preserve"]["group_size"] == 32
-    assert report["preserve"]["aggregate_relative_l2"] < gguf_codes.PRESERVE_TOLERANCE
 
-    # Q4_K and Q8_0 keep their codes; Q6_K cannot be expressed on a 32-wide grid
-    # when its 16-value scales disagree, so it is decoded instead of requantized.
-    assert report["preserve"]["preserved_by_qtype"] == {"Q4_K": 7, "Q8_0": 1}
-    assert report["preserve"]["preserved_by_bits"] == {"4": 7, "8": 1}
+    # Q4_K and Q8_0 keep their codes. Q6_K cannot be expressed on a 32-wide grid
+    # when its 16-value scales disagree, so it is re-fitted at 6 bits and
+    # reported under its own tier -- not expanded to float16, which would have
+    # cost 2.4x the bytes of the tensor.
+    assert report["preserve"]["preserved_by_qtype"] == {"Q4_K": 7, "Q6_K": 1, "Q8_0": 1}
+    assert report["preserve"]["preserved_by_bits"] == {"4": 7, "6": 1, "8": 1}
+    assert report["preserve"]["fallback"] == "6bit"
     assert report["preserve"]["kept_float16"]["counts"] == {
         "F32_has_no_affine_reexpression": 3,
-        "sub_block_scales_disagree": 1,
     }
     assert report["preserve"]["bit_exact_tensors"] >= 1
+
+    tiers = report["preserve"]["tiers"]
+    assert set(tiers) == {"exact", "inexact"}
+    assert tiers["exact"]["status"] == "pass"
+    assert tiers["exact"]["tolerance"] == gguf_codes.PRESERVE_TOLERANCE
+    assert tiers["exact"]["aggregate_relative_l2"] < gguf_codes.PRESERVE_TOLERANCE
+    assert tiers["inexact"]["status"] == "pass"
+    assert tiers["inexact"]["tolerance"] == gguf_codes.PRESERVE_INEXACT_TOLERANCE["6bit"]
+    assert tiers["inexact"]["tensors_compared"] == 1
+
+    # The tier split is load-bearing: the re-fitted tensor is far outside the
+    # exact ceiling and still inside its own.
+    re_fitted = next(r for r in report["preserve"]["tensors"] if r["tier"] == "inexact")
+    assert re_fitted["relative_l2"] > gguf_codes.PRESERVE_TOLERANCE
+    assert re_fitted["relative_l2"] < gguf_codes.PRESERVE_INEXACT_TOLERANCE["6bit"]
+
+    # Artifact size is the whole point of the mode.
+    size = report["preserve"]["size"]
+    assert size["source_bytes"] > 0
+    assert 1.0 <= size["ratio"] < 1.15
 
     config = json.loads((destination / "config.json").read_text())
     quantization = config["quantization"]
     assert quantization["group_size"] == 32
     assert quantization["mode"] == "affine"
     assert quantization["scheme"] == "gguf_preserve_v1"
-    # The 8-bit tensor is the only module that needs an explicit override.
+    # Only the tensors that differ from the 4-bit default carry an override.
     assert quantization["model.layers.0.mlp.up_proj"] == {
         "bits": 8, "group_size": 32, "mode": "affine",
+    }
+    assert quantization["model.layers.0.mlp.gate_proj"] == {
+        "bits": 6, "group_size": 32, "mode": "affine",
     }
 
     # Spot-check the audited numbers against an independent decode of the GGUF.
@@ -146,6 +170,53 @@ def test_preserve_never_silently_falls_back_to_requant(source_gguf, tmp_path, ca
     assert "preserve" in report
     assert report["preserve"]["gate"] == "pass"
     assert "requantiz" not in capsys.readouterr().out.lower()
+
+
+def test_fallback_float16_is_the_old_lossless_path(source_gguf, tmp_path):
+    """The escape hatch still exists, and still costs the bytes this mode avoids."""
+    destination = tmp_path / "out"
+    assert _convert(
+        source_gguf, destination, quant_source="preserve", preserve_fallback="float16",
+    ) is True
+
+    report = _report(destination)
+    assert report["preserve"]["fallback"] == "float16"
+    assert report["preserve"]["preserved_by_bits"] == {"4": 7, "8": 1}
+    assert report["preserve"]["kept_float16"]["counts"] == {
+        "F32_has_no_affine_reexpression": 3,
+        "sub_block_scales_disagree": 1,
+    }
+    assert report["preserve"]["tiers"]["inexact"]["status"] == "not_run"
+    # This is the regression: Q6_K expanded to float16 dominates the output.
+    assert report["preserve"]["size"]["ratio"] > 1.3
+
+
+def test_8bit_fallback_buys_accuracy_with_bytes(source_gguf, tmp_path):
+    six_bit = tmp_path / "six"
+    eight_bit = tmp_path / "eight"
+    assert _convert(source_gguf, six_bit, quant_source="preserve") is True
+    assert _convert(
+        source_gguf, eight_bit, quant_source="preserve", preserve_fallback="8bit",
+    ) is True
+
+    six_report = _report(six_bit)["preserve"]
+    eight_report = _report(eight_bit)["preserve"]
+
+    assert eight_report["preserved_by_bits"] == {"4": 7, "8": 2}
+    assert eight_report["tiers"]["inexact"]["tolerance"] == (
+        gguf_codes.PRESERVE_INEXACT_TOLERANCE["8bit"]
+    )
+    six_error = six_report["tiers"]["inexact"]["max_relative_l2"]
+    eight_error = eight_report["tiers"]["inexact"]["max_relative_l2"]
+    assert eight_error < six_error / 2
+    assert eight_report["size"]["ratio"] > six_report["size"]["ratio"]
+
+
+def test_unknown_fallback_is_rejected(source_gguf, tmp_path, capsys):
+    assert _convert(
+        source_gguf, tmp_path / "out", quant_source="preserve", preserve_fallback="4bit",
+    ) is False
+    assert "--preserve-fallback" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("arch", ["llama", "qwen2", "qwen3", "mistral"])
@@ -254,6 +325,15 @@ def test_mlx_lm_loads_the_mixed_width_artifact(source_gguf, tmp_path):
 
     result = fidelity.load_and_run(destination)
     assert result["status"] == "pass", result
+
+
+def test_cli_accepts_preserve_fallback(source_gguf, tmp_path):
+    destination = tmp_path / "cli-8bit"
+    assert _run_cli([
+        "convert", "--input", str(source_gguf), "--output", str(destination),
+        "--quant-source", "preserve", "--preserve-fallback", "8bit",
+    ]) == 0
+    assert _report(destination)["preserve"]["fallback"] == "8bit"
 
 
 def test_preserve_report_matches_the_documented_schema(source_gguf, tmp_path):

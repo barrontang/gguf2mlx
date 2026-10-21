@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/barrontang/gguf2mlx/conversion-report.schema.json",
   "title": "gguf2mlx conversion report",
-  "description": "Written as conversion_report.json next to every conversion. Schema 2 adds the three-tier fidelity block; schema 1 reports (architecture_kind, tensor_decisions) remain valid because those fields are optional here.",
+  "description": "Written as conversion_report.json next to every conversion. Schema 2 added the three-tier fidelity block; schema 3 splits the preserve gate into exact and inexact tiers and records the artifact size ratio. Older reports remain valid: fields added since their schema version are optional here.",
   "type": "object",
   "required": ["schema_version", "architecture"],
   "properties": {
-    "schema_version": {"enum": [1, 2]},
+    "schema_version": {"enum": [1, 2, 3]},
     "architecture": {"type": "string"},
     "architecture_kind": {"enum": ["dense", "moe", "hybrid"]},
     "mixed_precision": {"type": "boolean"},
@@ -48,14 +48,38 @@
     },
     "preserve": {
       "type": "object",
-      "description": "Present only for --quant-source preserve: one record per tensor whose GGUF block codes were reused.",
+      "description": "Present only for --quant-source preserve: one record per tensor mapped onto the affine grid. Tensors in the `exact` tier reused their GGUF codes; `inexact` ones were re-fitted because their block layout cannot be expressed on a 32-wide grid.",
       "required": [
         "gate", "tolerance", "tensors_compared", "aggregate_relative_l2",
         "preserved_by_qtype", "preserved_by_bits", "group_size", "tensors"
       ],
       "properties": {
         "gate": {"enum": ["pass", "fail", "not_run"]},
-        "tolerance": {"type": "number"},
+        "tolerance": {
+          "type": "number",
+          "description": "Ceiling for the `exact` tier, where only fp16 scale/bias rounding is permitted. Inexact tensors are judged against preserve.tiers.inexact.tolerance instead; this field alone does not bound every tensor in the report."
+        },
+        "fallback": {
+          "enum": ["6bit", "8bit", "float16"],
+          "description": "What happened to tensors whose codes could not be reused."
+        },
+        "tiers": {
+          "type": "object",
+          "description": "Per-tier verdicts. The top-level gate passes only when every measured tier passes.",
+          "properties": {
+            "exact": {"$ref": "#/$defs/preserveTier"},
+            "inexact": {"$ref": "#/$defs/preserveTier"}
+          }
+        },
+        "size": {
+          "type": "object",
+          "description": "GGUF bytes versus written safetensors bytes, the ratio this mode is judged on.",
+          "properties": {
+            "source_bytes": {"type": "integer"},
+            "output_bytes": {"type": "integer"},
+            "ratio": {"type": "number"}
+          }
+        },
         "tensors_compared": {"type": "integer"},
         "tensors_total": {"type": "integer"},
         "bit_exact_tensors": {"type": "integer"},
@@ -77,7 +101,7 @@
         "tensors": {"type": "array", "items": {"$ref": "#/$defs/preservedTensor"}},
         "kept_float16": {
           "type": "object",
-          "description": "Tensors that could not keep their codes, with the reason. They are decoded, never requantized.",
+          "description": "Tensors that could not be expressed on the affine grid at all (no mapping for the block type, not a matrix, or unaligned rows). They are decoded, never requantized.",
           "properties": {
             "counts": {"type": "object", "additionalProperties": {"type": "integer"}},
             "tensors": {"type": "array", "items": {"type": "object"}}
@@ -85,7 +109,7 @@
         },
         "plan": {
           "type": "object",
-          "description": "Audit plan: output tensor -> source tensor, block type, affine width and row layout.",
+          "description": "Audit plan: output tensor -> source tensor, block type, affine width, tier and row layout.",
           "additionalProperties": {
             "type": "object",
             "required": ["source", "qtype", "bits", "group_size"],
@@ -96,7 +120,8 @@
               "group_size": {"const": 32},
               "shape": {"type": "array", "items": {"type": "integer"}},
               "rows": {"enum": ["identity", "rotary"]},
-              "heads": {"type": "integer"}
+              "heads": {"type": "integer"},
+              "tier": {"enum": ["exact", "inexact"]}
             }
           }
         },
@@ -173,6 +198,23 @@
         "measured_stage": {"type": "string"}
       }
     },
+    "preserveTier": {
+      "type": "object",
+      "required": ["status", "tolerance", "tensors_compared"],
+      "properties": {
+        "status": {"enum": ["pass", "fail", "not_run"]},
+        "gated": {"type": "boolean"},
+        "tolerance": {"type": "number"},
+        "tensors_compared": {"type": "integer"},
+        "tensors_total": {"type": "integer"},
+        "bit_exact_tensors": {"type": "integer"},
+        "aggregate_relative_l2": {"type": ["number", "null"]},
+        "max_relative_l2": {"type": ["number", "null"]},
+        "worst_tensor": {"type": ["string", "null"]},
+        "failures": {"type": "array", "items": {"type": "string"}},
+        "failure_count": {"type": "integer"}
+      }
+    },
     "preservedTensor": {
       "type": "object",
       "required": [
@@ -185,6 +227,10 @@
         "qtype": {"enum": ["Q4_K", "Q6_K", "Q8_0"]},
         "bits": {"enum": [4, 6, 8]},
         "group_size": {"const": 32},
+        "tier": {
+          "enum": ["exact", "inexact"],
+          "description": "exact: the GGUF codes were copied. inexact: the tensor was re-fitted onto the affine grid."
+        },
         "elements": {"type": "integer"},
         "relative_l2": {"type": "number"},
         "max_abs_error": {"type": "number"},

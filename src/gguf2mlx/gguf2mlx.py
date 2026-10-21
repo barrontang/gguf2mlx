@@ -2833,19 +2833,32 @@ def extract_and_convert_weights_preserve(
     kv_heads: int | None = None,
     max_shard_bytes: int | None = None,
     audit: bool = True,
+    fallback: str = "6bit",
 ) -> dict[str, Any]:
     """Write MLX weights that reuse the GGUF source's quantization codes.
 
     Tensors whose block format maps exactly onto MLX affine groups of 32 keep
-    their codes and only gain an ``fp16`` scale and bias. Everything else --
-    unsupported block types, non-matrix tensors, and ``Q6_K`` tensors whose
-    16-value sub-block scales disagree inside a 32-value group -- is decoded to
-    ``float16`` instead. Nothing is ever silently requantized, and the report
-    states which tensors took which path and why.
+    their codes and only gain an ``fp16`` scale and bias.
+
+    ``Q6_K`` cannot: its scale is per 16 values and MLX's grid is per 32, so for
+    the ~99% of groups whose two sub-block scales differ the tensor is re-fitted
+    at the source width and reported under the ``inexact`` tier. It is *not*
+    decoded to ``float16`` -- that would turn 0.82 bytes/value into 2 and make
+    the artifact 2.4x the GGUF, which is the defect this path exists to avoid.
+
+    ``fallback`` picks what happens to those tensors: ``6bit`` (default, same
+    width as the source), ``8bit`` (4x lower error, 1.37x the source bytes), or
+    ``float16`` (lossless, 2.4x). Block types with no affine re-expression at
+    all always decode to ``dtype``.
     """
     if dtype != "float16":
         raise RuntimeError(
             "preserve mode stores affine scales as float16; use --dtype float16"
+        )
+    if fallback not in gguf_codes.PRESERVE_FALLBACK_CHOICES:
+        raise RuntimeError(
+            f"unsupported preserve fallback {fallback!r}; "
+            f"choose from {gguf_codes.PRESERVE_FALLBACK_CHOICES}"
         )
     if max_shard_bytes is None:
         max_shard_bytes = PRESERVE_DEFAULT_MAX_SHARD_BYTES
@@ -2856,6 +2869,7 @@ def extract_and_convert_weights_preserve(
     qtype_counts: dict[str, int] = {}
     bits_counts: dict[int, int] = {}
     module_bits: dict[str, int] = {}
+    tier_counts = {"exact": 0, "inexact": 0}
 
     with StreamingShardWriter(output_dir, max_shard_bytes) as writer:
         for tensor in tqdm(reader.tensors, desc="  Preserving", unit="tensor"):
@@ -2870,10 +2884,26 @@ def extract_and_convert_weights_preserve(
 
             skip = _preserve_skip_reason(shape, qtype)
             mapped = None
+            tier = "exact"
             if skip is None:
                 mapped = gguf_codes.map_tensor(tensor.data, qtype, shape)
                 if not mapped.exact:
-                    skip = "sub_block_scales_disagree"
+                    # Structural, bounded inexactness (Q6_K on a 32-wide grid).
+                    # Emit it at the requested width instead of dropping to
+                    # float16; only an explicit `float16` fallback declines.
+                    if (
+                        mapped.qtype in gguf_codes.INEVITABLY_INEXACT
+                        and fallback != "float16"
+                    ):
+                        tier = "inexact"
+                        if fallback == "8bit" and mapped.bits < 8:
+                            exact_values = gguf_codes.reference_decode(
+                                tensor.data, qtype, shape
+                            )
+                            mapped = gguf_codes.refit_tensor_to_affine(exact_values, 8)
+                            del exact_values
+                    else:
+                        skip = "sub_block_scales_disagree"
             if skip is not None:
                 kept_float.append({
                     "source": gguf_name,
@@ -2894,15 +2924,19 @@ def extract_and_convert_weights_preserve(
                 writer.add(f"{name.removesuffix('.weight')}.biases", biases)
                 preserve_plan[name] = {
                     "source": gguf_name,
-                    "qtype": str(mapped.qtype),
+                    # Always the *source* block type, so `preserved_by_qtype`
+                    # answers "what came in"; `bits` says what went out.
+                    "qtype": str(qname or mapped.qtype),
                     "bits": int(mapped.bits),
                     "group_size": int(mapped.group_size),
                     "shape": [int(shape[0]), int(shape[1])],
                     "rows": "rotary" if heads else "identity",
                     "heads": int(heads or 0),
+                    "tier": tier,
                 }
                 module_bits[name.removesuffix(".weight")] = int(mapped.bits)
                 bits_counts[int(mapped.bits)] = bits_counts.get(int(mapped.bits), 0) + 1
+                tier_counts[tier] += 1
                 del packed, scales, biases
                 continue
 
@@ -2924,13 +2958,23 @@ def extract_and_convert_weights_preserve(
           f"{len(float_layout)} kept in {dtype} ({len(writer.files)} shards)")
     print(f"    Source block types: {', '.join(f'{k}={v}' for k, v in sorted(qtype_counts.items()))}")
     print(f"    Affine widths: {', '.join(f'{k}-bit={v}' for k, v in sorted(bits_counts.items())) or 'none'}")
+    print(
+        f"    Tiers: exact={tier_counts['exact']}, "
+        f"inexact={tier_counts['inexact']} (fallback={fallback})"
+    )
     if kept_float:
         reasons: dict[str, int] = {}
         for item in kept_float:
             reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
         print("    Float fallbacks: " + ", ".join(f"{k}={v}" for k, v in sorted(reasons.items())))
-    print(f"    Total input:  {sum(t.n_bytes for t in reader.tensors) / 1e9:.2f} GB (GGUF)")
-    print(f"    Total output: {writer.total / 1e9:.2f} GB (safetensors)")
+    source_bytes = sum(int(t.n_bytes) for t in reader.tensors)
+    output_bytes = int(writer.total)
+    size_ratio = (output_bytes / source_bytes) if source_bytes else 0.0
+    print(f"    Total input:  {source_bytes / 1e9:.2f} GB (GGUF)")
+    print(
+        f"    Total output: {output_bytes / 1e9:.2f} GB (safetensors), "
+        f"{size_ratio:.3f}x the source"
+    )
 
     if audit and float_layout:
         print("\n  Auditing float tensors against an independent source decode...")
@@ -2943,7 +2987,9 @@ def extract_and_convert_weights_preserve(
             "total_output_tensors": len(float_layout),
         }
     if audit and preserve_plan:
-        preserve_audit = fidelity.audit_preserved(output_dir, reader, preserve_plan)
+        preserve_audit = fidelity.audit_preserved(
+            output_dir, reader, preserve_plan, fallback=fallback
+        )
     else:
         preserve_audit = {
             "tensors": [],
@@ -2963,6 +3009,12 @@ def extract_and_convert_weights_preserve(
         preserve_plan=preserve_plan,
         kept_float=kept_float,
         module_bits=module_bits,
+        preserve_size={
+            "source_bytes": source_bytes,
+            "output_bytes": output_bytes,
+            "ratio": size_ratio,
+        },
+        preserve_fallback=fallback,
     )
     fidelity.write_report(output_dir, report)
     print(f"  {fidelity.summarize(report)}")
@@ -2971,9 +3023,16 @@ def extract_and_convert_weights_preserve(
     print(
         f"  {marker} preserved weights: {preserved['gate']} "
         f"({preserved['tensors_compared']}/{len(preserve_plan)} tensors, "
-        f"aggregate relative L2 {preserved['aggregate_relative_l2']:.2e} vs "
-        f"tolerance {preserved['tolerance']:.1e})"
+        f"aggregate relative L2 {preserved['aggregate_relative_l2']:.2e})"
     )
+    for tier_name, tier in preserved.get("tiers", {}).items():
+        if not tier.get("tensors_compared"):
+            continue
+        print(
+            f"    {tier_name:7s} tier: {tier['status']} "
+            f"({tier['tensors_compared']} tensors, max relative L2 "
+            f"{tier['max_relative_l2']:.2e} vs {tier['tolerance']:.1e})"
+        )
     if preserved["kept_float16"]["counts"]:
         print(f"    Kept in float16: {preserved['kept_float16']['counts']}")
     return report
@@ -3017,8 +3076,13 @@ def _convert_preserved(
     *,
     max_shard_bytes: int | None = None,
     weight_audit: bool = True,
+    fallback: str = "6bit",
 ) -> bool:
     """Convert a GGUF to MLX without requantizing, reusing its codes."""
+    if fallback not in gguf_codes.PRESERVE_FALLBACK_CHOICES:
+        supported = ", ".join(gguf_codes.PRESERVE_FALLBACK_CHOICES)
+        print(f"❌ Unsupported --preserve-fallback {fallback}; choose from {supported}")
+        return False
     gguf_file = Path(gguf_path)
     if not gguf_file.exists():
         print(f"❌ GGUF file not found: {gguf_path}")
@@ -3069,6 +3133,7 @@ def _convert_preserved(
             kv_heads=int(config.get("num_key_value_heads") or 0) or None,
             max_shard_bytes=max_shard_bytes,
             audit=weight_audit,
+            fallback=fallback,
         )
     except Exception as error:  # noqa: BLE001
         print(f"❌ Preserve conversion failed: {error}")
@@ -3454,6 +3519,7 @@ def convert(
     max_shard_gb: float | None = None,
     weight_audit: bool = True,
     quant_source: str | None = None,
+    preserve_fallback: str = "6bit",
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     # ``--preserve-source-quant`` used to be a Qwen2-VL-only switch; it is now a
@@ -3474,6 +3540,12 @@ def convert(
     if quant_source not in QUANT_SOURCE_CHOICES:
         print(f"❌ Unsupported --quant-source: {quant_source}")
         return False
+    if preserve_fallback not in gguf_codes.PRESERVE_FALLBACK_CHOICES:
+        supported = ", ".join(gguf_codes.PRESERVE_FALLBACK_CHOICES)
+        print(f"❌ Unsupported --preserve-fallback {preserve_fallback}; choose from {supported}")
+        return False
+    if preserve_fallback != "6bit" and quant_source != "preserve":
+        print("ℹ --preserve-fallback only applies to --quant-source preserve; ignoring it")
     # ``None`` means "let the code path pick": preserve is pinned to 32 (the GGUF
     # block width), everything else keeps the historical mlx-lm default of 64.
     if q_group_size is not None and quantize and (
@@ -3634,6 +3706,7 @@ def convert(
                     dtype,
                     **shard_options,
                     weight_audit=weight_audit,
+                    fallback=preserve_fallback,
                 )
             except Exception as error:  # noqa: BLE001
                 print(f"❌ Preserve conversion failed: {error}")
@@ -3992,6 +4065,18 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--preserve-fallback",
+        choices=list(gguf_codes.PRESERVE_FALLBACK_CHOICES),
+        default="6bit",
+        help=(
+            "How --quant-source preserve stores tensors whose codes cannot be "
+            "reused (Q6_K: MLX groups are 32 wide, its scale is per 16). '6bit' "
+            "(default) keeps the source width at ~1.7e-2 relative L2, '8bit' "
+            "costs 1.37x the source bytes for ~4e-3, 'float16' is lossless at "
+            "2.4x and is what earlier releases did"
+        ),
+    )
+    parser.add_argument(
         "--preserve-source-quant",
         action="store_true",
         help=(
@@ -4064,6 +4149,7 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         max_shard_gb=args.max_shard_gb,
         weight_audit=args.weight_audit,
         quant_source=getattr(args, "quant_source", None),
+        preserve_fallback=getattr(args, "preserve_fallback", "6bit"),
     )
     return 0 if success else 1
 

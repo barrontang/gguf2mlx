@@ -43,19 +43,29 @@ Per type:
     Here the two formats disagree structurally: ``Q6_K``'s scale is per 16
     values, MLX's smallest supported group is 32 (``mlx.core.quantize`` rejects
     ``group_size=16``), so one affine group has to cover two ``Q6_K`` sub-blocks
-    with potentially different scales. Exactness then requires
-    ``sc[2i] == sc[2i+1]``; when they differ the codes of the smaller sub-block
-    have to be rounded onto the coarser grid, and the resulting error is on the
-    order of the source quantization step, not of ``fp16`` rounding. Measured on
-    synthetic blocks with realistic pair scales: relative L2 ~1.1e-2, i.e. an
-    order of magnitude above the 1e-3 gate this project ships with.
+    with potentially different scales. Exactness requires
+    ``sc[2i] == sc[2i+1]``, which holds for only ~0.7% of groups in a real
+    model, so this is the one format where ``preserve`` cannot copy codes: the
+    values are re-fitted onto the 6-bit grid and the error is *reported*, not
+    hidden.
 
-    The mapping is still implemented and deterministic -- it is exact for the
-    ~7% of pairs whose scales match, and it is what :func:`map_tensor` reports
-    as ``exact=False`` otherwise. The conversion pipeline uses it only when
-    every pair in a tensor matches, and otherwise keeps the decoded values in
-    ``float16`` rather than requantize them. Nothing here silently degrades: the
-    caller sees ``MappingResult.exact``.
+    Two candidates are computed per group and the lower squared error wins:
+
+    * the source-lattice fit -- scale ``d*max|sc|``, codes divided through by
+      the scale ratio, which is exact for the coarser sub-block;
+    * a least-squares refit of ``scale``/``bias`` onto the decoded values,
+      which recovers most of what the coarse fit loses on the finer sub-block.
+
+    Measured on real Llama-3.2-1B ``Q6_K`` tensors: relative L2 **1.7e-2**,
+    against 4.3e-3 if the same tensor is stored at 8 bits. Groups whose pair
+    scales do agree keep their codes bit for bit, so ``MappingResult.exact``
+    is still an honest per-tensor statement.
+
+    The conversion pipeline never falls back to ``float16`` for these tensors:
+    that would turn a 0.82 byte/value tensor into a 2 byte/value one (2.4x) and
+    defeat the point of the mode. It emits them at 6 bits under a separate
+    gate with the tolerance in :data:`PRESERVE_INEXACT_TOLERANCE`; only block
+    types with no mapping at all still decode to float.
 
 Packing
 -------
@@ -85,6 +95,27 @@ PRESERVE_ARCHES = frozenset({"llama", "qwen2", "qwen3", "mistral"})
 #: Relative-L2 ceiling for a preserved tensor. Only ``fp16`` scale/bias rounding
 #: is allowed inside it, so a mis-mapped block cannot hide underneath.
 PRESERVE_TOLERANCE = 1.0e-3
+
+#: Ceilings for tensors that cannot keep their codes and are re-fitted at the
+#: source bit width instead. Keyed by the fallback the caller asked for.
+#: Measured on Llama-3.2-1B: 1.7e-2 at 6 bits, 4.4e-3 at 8 bits.
+PRESERVE_INEXACT_TOLERANCE = {
+    "6bit": 2.5e-2,
+    "8bit": 8.0e-3,
+}
+
+#: Block formats whose affine re-expression cannot be exact for every group.
+#: Inexactness here is structural and bounded, not a mapping bug -- so the
+#: pipeline re-fits instead of dropping the tensor to ``float16``.
+INEVITABLY_INEXACT = frozenset({"Q6_K"})
+
+#: How a tensor whose codes cannot be reused verbatim is stored.
+PRESERVE_FALLBACK_CHOICES = ("6bit", "8bit", "float16")
+
+#: Values processed per chunk. Keeps the transient float32 arrays bounded for
+#: embedding tables, where one ``Q6_K`` tensor holds a quarter of a billion
+#: values.
+_CHUNK_VALUES = 4 * 1024 * 1024
 
 #: MLX's own limit: ``group_size`` must be 32, 64, or 128.
 MIN_MLX_GROUP_SIZE = 32
@@ -350,58 +381,238 @@ def q8_0_to_affine(
     )
 
 
+def _group_sse(
+    values: np.ndarray, codes: np.ndarray, scale: np.ndarray, bias: np.ndarray
+) -> np.ndarray:
+    """Squared error of one reconstructed group, summed over its values."""
+    residual = codes * scale + bias - values
+    return np.sum(residual * residual, axis=-1)
+
+
+def _codes_for(
+    values: np.ndarray, scale: np.ndarray, bias: np.ndarray, levels: int
+) -> np.ndarray:
+    """Nearest code in ``[0, levels]`` for every value, given a group grid."""
+    safe = np.where(scale > 0, scale, 1.0)
+    return cast(
+        np.ndarray,
+        np.clip(_round_half_away_from_zero((values - bias) / safe), 0, levels),
+    )
+
+
+def _refit_groups(
+    values: np.ndarray,
+    codes: np.ndarray,
+    scale: np.ndarray,
+    bias: np.ndarray,
+    levels: int,
+    *,
+    iterations: int = 2,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Least-squares refit of ``scale``/``bias`` for groups of 32 values.
+
+    Starts from the caller's mapping and keeps it whenever a pass does not lower
+    the squared error, so a refit can never make a group worse. ``values`` is
+    ``(..., 32)``, ``scale``/``bias`` are ``(..., 1)``.
+    """
+    best_codes = codes.astype(np.float32)
+    best_scale = scale.astype(np.float32)
+    best_bias = bias.astype(np.float32)
+    best_error = _group_sse(values, best_codes, best_scale, best_bias)
+    for _ in range(iterations):
+        code_mean = best_codes.mean(-1, keepdims=True)
+        value_mean = values.mean(-1, keepdims=True)
+        centred = best_codes - code_mean
+        variance = np.sum(centred * centred, axis=-1, keepdims=True)
+        covariance = np.sum(centred * (values - value_mean), axis=-1, keepdims=True)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            candidate_scale = np.where(variance > 1e-12, covariance / variance, best_scale)
+        candidate_scale = np.where(candidate_scale > 0, candidate_scale, best_scale)
+        candidate_bias = value_mean - candidate_scale * code_mean
+        candidate_codes = _codes_for(values, candidate_scale, candidate_bias, levels)
+        candidate_error = _group_sse(
+            values, candidate_codes, candidate_scale, candidate_bias
+        )
+        better = (candidate_error < best_error)[..., None]
+        best_codes = np.where(better, candidate_codes, best_codes)
+        best_scale = np.where(better, candidate_scale, best_scale)
+        best_bias = np.where(better, candidate_bias, best_bias)
+        best_error = np.where(better[..., 0], candidate_error, best_error)
+    return best_codes, best_scale, best_bias
+
+
+def _q6k_chunk(
+    blocks: np.ndarray, floating_dtype: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Map one run of ``Q6_K`` blocks; returns packed, scales, biases, mismatch mask."""
+    count = int(blocks.shape[0])
+    ql = blocks[:, 0:128]
+    qh = blocks[:, 128:192]
+    pair = blocks[:, 192:208].copy().view(np.int8).astype(np.float32).reshape(count, 8, 2)
+    d = blocks[:, 208:210].copy().view("<f2").astype(np.float32).reshape(count, 1, 1)
+
+    low = ((ql.reshape(-1, 2, 1, 64) >> np.array(
+        [0, 4], dtype=np.uint8
+    ).reshape(1, 1, 2, 1)) & np.uint8(0x0F)).reshape(count, 8, 32)
+    high = ((qh.reshape(-1, 2, 1, 32) >> np.array(
+        [0, 2, 4, 6], dtype=np.uint8
+    ).reshape(1, 1, 4, 1)) & np.uint8(0x03)).reshape(count, 8, 32)
+    codes = (low | (high << np.uint8(4))).astype(np.float32)
+
+    # Exact source values: per 16-value sub-block, w = d * sc * (q - 32).
+    sub = (codes.reshape(count, 8, 2, 16) - 32.0) * d[..., None] * pair[..., None]
+    values = sub.reshape(count, 8, 32)
+
+    # Candidate 1: the coarser sub-block scale, codes divided through by the
+    # scale ratio. Exact for the coarser of the two sub-blocks.
+    magnitudes = np.abs(pair)
+    coarse = magnitudes.max(axis=-1)
+    scale = d * coarse[..., None]
+    zero = coarse == 0
+    ratio = pair / np.where(zero, 1.0, coarse)[..., None]
+    source_codes = np.clip(_round_half_away_from_zero(
+        (codes.reshape(count, 8, 2, 16) - 32.0) * ratio[..., None]
+    ) + 32.0, 0, 63).reshape(count, 8, 32)
+    source_codes[
+        zero.repeat(2, axis=-1).repeat(16, axis=-1).reshape(values.shape)
+    ] = 32.0
+    source_bias = -32.0 * scale
+
+    # Candidates 2 and 3: least squares from the source lattice, and from the
+    # group's own span. Neither is uniformly better -- the lattice start wins
+    # where codes land on the grid, the span start where the sub-block scales
+    # differ a lot -- so the lower error wins per group. Applied only where the
+    # pair scales disagree: matched groups must keep their exact codes.
+    mismatched = pair[..., 0] != pair[..., 1]
+    codes_out = source_codes
+    scale_out = scale
+    bias_out = source_bias
+    if mismatched.any():
+        lattice = _refit_groups(values, source_codes, scale, source_bias, 63)
+        group_low = values.min(axis=-1, keepdims=True)
+        group_high = values.max(axis=-1, keepdims=True)
+        span_scale = np.maximum(group_high - group_low, 1e-12) / 63.0
+        span_bias = group_low
+        span_codes = _codes_for(values, span_scale, span_bias, 63)
+        span = _refit_groups(values, span_codes, span_scale, span_bias, 63)
+
+        take_span = _group_sse(values, *span) < _group_sse(values, *lattice)
+        fit_codes = np.where(take_span[..., None], span[0], lattice[0])
+        fit_scale = np.where(take_span[..., None], span[1], lattice[1])
+        fit_bias = np.where(take_span[..., None], span[2], lattice[2])
+
+        keep = mismatched[..., None]
+        codes_out = np.where(keep, fit_codes, source_codes)
+        scale_out = np.where(keep, fit_scale, scale)
+        bias_out = np.where(keep, fit_bias, source_bias)
+
+    packed = pack_codes(codes_out.astype(np.uint8).reshape(count, 256), 6)
+    return (
+        packed,
+        scale_out.astype(floating_dtype),
+        bias_out.astype(floating_dtype),
+        mismatched,
+    )
+
+
 def q6_k_to_affine(
     raw: np.ndarray, shape: Any, *, floating_dtype: str = "float16"
 ) -> MappingResult:
     """Re-express a ``Q6_K`` tensor as affine 6-bit groups of 32.
 
     Exact only where the two 16-value sub-block scales inside a 32-value group
-    agree; see the module docstring for why MLX cannot express the general case.
+    agree; elsewhere the group is least-squares re-fitted and the error is
+    reported through :attr:`MappingResult.inexact_groups`.
     """
     rows, cols = _check_shape(shape, "Q6_K")
     blocks = _blocks(raw, rows, cols, "Q6_K")
+    per_row = cols // _BLOCK_ELEMENTS["Q6_K"]
+    step = max(1, _CHUNK_VALUES // max(cols, 1))
 
-    ql = blocks[:, 0:128]
-    qh = blocks[:, 128:192]
-    sub_scales = blocks[:, 192:208].copy().view(np.int8).astype(np.int32)
-    d = blocks[:, 208:210].copy().view("<f2").astype(np.float32)
+    packed_parts: list[np.ndarray] = []
+    scale_parts: list[np.ndarray] = []
+    bias_parts: list[np.ndarray] = []
+    inexact_groups = 0
+    packed_cols = cols * 6 // 32
+    for start in range(0, rows, step):
+        stop = min(rows, start + step)
+        packed, scale, bias, mismatched = _q6k_chunk(
+            blocks[start * per_row: stop * per_row], floating_dtype
+        )
+        rows_in_chunk = stop - start
+        packed_parts.append(packed.reshape(rows_in_chunk, packed_cols))
+        scale_parts.append(scale.reshape(rows_in_chunk, cols // 32))
+        bias_parts.append(bias.reshape(rows_in_chunk, cols // 32))
+        inexact_groups += int(mismatched.sum())
 
-    low = ((ql.reshape(-1, 2, 1, 64) >> np.array(
-        [0, 4], dtype=np.uint8
-    ).reshape(1, 1, 2, 1)) & np.uint8(0x0F)).reshape(-1, 8, 32)
-    high = ((qh.reshape(-1, 2, 1, 32) >> np.array(
-        [0, 2, 4, 6], dtype=np.uint8
-    ).reshape(1, 1, 4, 1)) & np.uint8(0x03)).reshape(-1, 8, 32)
-    codes = (low | (high << np.uint8(4))).astype(np.int16)
-
-    groups = codes.reshape(-1, 8, 2, 16)
-    pair = sub_scales.reshape(-1, 8, 2)
-    magnitudes = np.abs(pair)
-    coarse = magnitudes.max(axis=-1)
-    mismatched = pair[:, :, 0] != pair[:, :, 1]
-    exact = not bool(mismatched.any())
-
-    # Values are d * sc * (q - 32); pick the coarser of the two sub-block scales
-    # as the group scale and fold the -32 offset into the bias.
-    scale = (d.reshape(-1, 1) * coarse.astype(np.float32)).astype(floating_dtype)
-    bias = (-32.0 * scale.astype(np.float32)).astype(floating_dtype)
-    zero = coarse == 0
-    safe = np.where(zero, 1, coarse).astype(np.float32)
-    ratio = (pair.astype(np.float32) / safe[:, :, None])[:, :, :, None]
-    shifted = _round_half_away_from_zero((groups.astype(np.float32) - 32.0) * ratio) + 32.0
-    shifted = np.clip(shifted, 0, 63)
-    shifted[zero.repeat(2, axis=-1).repeat(16, axis=-1).reshape(groups.shape)] = 32
-
+    packed = packed_parts[0] if len(packed_parts) == 1 else np.concatenate(packed_parts)
+    scales = scale_parts[0] if len(scale_parts) == 1 else np.concatenate(scale_parts)
+    biases = bias_parts[0] if len(bias_parts) == 1 else np.concatenate(bias_parts)
     return MappingResult(
-        packed=pack_codes(shifted.astype(np.uint8).reshape(rows, cols), 6),
-        scales=scale.reshape(rows, cols // 32),
-        biases=bias.reshape(rows, cols // 32),
+        packed=packed,
+        scales=scales,
+        biases=biases,
         bits=6,
         group_size=32,
         qtype="Q6_K",
-        exact=exact,
-        inexact_groups=int(mismatched.sum()),
+        exact=inexact_groups == 0,
+        inexact_groups=inexact_groups,
     )
+
+
+def refit_tensor_to_affine(
+    values: np.ndarray, bits: int, *, floating_dtype: str = "float16"
+) -> MappingResult:
+    """Fit arbitrary float values onto an MLX affine grid at ``bits``.
+
+    Used when a block format cannot keep its codes at the source width and the
+    caller asked for a different width. ``values`` is the decoded tensor, so
+    the result is a requantization -- callers must record it as inexact.
+    """
+    if bits not in (4, 6, 8):
+        raise ValueError(f"unsupported MLX affine bit-width: {bits}")
+    array = np.ascontiguousarray(values, dtype=np.float32)
+    if array.ndim != 2 or array.shape[1] % AFFINE_GROUP_SIZE:
+        raise ValueError(
+            f"affine refit needs a 2-D tensor with a row length that is a "
+            f"multiple of {AFFINE_GROUP_SIZE}, got {array.shape}"
+        )
+    rows, cols = array.shape
+    levels = float((1 << bits) - 1)
+    step = max(1, _CHUNK_VALUES // max(cols, 1))
+    packed_parts: list[np.ndarray] = []
+    scale_parts: list[np.ndarray] = []
+    bias_parts: list[np.ndarray] = []
+    for start in range(0, rows, step):
+        groups = np.ascontiguousarray(array[start:start + step]).reshape(
+            -1, cols // AFFINE_GROUP_SIZE, AFFINE_GROUP_SIZE
+        )
+        low = groups.min(axis=-1, keepdims=True)
+        high = groups.max(axis=-1, keepdims=True)
+        scale = np.maximum(high - low, 1e-12) / levels
+        bias = low
+        codes = _codes_for(groups, scale, bias, int(levels))
+        codes, scale, bias = _refit_groups(groups, codes, scale, bias, int(levels))
+        packed_parts.append(
+            pack_codes(codes.astype(np.uint8).reshape(-1, cols), bits)
+        )
+        scale_parts.append(scale.reshape(-1, cols // AFFINE_GROUP_SIZE))
+        bias_parts.append(bias.reshape(-1, cols // AFFINE_GROUP_SIZE))
+
+    packed = packed_parts[0] if len(packed_parts) == 1 else np.concatenate(packed_parts)
+    scales = scale_parts[0] if len(scale_parts) == 1 else np.concatenate(scale_parts)
+    biases = bias_parts[0] if len(bias_parts) == 1 else np.concatenate(bias_parts)
+    return MappingResult(
+        packed=packed,
+        scales=scales.astype(floating_dtype),
+        biases=biases.astype(floating_dtype),
+        bits=bits,
+        group_size=AFFINE_GROUP_SIZE,
+        qtype=f"AFFINE{bits}",
+        exact=False,
+        inexact_groups=int(packed.shape[0] * (cols // AFFINE_GROUP_SIZE)),
+    )
+
 
 
 _MAPPERS = {

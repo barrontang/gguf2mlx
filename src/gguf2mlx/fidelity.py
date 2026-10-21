@@ -43,9 +43,9 @@ from typing import Any, cast
 
 import numpy as np
 
-from .quantize.gguf_codes import PRESERVE_TOLERANCE
+from .quantize.gguf_codes import PRESERVE_INEXACT_TOLERANCE, PRESERVE_TOLERANCE
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 REPORT_NAME = "conversion_report.json"
 
 # A relative L2 error larger than these is not rounding: it means values changed
@@ -325,12 +325,25 @@ def audit_weights(
     }
 
 
+def _tier_tolerance(tier: str, fallback: str) -> float:
+    """Ceiling that applies to one preservation tier."""
+    if tier == "exact":
+        return PRESERVE_TOLERANCE
+    registered = PRESERVE_INEXACT_TOLERANCE.get(fallback)
+    if registered is None:
+        raise ValueError(
+            f"no inexact tolerance is registered for preserve fallback {fallback!r}"
+        )
+    return registered
+
+
 def audit_preserved(
     output_dir: Path,
     reader: Any,
     plan: dict[str, dict[str, Any]],
     *,
     tolerance: float = PRESERVE_TOLERANCE,
+    fallback: str = "6bit",
 ) -> dict[str, Any]:
     """Compare re-expressed affine tensors against the GGUF blocks they came from.
 
@@ -339,6 +352,12 @@ def audit_preserved(
     ``scale * code + bias`` arithmetic MLX performs) and compared with
     ``gguf.quants.dequantize`` of the source tensor. A mapping error shows up as
     a large relative L2, which is how a block reordered by accident gets caught.
+
+    Tensors carry a ``tier``. ``exact`` ones copied their codes and are held to
+    ``tolerance`` (fp16 scale/bias rounding only). ``inexact`` ones could not --
+    ``Q6_K`` on a 32-wide grid -- and are held to the ceiling registered for the
+    fallback that produced them, so a re-fit is never judged by a bound it
+    cannot meet and never hides behind a loose one.
     """
     from .quantize import gguf_codes
 
@@ -349,6 +368,11 @@ def audit_preserved(
     skipped = {"missing_source": 0, "unreadable": 0, "shape_mismatch": 0}
     error_squares = 0.0
     reference_squares = 0.0
+    tier_error = {tier: 0.0 for tier in ("exact", "inexact")}
+    tier_reference = {tier: 0.0 for tier in ("exact", "inexact")}
+    tier_of = {
+        name: str(meta.get("tier", "exact")) for name, meta in plan.items()
+    }
 
     try:
         for name, meta in sorted(plan.items()):
@@ -378,29 +402,60 @@ def audit_preserved(
                 mismatches.append(name)
                 continue
 
+            tier = tier_of.get(name, "exact")
             record = {
                 "name": name,
                 "source": meta["source"],
                 "qtype": meta["qtype"],
                 "bits": int(meta["bits"]),
                 "group_size": int(meta["group_size"]),
+                "tier": tier,
             }
             record.update(compare(reference, decoded))
             records.append(record)
             diff = (decoded - reference).astype(np.float64)
-            error_squares += float(np.sum(diff * diff))
-            reference_squares += float(np.sum(reference.astype(np.float64) ** 2))
+            tensor_error = float(np.sum(diff * diff))
+            tensor_reference = float(np.sum(reference.astype(np.float64) ** 2))
+            error_squares += tensor_error
+            reference_squares += tensor_reference
+            tier_error[tier] = tier_error.get(tier, 0.0) + tensor_error
+            tier_reference[tier] = tier_reference.get(tier, 0.0) + tensor_reference
     finally:
         shards.close()
 
-    if reference_squares > 0.0:
-        aggregate = math.sqrt(error_squares / reference_squares)
-    else:
-        aggregate = 0.0 if error_squares == 0.0 else math.inf
-    gate = evaluate_preserve_gate(
-        records, aggregate, total_tensors=len(plan), mismatches=mismatches,
-        tolerance=tolerance,
-    )
+    def _aggregate(errors: float, references: float) -> float:
+        if references > 0.0:
+            return math.sqrt(errors / references)
+        return 0.0 if errors == 0.0 else math.inf
+
+    tiers: dict[str, Any] = {}
+    for tier in ("exact", "inexact"):
+        subset = [record for record in records if record["tier"] == tier]
+        planned = sum(1 for value in tier_of.values() if value == tier)
+        tier_mismatches = [name for name in mismatches if tier_of.get(name, "exact") == tier]
+        # An empty tier never needs a ceiling, and the `float16` fallback never
+        # produces an inexact tier at all -- ask for the bound only when a
+        # tensor could actually land in it.
+        ceiling = tolerance
+        if tier != "exact" and planned:
+            ceiling = _tier_tolerance(tier, fallback)
+        tiers[tier] = evaluate_preserve_gate(
+            subset,
+            _aggregate(tier_error.get(tier, 0.0), tier_reference.get(tier, 0.0)),
+            total_tensors=planned,
+            mismatches=tier_mismatches,
+            tolerance=ceiling,
+        )
+
+    aggregate = _aggregate(error_squares, reference_squares)
+    measured = [payload for payload in tiers.values() if payload["status"] != "not_run"]
+    failures = [name for payload in tiers.values() for name in payload["failures"]]
+    status = "fail"
+    if measured and all(payload["status"] == "pass" for payload in measured):
+        status = "pass"
+    elif not measured and not failures:
+        status = "not_run"
+    worst = max(records, key=lambda record: record["relative_l2"], default=None)
     return {
         "tensors": records,
         "mismatches": mismatches,
@@ -408,8 +463,24 @@ def audit_preserved(
         "skipped": skipped,
         "total_output_tensors": len(plan),
         "aggregate_relative_l2": aggregate,
-        "gate": gate,
+        "tiers": tiers,
+        "gate": {
+            "status": status,
+            "gated": True,
+            "tolerance": tolerance,
+            "tensors_compared": len(records),
+            "tensors_total": len(plan),
+            "bit_exact_tensors": sum(1 for record in records if record["bit_exact"]),
+            "aggregate_relative_l2": aggregate,
+            "max_relative_l2": None if worst is None else worst["relative_l2"],
+            "worst_tensor": None if worst is None else worst["name"],
+            "failures": failures[:10],
+            "failure_count": len(failures),
+            "tiers": tiers,
+            "fallback": fallback,
+        },
     }
+
 
 
 def evaluate_preserve_gate(
@@ -431,8 +502,13 @@ def evaluate_preserve_gate(
     failures.extend(list(mismatches))
     worst = max(tested, key=lambda record: record["relative_l2"], default=None)
     healthy = not failures and math.isfinite(aggregate) and aggregate < tolerance
+    if not tested and not failures:
+        # Nothing was measured: an empty tier is not a passing tier.
+        status = "not_run"
+    else:
+        status = "pass" if healthy else "fail"
     return {
-        "status": "pass" if healthy else ("fail" if tested or failures else "not_run"),
+        "status": status,
         "gated": True,
         "tolerance": tolerance,
         "tensors_compared": len(tested),
@@ -504,6 +580,8 @@ def build_report(
     preserve_plan: dict[str, dict[str, Any]] | None = None,
     kept_float: Iterable[dict[str, str]] = (),
     module_bits: dict[str, int] | None = None,
+    preserve_size: dict[str, Any] | None = None,
+    preserve_fallback: str = "6bit",
 ) -> dict[str, Any]:
     """Assemble the JSON payload written next to every conversion."""
     weight_gate = evaluate_weight_gate(
@@ -564,6 +642,12 @@ def build_report(
             "max_relative_l2": gate.get("max_relative_l2"),
             "worst_tensor": gate.get("worst_tensor"),
             "failures": gate.get("failures", []),
+            # Per-tier verdicts: `exact` tensors reused the source codes, the
+            # rest were re-fitted at `fallback` and are judged against that
+            # width's ceiling rather than the fp16-rounding one.
+            "fallback": gate.get("fallback", preserve_fallback),
+            "tiers": gate.get("tiers", {}),
+            "size": preserve_size or {},
             "preserved_by_qtype": dict(sorted(by_qtype.items())),
             "preserved_by_bits": dict(sorted(by_bits.items())),
             "kept_float16": {
