@@ -2,7 +2,8 @@
 
 > Completed work and the areas still open for contributors.
 
-> Split out of the top-level README on 2026-10-20; content is unchanged apart from heading levels.
+> Split out of the top-level README on 2026-10-20; heading levels unchanged, entries
+> updated since to match what has shipped.
 
 Completed:
 
@@ -23,12 +24,24 @@ Completed:
 - pinned Qwen2-VL-2B real-checkpoint conversion, all-tensor audit and four-path
   labeled image acceptance, including historical `qwen2vl_merger` compatibility
 - `--eval-ppl` perplexity guardrail in the benchmark harness (reuses `mlx_lm.perplexity`; reports standard vs `--direct-quant` PPL delta)
+- three-tier fidelity gate (`exact` / `inexact` / lossless), the `verify` command and
+  the documented `conversion-report.json` schema
+- `--quant-source preserve|requant` re-expressing GGUF `Q4_K`/`Q6_K`/`Q8_0` blocks on
+  MLX's affine grid instead of requantizing decoded floats, with a per-tensor audit in
+  the conversion report (`requant` remains the default); supported for llama, qwen2,
+  qwen3 and mistral, fail-closed elsewhere
+- `gguf2mlx publish`: split-GGUF discovery and merge, provenance record, license copy
+  and pinned converter version, with `publish-mlx.yml` reduced to a thin shell
+- pinned load matrix converting, weight-gating and `mlx_lm.load()`-ing 11 entries
+  across llama, qwen2, qwen3, gemma2 and phi3 (run 39505897872)
 
 Remaining areas for contributors:
 
 - publish fixed-corpus perplexity numbers from `--eval-ppl` (standard vs `--direct-quant` vs `mlx_lm.convert`) so users can judge round-trip accuracy loss
 - verify `gguf2mlx-mixed-v1` with a named JANG runtime; until then the format remains experimental
-- extend the opt-in real-GGUF load test to the remaining conversion-enabled architectures (several are declared supported but have no end-to-end coverage; the `safe_open` bug showed how those paths silently rot)
+- extend the pinned load matrix beyond its five architectures (llama, qwen2, qwen3,
+  gemma2, phi3): several conversion-enabled architectures are declared supported but
+  have no end-to-end coverage, and the `safe_open` bug showed how those paths rot
 - canonical chat-template fallback table for known model families when GGUF-embedded Jinja templates are missing or broken
 - publish peak RSS and output-size comparison results from `benchmarks/benchmark_conversion.py --compare`
 - evaluate GGUF→MLX conversion for high-demand non-text models (e.g. ASR/embedding) where competition is thin (pending verification that such models ship GGUF)
