@@ -47,6 +47,42 @@ match still keep their codes bit for bit.
 - The Q6_K mapping is chunked, so an embedding table with a quarter of a
   billion values no longer allocates three full-size float32 temporaries.
 
+### CLI: `--force`, `--json`, and a real logging channel
+
+- `--force` replaces a non-empty `--output`. Without it a non-empty directory is
+  still refused — and `--force` will not delete a *file* sitting at `--output`.
+- `--json` prints one object (`ok`, `output`, `report`, `gates`, `weight`) read
+  back from `conversion_report.json`, so a wrapper never has to parse the human
+  summary. `verify --json` already worked this way.
+- Diagnostics now go through a `logging` logger on stderr (`-v` for DEBUG, `-q`
+  for warnings and errors only). With `--json`, the converter's own progress and
+  failure prints are redirected to stderr too, so stdout carries exactly one
+  parseable object. There were no `logging` calls before.
+
+### `rust/gguf2mlx-rs` is deleted
+
+Nine tracked files of pyo3 code (architecture detection, metadata, tensor and
+tokenizer helpers) sat behind an optional import that never resolved: the cdylib
+was never built, never published, and never mentioned in the docs, while the
+Python path already computed everything it returned. The MDD left this as
+"maturin or delete". A one-shot classification of a few thousand tensor names
+does not justify a second toolchain in the release pipeline, so the crate and its
+`rust_backend.py` shim are gone. The pre-rewrite backup and the changelog keep
+the decision reversible.
+
+### Declared-versus-covered architectures are enforced, not implied
+
+`CONVERTIBLE_ARCHES` claims 30 architecture IDs; the pinned load matrix proves
+five. The 17 canonical gaps (25 spellings) are now listed with a reason in
+`DECLARED_COVERAGE_GAPS`, and
+`test_every_convertible_architecture_is_covered_or_declared` fails when a new
+adapter is neither pinned nor declared — and when a declared gap is filled but
+its line is left behind. `docs/support-matrix.md` mirrors the table.
+
+`README.md` is back inside its 200-line budget (254 → 200) by pushing the
+preserve measurements to the quality-gate page and the `.mlx` walkthrough to its
+own page.
+
 ## 2.2.0 - 2026-10-21
 
 ### Type checking is now a gate, not a configuration file

@@ -32,8 +32,7 @@ def test_tensor_policy_classification(name: str, expected: str):
     assert core.classify_tensor(name) == expected
 
 
-def test_architecture_kind_detects_dense_moe_and_hybrid(monkeypatch):
-    monkeypatch.setattr(core, "rust_classify_architecture", lambda *_args: None)
+def test_architecture_kind_detects_dense_moe_and_hybrid():
     assert core.classify_architecture(_Reader([]), "llama") == "dense"
     assert core.classify_architecture(
         _Reader(["blk.0.ffn_gate_inp.weight", "blk.0.ffn_up_exps.weight"]),

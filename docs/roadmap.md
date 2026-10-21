@@ -34,14 +34,22 @@ Completed:
   and pinned converter version, with `publish-mlx.yml` reduced to a thin shell
 - pinned load matrix converting, weight-gating and `mlx_lm.load()`-ing 11 entries
   across llama, qwen2, qwen3, gemma2 and phi3 (run 39505897872)
+- CLI completion: `--force` for a non-empty output directory, `--json` for a
+  machine-readable result, and a `logging` channel on stderr (`-v`/`-q`) that
+  keeps stdout clean for `--json`
+- the declared-versus-covered architecture gap is now explicit and test-enforced
+  (`DECLARED_COVERAGE_GAPS`), instead of implied by prose
+- deleted `rust/gguf2mlx-rs`: an unbuilt, unpublished pyo3 crate whose behaviour
+  the Python path already implemented
 
 Remaining areas for contributors:
 
 - publish fixed-corpus perplexity numbers from `--eval-ppl` (standard vs `--direct-quant` vs `mlx_lm.convert`) so users can judge round-trip accuracy loss
 - verify `gguf2mlx-mixed-v1` with a named JANG runtime; until then the format remains experimental
 - extend the pinned load matrix beyond its five architectures (llama, qwen2, qwen3,
-  gemma2, phi3): several conversion-enabled architectures are declared supported but
-  have no end-to-end coverage, and the `safe_open` bug showed how those paths rot
+  gemma2, phi3): the gap is no longer silent — `DECLARED_COVERAGE_GAPS` lists every
+  convertible architecture without a case and a test keeps that list exact — but
+  each entry still needs a pinned GGUF and a real `mlx_lm` load
 - canonical chat-template fallback table for known model families when GGUF-embedded Jinja templates are missing or broken
 - publish peak RSS and output-size comparison results from `benchmarks/benchmark_conversion.py --compare`
 - evaluate GGUF→MLX conversion for high-demand non-text models (e.g. ASR/embedding) where competition is thin (pending verification that such models ship GGUF)

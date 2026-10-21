@@ -89,6 +89,69 @@ def test_matrix_covers_declared_architectures():
     assert not unknown, f"matrix references architectures that cannot be converted: {unknown}"
 
 
+# Alternative GGUF spellings of one architecture. They share a conversion path,
+# so one pinned case proves all of the aliases and they must not each demand a
+# separate entry.
+_ALIASES = {
+    "qwen3_5": "qwen35",
+    "qwen3.5": "qwen35",
+    "qwen3_6": "qwen36",
+    "qwen3.6": "qwen36",
+    "qwen3_8": "qwen38",
+    "qwen3.8": "qwen38",
+    "qwen2vl": "qwen2_vl",
+    "qwen3vl": "qwen3_vl",
+}
+
+# Declared, reasoned coverage gaps. `CONVERTIBLE_ARCHES` is a claim about what
+# the converters accept; this matrix is the evidence for what actually loads.
+# They are 30 vs 5, so the difference is written down here rather than implied:
+# adding an architecture to `CONVERTIBLE_ARCHES` without pinning a case (or
+# listing it below) fails `test_every_convertible_architecture_is_covered_or_declared`.
+DECLARED_COVERAGE_GAPS: dict[str, str] = {
+    "deepseek2": "MoE with MLA; the smallest public GGUF far exceeds the per-runner budget",
+    "deepseek3": "MoE with MLA; same download budget as deepseek2",
+    "gemma": "gemma2 covers the shared adapter; no small pinned gemma GGUF yet",
+    "gemma3": "text twin of a multimodal release; no small pinned GGUF yet",
+    "gemma4": "adapter is fixture-tested only; no pinned public GGUF yet",
+    "glm-dsa": "MoE with a full-indexer path; needs a dedicated router-protect case",
+    "glm4moe": "MoE; same download budget as the other expert models",
+    "mistral": "shares llama's tensor map, which is pinned; no pinned mistral GGUF yet",
+    "phi4": "phi3 pins the same sliding-window adapter; phi4 is fixture-tested",
+    "qwen2_vl": "needs the matching HF repo beside the GGUF; vision.yml owns that path",
+    "qwen2moe": "MoE; weekly-moe.yml exercises two families, not this matrix",
+    "qwen3_vl": "needs the matching HF repo beside the GGUF; vision.yml owns that path",
+    "qwen35": "hybrid adapter, fixture-tested; no small pinned GGUF yet",
+    "qwen36": "hybrid adapter, fixture-tested; no small pinned GGUF yet",
+    "qwen38": "hybrid adapter, fixture-tested; no small pinned GGUF yet",
+    "qwen3moe": "MoE; weekly-moe.yml exercises two families, not this matrix",
+    "stablelm": "adapter ships; no pinned public GGUF yet",
+}
+
+
+def _canonical(arch: str) -> str:
+    return _ALIASES.get(arch, arch)
+
+
+def test_every_convertible_architecture_is_covered_or_declared():
+    """No architecture may be 'supported' without evidence or a stated gap."""
+    covered = {_canonical(entry["arch"]) for entry in ALL_ENTRIES}
+    declared = {_canonical(arch) for arch in DECLARED_COVERAGE_GAPS}
+    declared_arches = {_canonical(arch) for arch in core.CONVERTIBLE_ARCHES}
+
+    undeclared = declared_arches - covered - declared
+    assert not undeclared, (
+        "these architectures are convertible but have no pinned load case and no "
+        f"reason in DECLARED_COVERAGE_GAPS: {sorted(undeclared)}"
+    )
+    stale = declared - (declared_arches - covered)
+    assert not stale, (
+        "DECLARED_COVERAGE_GAPS lists architectures that are now covered or no "
+        f"longer convertible: {sorted(stale)}"
+    )
+
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

@@ -61,9 +61,8 @@ class Reader:
 
 
 @pytest.mark.parametrize("arch", sorted(QWEN_VL_TEXT_ARCHES))
-def test_qwen3_topology_and_mapping(arch, monkeypatch):
+def test_qwen3_topology_and_mapping(arch):
     reader = Reader(metadata(arch), TENSOR_MAP)
-    monkeypatch.setattr(core, "rust_detect_architecture", lambda *args: "qwen2")
     assert core.detect_architecture(reader) == arch
     config = core.build_config(reader, arch, "bfloat16")
     assert config["model_type"] == "qwen3_vl_text"

@@ -26,6 +26,8 @@ uv.lock
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# Build cache left behind by the deleted rust/gguf2mlx-rs crate (163 MB). It is
+# never committed; delete the directory to reclaim the space.
 rust/gguf2mlx-rs/target/
 .vscode/settings.json
 
@@ -49,6 +51,8 @@ gguf2mlx-review-and-roadmap*
 
 # CI-only pytest basetemp for the load matrix (see .github/workflows/load-matrix.yml).
 load-matrix-tmp/
+# Local `pytest --basetemp` when the system temp dir is not writable.
+.pytest-tmp/
 
 # Local agent workspace data (project memory + session state). Must stay on disk,
 # must never be committed.

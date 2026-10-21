@@ -48,6 +48,29 @@ gate, loads the result with `mlx_lm` and requires finite logits. Evidence:
 (11/11 entries green, 2026-10-21). The entry list lives in
 `tests/load_matrix.json`, and each job uploads the conversion report it produced.
 
+### Pinned versus declared-only
+
+`CONVERTIBLE_ARCHES` lists 30 architecture IDs; the pinned matrix covers five
+(`llama`, `qwen2`, `qwen3`, `gemma2`, `phi3`). The difference is not implied — it
+is written down and enforced. `tests/test_load_matrix.py` fails when an
+architecture is convertible but is neither pinned nor listed in
+`DECLARED_COVERAGE_GAPS` with a reason, so a new adapter cannot quietly widen the
+support claim. Alias spellings (`qwen3_5`, `qwen3.5`, `qwen2vl`, …) share one
+canonical ID and one case.
+
+| Architecture IDs without a pinned case | Reason |
+|---|---|
+| `deepseek2`, `deepseek3`, `glm4moe`, `glm-dsa`, `qwen2moe`, `qwen3moe` | MoE/MLA sources; the smallest public GGUFs exceed the per-runner download budget, and router protection needs its own case. `weekly-moe.yml` covers two families instead. |
+| `gemma`, `gemma3`, `gemma4` | share `gemma2`'s adapter path, which is pinned; no small pinned GGUF for the others yet |
+| `mistral`, `phi4` | share `llama`'s tensor map and `phi3`'s sliding-window adapter, both pinned |
+| `qwen35`, `qwen36`, `qwen38` (and their alias spellings) | hybrid adapters, fixture-tested only; no small pinned GGUF yet |
+| `stablelm` | adapter ships; no pinned public GGUF yet |
+| `qwen2_vl`, `qwen3_vl` | full VLM entries need the matching HF repo beside the GGUF; `vision.yml` owns that path |
+
+Pin an entry by adding it to `tests/load_matrix.json` and deleting its line from
+`DECLARED_COVERAGE_GAPS` — the test fails on a stale line, so the two cannot
+drift apart.
+
 #### Qwen3 MoE real-model validation
 
 On 2026-10-18, `Qwen3-30B-A3B-Q4_K_M.gguf` from

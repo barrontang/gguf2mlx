@@ -8,9 +8,11 @@ Phase 1: Real weight extraction, safetensors output, architecture detection,
 
 import argparse
 import base64
+import contextlib
 import gc  # noqa: F401
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,9 +30,12 @@ from tqdm import tqdm
 from . import fidelity
 from .quantize import gguf_codes
 from .qwen_vl_text import QWEN_VL_TEXT_ARCHES, Qwen3VLTextEncoderConverter
-from .rust_backend import classify_architecture as rust_classify_architecture
-from .rust_backend import detect_architecture as rust_detect_architecture
 from .streaming import StreamingShardWriter
+
+# Diagnostics go to a logger; the progress display stays on stdout via print().
+# ``--verbose`` raises this to DEBUG, ``--quiet`` drops it to WARNING, and every
+# record lands on stderr so ``--json`` output on stdout stays parseable.
+_LOG = logging.getLogger("gguf2mlx")
 
 # ---------------------------------------------------------------------------
 # Required imports with friendly error messages
@@ -373,9 +378,6 @@ def detect_architecture(reader: GGUFReader) -> str:
 
     if arch in QWEN_VL_TEXT_ARCHES:
         return arch
-    rust_arch = rust_detect_architecture(arch, name)
-    if rust_arch:
-        return rust_arch
 
     if arch:
         return arch
@@ -398,9 +400,6 @@ def classify_architecture(reader: GGUFReader, arch: str | None = None) -> str:
     """Classify a GGUF tensor layout as dense, MoE, or hybrid."""
     arch = arch or detect_architecture(reader)
     tensor_names = [tensor.name for tensor in reader.tensors]
-    rust_kind = rust_classify_architecture(arch, tensor_names)
-    if rust_kind:
-        return rust_kind
 
     has_experts = any(
         any(pattern in name for pattern in _EXPERT_PATTERNS) for name in tensor_names
@@ -3526,6 +3525,7 @@ def convert(
     weight_audit: bool = True,
     quant_source: str | None = None,
     preserve_fallback: str = "6bit",
+    force: bool = False,
 ) -> bool:
     """Convert into a staging directory so failed runs never leave partial output."""
     # ``--preserve-source-quant`` used to be a Qwen2-VL-only switch; it is now a
@@ -3579,8 +3579,25 @@ def convert(
     if output_path.exists() and (
         not output_path.is_dir() or any(output_path.iterdir())
     ):
-        print(f"❌ Output path already exists and is not empty: {output_path}")
-        return False
+        if not force:
+            print(f"❌ Output path already exists and is not empty: {output_path}")
+            print("    Pass --force to replace it.")
+            return False
+        if not output_path.is_dir():
+            print(f"❌ Output path exists and is not a directory: {output_path}")
+            return False
+        _LOG.warning("replacing non-empty output directory %s (--force)", output_path)
+        print(f"ℹ --force: replacing existing contents of {output_path}")
+        for entry in output_path.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+
+    _LOG.info(
+        "convert start: input=%s output=%s dtype=%s quant_source=%s",
+        gguf_path, output_path, dtype, quant_source,
+    )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     staging_path = Path(
@@ -3772,6 +3789,7 @@ def convert(
         if output_path.exists():
             output_path.rmdir()
         final_stage_path.replace(output_path)
+        _LOG.info("convert finished: %s", output_path)
         return True
     finally:
         if staging_path.exists():
@@ -3981,6 +3999,58 @@ def verify_mlx_bundle(bundle_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _configure_logging(*, verbose: bool = False, quiet: bool = False) -> None:
+    """Send the ``gguf2mlx`` logger to stderr at the requested verbosity.
+
+    Records never go to stdout: ``--json`` writes a single object there, and a
+    log line mixed into it would make the output unparseable.
+    """
+    level = logging.DEBUG if verbose else logging.WARNING if quiet else logging.INFO
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("gguf2mlx: %(levelname)s %(message)s"))
+    _LOG.handlers.clear()
+    _LOG.addHandler(handler)
+    _LOG.setLevel(level)
+    _LOG.propagate = False
+
+
+def _convert_json_summary(output_dir: Path, success: bool) -> dict[str, Any]:
+    """Machine-readable result for ``--json``, read back from the report."""
+    report_path = output_dir / fidelity.REPORT_NAME
+    summary: dict[str, Any] = {
+        "ok": success,
+        "output": str(output_dir),
+        "report": str(report_path) if report_path.is_file() else None,
+    }
+    if not report_path.is_file():
+        return summary
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        summary["error"] = f"unreadable report: {error}"
+        return summary
+    weight = (report.get("fidelity") or {}).get("weight") or {}
+    preserve = report.get("preserve") or {}
+    summary.update(
+        {
+            "schema_version": report.get("schema_version"),
+            "architecture": report.get("architecture"),
+            "dtype": report.get("dtype"),
+            "source": report.get("source"),
+            "gates": {
+                "weight": weight.get("status"),
+                "preserve": preserve.get("gate"),
+            },
+            "weight": {
+                "tensors_compared": weight.get("tensors_compared"),
+                "max_relative_l2": weight.get("max_relative_l2"),
+                "failures": weight.get("failures", []),
+            },
+        }
+    )
+    return summary
+
+
 def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--type", dest="model_type", choices=["auto", "llm", "vlm", "text-encoder"],
@@ -4116,9 +4186,32 @@ def _add_convert_arguments(parser: argparse.ArgumentParser) -> None:
             "doubles conversion time)"
         ),
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace the contents of a non-empty --output directory",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print one JSON object (ok, output, report, gates, weight) instead "
+            "of a human summary; diagnostics stay on stderr"
+        ),
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Log DEBUG diagnostics to stderr"
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true", help="Only log warnings and errors to stderr"
+    )
 
 
 def _run_convert_command(args: argparse.Namespace) -> int:
+    _configure_logging(
+        verbose=bool(getattr(args, "verbose", False)),
+        quiet=bool(getattr(args, "quiet", False)),
+    )
     if args.output is None:
         args.output = Path(args.input).stem + "-mlx"
 
@@ -4134,7 +4227,22 @@ def _run_convert_command(args: argparse.Namespace) -> int:
             print(f"  {name}")
         return 0
 
-    success = convert(
+    success = False
+    if getattr(args, "json", False):
+        # ``--json`` promises stdout is one parseable object, but the conversion
+        # reports progress and failures with print(). Send all of that to stderr
+        # for the duration and let the summary below own stdout.
+        with contextlib.redirect_stdout(sys.stderr):
+            success = _convert_with_args(args)
+    else:
+        success = _convert_with_args(args)
+    if getattr(args, "json", False):
+        print(json.dumps(_convert_json_summary(Path(args.output), success), indent=2))
+    return 0 if success else 1
+
+
+def _convert_with_args(args: argparse.Namespace) -> bool:
+    return convert(
         args.input,
         args.output,
         args.dtype,
@@ -4156,8 +4264,8 @@ def _run_convert_command(args: argparse.Namespace) -> int:
         weight_audit=args.weight_audit,
         quant_source=getattr(args, "quant_source", None),
         preserve_fallback=getattr(args, "preserve_fallback", "6bit"),
+        force=bool(getattr(args, "force", False)),
     )
-    return 0 if success else 1
 
 
 def _run_verify_command(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

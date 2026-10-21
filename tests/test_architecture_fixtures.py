@@ -419,9 +419,7 @@ def test_phi3_longrope_rejects_invalid_factor_dimensions():
         core.build_config(reader, "phi3")
 
 
-def test_python_name_detection_prefers_specific_gemma_variants(monkeypatch):
-    monkeypatch.setattr(core, "rust_detect_architecture", lambda arch, name: None)
-
+def test_python_name_detection_prefers_specific_gemma_variants():
     assert core.detect_architecture(_FakeReader({"general.name": "Gemma-2-9B"})) == "gemma"
     assert core.detect_architecture(_FakeReader({"general.name": "gemma2-9b"})) == "gemma2"
     assert core.detect_architecture(_FakeReader({"general.name": "gemma3-4b"})) == "gemma3"
