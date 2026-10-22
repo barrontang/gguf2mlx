@@ -175,6 +175,9 @@ Native acceptance: [Qwen2-VL report](docs/qwen2-vl-real-validation.md). Qwen3-VL
 
 ## Documentation
 
+Full documentation site: **<https://barrontang.github.io/gguf2mlx/>** — built from `docs/` with
+MkDocs by `.github/workflows/docs.yml` (`mkdocs serve` locally).
+
 [Quality gates](docs/quality-gates.md) · [Support matrix](docs/support-matrix.md) · [How conversion works](docs/how-conversion-works.md) ·
 [VLM conversion](docs/vlm-conversion.md) · [Text conditioning](docs/text-encoder.md) · [Publishing](docs/publishing.md) · [`.mlx` bundles](docs/mlx-bundle.md) ·
 [Capabilities](docs/capabilities.md) · [Benchmarks](docs/benchmarks.md) · [FAQ](docs/faq.md) · [Roadmap](docs/roadmap.md) · [Validation logs](docs/validation/) · [Development](docs/development.md)

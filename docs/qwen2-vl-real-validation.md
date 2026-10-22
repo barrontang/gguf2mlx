@@ -229,7 +229,7 @@ Use an Apple Silicon machine with adequate RAM and disk space. This run used
 64 GiB RAM, Python 3.12.12, MLX 0.32.2, MLX-VLM 0.7.6, MLX-LM 0.31.3,
 Transformers 5.16.1, huggingface-hub 1.30.0, gguf 0.19.0, NumPy 2.5.4,
 Pillow 12.3.0, and llama.cpp **5490 (`fef693dc`)**.
-Use [the isolated runtime requirements](../tests/requirements-vlm.txt);
+Use [the isolated runtime requirements](https://github.com/barrontang/gguf2mlx/blob/main/tests/requirements-vlm.txt);
 do not downgrade the project's development environment or modify `mlxgen`.
 
 Fetch the exact revisions above, verify the SHA-256 hashes, and retain the
@@ -263,7 +263,7 @@ gguf2mlx convert \
   --quantize --direct-quant --output models/qwen2-vl-validation/mlx-4bit
 ```
 
-Run [the acceptance harness](../benchmarks/validate_vlm.py):
+Run [the acceptance harness](https://github.com/barrontang/gguf2mlx/blob/main/benchmarks/validate_vlm.py):
 
 ```bash
 HF_HUB_OFFLINE=1 uv run --isolated --no-project --with-editable . \

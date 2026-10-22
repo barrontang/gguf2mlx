@@ -1,0 +1,5 @@
+# Toolchain for building the MkDocs site (see .github/workflows/docs.yml).
+# Install with: pip install -r requirements-docs.txt
+# Serve locally with: mkdocs serve
+mkdocs>=1.6,<2
+mkdocs-material>=9.5,<10

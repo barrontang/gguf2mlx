@@ -1,0 +1,76 @@
+site_name: gguf2mlx
+site_description: >-
+  Convert verified GGUF models to MLX-LM safetensors on Apple Silicon.
+site_url: https://barrontang.github.io/gguf2mlx/
+repo_url: https://github.com/barrontang/gguf2mlx
+repo_name: barrontang/gguf2mlx
+edit_uri: edit/main/docs/
+
+# Built by .github/workflows/docs.yml and served from GitHub Pages. The repo's
+# Pages source is "GitHub Actions", not the legacy "main branch /docs" setting,
+# because only the Actions path can run `mkdocs build`.
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Guide:
+      - What works today: capabilities.md
+      - Supported conversion matrix: support-matrix.md
+      - How conversion works: how-conversion-works.md
+      - Preserve GGUF quantization: quality-gates.md
+      - Reproducible benchmarks: benchmarks.md
+  - Vision and VLM:
+      - VLM conversion: vlm-conversion.md
+      - Qwen3-VL text conditioning: text-encoder.md
+      - Qwen2-VL real-checkpoint report: qwen2-vl-real-validation.md
+  - Packaging and releases:
+      - Publishing: publishing.md
+      - .mlx bundles: mlx-bundle.md
+      - Development: development.md
+  - Reference:
+      - FAQ: faq.md
+      - Roadmap: roadmap.md
+      - Direct quantization design: direct-quant-transcoding.md
+  - Validation logs:
+      - Overview: validation/README.md
+      - Native run (2026-10-18): validation/native-validation-2026-10-18.md
+      - Mac snapshot (2026-10-06): validation/mac-validation-2026-10-06.md
+  - Stats: stats.md

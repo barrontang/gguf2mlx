@@ -51,7 +51,7 @@ temporary download/convert tree (defaults to the system temp directory).
 
 ## Publish MLX alongside GGUF on Hugging Face
 
-The reusable [publish-mlx workflow](../.github/workflows/publish-mlx.yml) lets model
+The reusable [publish-mlx workflow](https://github.com/barrontang/gguf2mlx/blob/main/.github/workflows/publish-mlx.yml) lets model
 publishers chain GGUF uploads into MLX publication, including repositories in
 `mlx-community` **when the publisher has write access to that organization**.
 It does not grant organization membership or monitor Hugging Face uploads.

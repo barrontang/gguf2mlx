@@ -54,6 +54,9 @@ load-matrix-tmp/
 # Local `pytest --basetemp` when the system temp dir is not writable.
 .pytest-tmp/
 
+# MkDocs build output (see .github/workflows/docs.yml).
+site/
+
 # Local agent workspace data (project memory + session state). Must stay on disk,
 # must never be committed.
 .workbuddy/
