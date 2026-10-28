@@ -50,6 +50,10 @@ anything. Weight fidelity, by contrast, has an exact expected answer.
 - A tensor recorded as `identity` whose stored shape no longer matches the source
   is a hard failure (`layout_mismatch`), because the artifact and its stated plan
   disagree.
+- A tensor recorded as `reshaped` (Qwen3.5's depthwise `conv1d`, which GGUF
+  stores squeezed to 2-D) *is* still value-compared: the source is reshaped to
+  the stored shape when the element counts match, so a transposed kernel fails
+  the gate instead of being excused as "transformed".
 
 The comparison is against `gguf.quants.dequantize` applied to the raw GGUF
 bytes, not against the converter's own decode helper, so a bug in the converter
@@ -57,10 +61,17 @@ cannot hide behind a matching bug in the oracle.
 
 ## Preserve tier
 
-`--quant-source preserve` re-expresses the Q4_K / Q6_K / Q8_0 blocks as MLX
-affine groups (`w = scale * code + bias`, fp16 scale and bias, 32-value groups).
-Where the block layout is expressible it copies the *same integer codes* and
-only rounds the scale and bias to fp16.
+`--quant-source preserve` re-expresses the Q4_K / Q5_K / Q6_K / Q8_0 blocks as
+MLX affine groups (`w = scale * code + bias`, fp16 scale and bias, 32-value
+groups). Where the block layout is expressible it copies the *same integer
+codes* and only rounds the scale and bias to fp16.
+
+`Q5_K` is preserved exactly, like `Q4_K`: it keeps a 6-bit scale and min per 32
+values — exactly MLX's group — and its 5-bit code is the low nibble of `qs` plus
+one high bit from the block's `qh` plane. MLX stores 5-bit groups as five words
+per 32 values, so the codes land unmodified. Skipping this width is expensive:
+the pinned Qwen3.5-0.8B Q4_K_M is 36 Q5_K tensors, and sending them to FP16
+turned a 1.08x artifact into 1.45x.
 
 `Q6_K` is the exception, and it is the reason this tier has two halves. Q6_K
 scales 16 values at a time; MLX's narrowest group is 32, so a group would need
@@ -99,8 +110,8 @@ scales do agree keep their codes untouched.
   "tensors_compared": 9,
   "aggregate_relative_l2": 0.00774,
   "size": {"source_bytes": 1294336, "output_bytes": 1397760, "ratio": 1.08},
-  "preserved_by_qtype": {"Q4_K": 7, "Q6_K": 1, "Q8_0": 1},
-  "preserved_by_bits": {"4": 7, "6": 1, "8": 1},
+  "preserved_by_qtype": {"Q4_K": 7, "Q5_K": 1, "Q6_K": 1, "Q8_0": 1},
+  "preserved_by_bits": {"4": 7, "5": 1, "6": 1, "8": 1},
   "group_size": 32,
   "tiers": {
     "exact":   {"status": "pass", "tolerance": 0.001, "tensors_compared": 8,
@@ -126,16 +137,68 @@ Per-tensor relative L2 against `gguf.quants.dequantize`:
 | Source | Relative L2 | Why |
 |---|---|---|
 | Q8_0 | 0 (bit-exact) | 8-bit codes map to 8-bit affine codes with `scale = d`, `bias = -128d` |
-| Q4_K | 2.0-2.4e-4 | fp16 rounding of the per-32 scale and min only |
+| Q4_K | 2.0e-4 - 7.7e-4 | fp16 rounding of the per-32 scale and min only |
+| Q5_K | 2.1e-4 - 7.0e-4 | same, with the 5th code bit taken from the block's `qh` plane |
 | Q6_K (pair scales agree) | ~2.2e-4 | same, within one 32-value group |
-| Q6_K (pair scales disagree, 6-bit) | 1.7-1.8e-2 | **not representable** on a 32-wide grid; re-fitted |
+| Q6_K (pair scales disagree, 6-bit) | 1.6-1.8e-2 | **not representable** on a 32-wide grid; re-fitted |
 | Q6_K (pair scales disagree, 8-bit) | 4.4-4.9e-3 | four times finer grid, 1.37x the bytes |
+
+Each range spans Llama-3.2-1B (bartowski, 113 quantized tensors) and the pinned
+Qwen3.5-0.8B Q4_K_M (98 `Q4_K`, 36 `Q5_K`, 17 `Q6_K`, 36 `Q8_0`). The upper ends
+are per-tensor maxima, not typicals — Qwen3.5-0.8B's worst `exact` tensor is
+7.69e-4, which is what the 1e-3 ceiling is sized against. The block type, not
+the layer, decides which band a tensor lands in: in that same file a `Q6_K`
+`ffn_down` measures 1.58e-2 while the `Q4_K` `ffn_down` one layer over measures
+6.82e-4, and every `Q8_0`, `ssm_alpha` and `ssm_beta` tensor round-trips at
+exactly 0.
 
 Only block types with no affine re-expression at all (F32 norms, non-matrices,
 unaligned rows) are decoded to float, and the report names the reason. The
-fail-closed rule extends to architectures: only `llama`, `qwen2`, `qwen3` and
-`mistral` are supported, and any other architecture raises an error naming it
-rather than silently requantizing.
+fail-closed rule extends to architectures: only `llama`, `qwen2`, `qwen3`,
+`mistral`, and the Qwen3.5 family (`qwen35` plus the `qwen3_5` / `qwen3.5` /
+`qwen36` / `qwen38` aliases) are supported, and any other architecture raises an
+error naming it rather than silently requantizing.
+
+Qwen3.5 is hybrid: only the quantized matrix projections of a linear-attention
+block are preservable. `A_log`, `dt_bias`, `conv1d` and the gated norm have no
+affine matrix form, so they stay float and are counted in
+`kept_float16.counts.F32_has_no_affine_reexpression`. Two layout rules make
+that output loadable at all, and both are recorded in `tensor_layout`:
+
+| Source tensor | On-disk MLX form | Recorded as |
+|---|---|---|
+| `blk.N.ssm_a` | `log(-ssm_a)` — GGUF stores the decay rate, MLX wants its log | `transformed` |
+| `blk.N.ssm_conv1d.weight` | `(channels, kernel)` → `(channels, kernel, 1)` | `reshaped` |
+| `blk.N.ssm_norm.weight`, `*_norm.weight` | unchanged | `identity` |
+
+The norms are deliberately **not** de-shifted: llama.cpp applies its `+1`
+centering to every norm except `linear_attn.norm.weight`, and MLX-LM's
+`qwen3_5` sanitize only re-applies that offset when it sees an HF-layout
+`conv1d`. Since this converter emits MLX layout, the GGUF norms are already the
+values the runtime wants.
+
+## Source tensors without an output
+
+Not every source tensor becomes an output tensor, and an unexplained gap is a
+silent correctness hole. The report names each one with a reason:
+
+```json
+"source_tensors_without_output": [
+  {"name": "blk.4.nextn.attn_k.weight", "reason": "mtp_head_not_consumed"},
+  {"name": "rope_freqs.weight", "reason": "reproduced_from_config"},
+  {"name": "mystery.weight", "reason": "unmapped"}
+]
+```
+
+| Reason | Meaning |
+|---|---|
+| `reproduced_from_config` | the tensor's effect is recreated from metadata (`llama3` rope table → `rope_scaling`) |
+| `mtp_head_not_consumed` | a speculative-decoding head (`mtp.*` / `nextn.*`) that the text runtime never runs |
+| `unmapped` | no adapter claimed the tensor — the case to investigate |
+
+A non-empty `unmapped` list is a defect report, not a normal outcome: the
+conversion still completes (the tensor list is data, not policy), but the
+artifact deserves a `verify --load` before it is trusted.
 
 ## Re-checking an artifact
 
@@ -168,11 +231,40 @@ Run a single pinned case locally with
 `GGUF2MLX_LOAD_MATRIX=1 GGUF2MLX_LOAD_MATRIX_ENTRY=llama-q4_k_m pytest
 tests/test_load_matrix.py -q`.
 
-The matrix currently covers Llama-3.2-1B, Qwen2.5-0.5B, Qwen3-0.6B, Gemma-2-2B
-and Phi-3-mini across Q4_0 / Q4_K_M / Q8_0 where published. MoE architectures are
-excluded from the nightly set because no ≤2B public fixture exists; their
-evidence remains the pinned real-model runs in
+The matrix currently covers Llama-3.2-1B, Qwen2.5-0.5B, Qwen3-0.6B, Gemma-2-2B,
+Phi-3-mini and Qwen3.5-0.8B across Q4_0 / Q4_K_M / Q8_0 where published. MoE
+architectures are excluded from the nightly set because no ≤2B public fixture
+exists; their evidence remains the pinned real-model runs in
 [validation](validation/native-validation-2026-10-18.md).
+
+The Qwen3.5 entry is pinned (`unsloth/Qwen3.5-0.8B-GGUF`, Q4_K_M,
+`bd258782…`) and runs with `quant_source: preserve`, so it simultaneously
+exercises the hybrid layout and the preserve tier.
+
+The whole matrix — all twelve entries — passes locally on Apple Silicon
+(2026-10-26, `mlx-lm` 0.32.2, `mlx` 0.32.4): conversion, the weight gate, the
+preserve gate where applicable, `mlx_lm.load` and a finite-logit forward pass.
+For the Qwen3.5 case specifically: weight gate `115/133` with a maximum relative
+L2 of 2.85e-04, preserve gate 170 `exact` / 17 `inexact`, a 1.084x artifact. The
+nightly `Load matrix` job has not been re-run since that entry was added, so the
+last published CI run predates it.
+
+### What the Qwen3.5 case found
+
+It was worth pinning. Five defects only a real checkpoint exposed:
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `Unsupported qwen35 tensor: blk.0.post_attention_norm.weight` | llama.cpp names Qwen3.5's post-attention norm `post_attention_norm`, not `ffn_norm`; the mapper only knew the Llama spelling | dedicated mapping to `post_attention_layernorm.weight` |
+| `Missing 1 parameters: language_model.lm_head.weight` | `build_config` forced `tie_word_embeddings: false` for Qwen3.5 while the file has no `output.weight` and upstream ties | tie/untie follows the tensor list, as for Qwen3 |
+| artifact 1.446x the source | 36 `Q5_K` tensors had no affine re-expression and fell back to FP16 | `Q5_K` → 5-bit affine with the source codes copied; 1.084x |
+| wrong decay / unloadable kernel | `A_log` was only restored for a tensor named `ssm_a` (real name `blk.N.ssm_a`), and the squeezed `conv1d` kernel was never widened | `blk.N.ssm_a` → `log(-x)`, kernel → `(channels, kernel, 1)`, gated norm left unshifted |
+| `tokenizer.ggml.pre='qwen35'; using legacy BPE splitting` | llama.cpp names the hybrid family `qwen35` while Qwen2/2.5/3 report `qwen2`; the value was unlisted, so the tokenizer fell to legacy splitting **and** kept the default NFC normalizer, which no Qwen tokenizer has | `QWEN_PRE_TOKENIZERS` and `QWEN_FAMILY_ARCHES` route every Qwen ID to the same no-normalizer path |
+
+The last one is the reason the load matrix asserts tokenization rather than just
+a successful load: the model loaded, produced finite logits, and still would have
+tokenized text differently from the reference. A warning in the matrix log was
+the only signal.
 
 ### What the first full sweep found
 

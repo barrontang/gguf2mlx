@@ -45,7 +45,10 @@ the quality gate and executable layout research before changing that pipeline.
 - Support every GGUF quantization type in the first release.
 - Mix architecture adaptation and quantization-format logic in one mapper.
 
-## Proposed pipeline
+## Pipeline
+
+Direct-quant transcoding is implemented (`--direct-quant`); this section
+describes the pass it runs.
 
 1. Read one GGUF tensor through the existing memory-mapped reader.
 2. Apply the architecture adapter's rename, split, concatenate, or norm transform.
@@ -251,9 +254,8 @@ remain future work.
 - Step 2: MVP layout fixtures and opt-in packed-array consumer tests established.
 - Mac validation executed in the `conda` environment `gguf2mlx`:
   Apple Silicon and real Gemma/Qwen1.5 MoE tests enabled -> 319 passed / 2 skipped,
-  `ruff check src/ tests/ benchmarks/` passes, and Rust unit tests ->
-  3 passed (on macOS these tests require
-  `RUSTFLAGS='-C link-arg=-undefined -C link-arg=dynamic_lookup'`).
+  and `ruff check src/ tests/ benchmarks/` passes. (The Rust unit-test line that
+  used to sit here referred to `rust/gguf2mlx-rs`, which has since been deleted.)
   Remaining skips need external Qwen3-MoE and DeepSeek2 models, not Gemma or
   packed-array hardware support.
 - Q4_0/Q8_0 layout fixtures and external packed-array checks are now covered by

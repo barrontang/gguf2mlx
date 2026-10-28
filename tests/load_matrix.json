@@ -86,5 +86,14 @@
     "filename": "Phi-3-mini-4k-instruct-Q8_0.gguf",
     "sha256": "0ac8ee48aeebf7d1b354691fd1e29e91c32ad88bbad10ad45ac880dcd4372a47",
     "size": 4061221376
+  },
+  {
+    "arch": "qwen35",
+    "qtype": "q4_k_m",
+    "repo_id": "unsloth/Qwen3.5-0.8B-GGUF",
+    "filename": "Qwen3.5-0.8B-Q4_K_M.gguf",
+    "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
+    "size": 532517120,
+    "quant_source": "preserve"
   }
 ]

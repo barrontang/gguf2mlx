@@ -10,9 +10,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from gguf import GGMLQuantizationType, GGUFWriter
+from gguf import GGMLQuantizationType, GGUFValueType, GGUFWriter
 
 Q4_K_BYTES = 144
+Q5_K_BYTES = 176
 Q6_K_BYTES = 210
 Q8_0_BYTES = 34
 
@@ -80,6 +81,62 @@ def encode_q4_k(array: np.ndarray) -> np.ndarray:
     ).astype(np.uint8)
     raw = q4_k_blocks(d, dmin, scales, mins, codes)
     return raw.reshape(array.shape[0], array.shape[1] // 256 * Q4_K_BYTES)
+
+
+def q5_k_blocks(
+    d: np.ndarray,
+    dmin: np.ndarray,
+    scales: np.ndarray,
+    mins: np.ndarray,
+    codes: np.ndarray,
+) -> np.ndarray:
+    """Assemble ``Q5_K`` blocks (``codes`` is (n, 8, 32) with values in 0..31).
+
+    Block layout mirrors ``ggml``: ``d``, ``dmin``, 12 packed scale/min bytes,
+    32 bytes of high bits, then 128 bytes of low nibbles.
+    """
+    count = codes.shape[0]
+    raw = np.zeros((count, Q5_K_BYTES), dtype=np.uint8)
+    raw[:, 0:2] = d.astype(np.float16).view(np.uint8).reshape(count, 2)
+    raw[:, 2:4] = dmin.astype(np.float16).view(np.uint8).reshape(count, 2)
+    raw[:, 4:16] = _pack_q4_k_scales(scales.astype(np.uint16), mins.astype(np.uint16))
+
+    grouped = codes.reshape(count, 8, 32)
+    # High bits: byte l holds bit p of value p*32+l in bit position p.
+    qh = np.zeros((count, 32), dtype=np.uint8)
+    for group in range(8):
+        qh |= (grouped[:, group, :] >> 4).astype(np.uint8) << group
+    raw[:, 16:48] = qh
+    # Low nibbles: four chunks of 64 values, low group then high group.
+    chunks = grouped.reshape(count, 4, 2, 32)
+    for chunk in range(4):
+        start = 48 + chunk * 32
+        raw[:, start:start + 32] = (
+            (chunks[:, chunk, 0, :] & 0x0F) | ((chunks[:, chunk, 1, :] & 0x0F) << 4)
+        )
+    return raw
+
+
+def encode_q5_k(array: np.ndarray) -> np.ndarray:
+    """Reference-style ``Q5_K`` encoder for fixtures (31-step code range)."""
+    values = np.asarray(array, dtype=np.float32).reshape(-1, 256)
+    count = values.shape[0]
+    sub = values.reshape(count, 8, 32)
+    upper = np.clip(sub.max(-1), 0, None)
+    lower = np.clip(-sub.min(-1), 0, None)
+    # 5-bit codes span 31 steps, so d carries the remaining 63x of a 6-bit scale.
+    d = np.maximum(upper.max(1), 1e-8) / (31.0 * 63.0)
+    dmin = np.maximum(lower.max(1), 1e-8) / (31.0 * 63.0)
+    scales = np.clip(np.round(upper / (31.0 * d[:, None])), 0, 63)
+    mins = np.clip(np.round(lower / (31.0 * dmin[:, None])), 0, 63)
+    codes = np.clip(
+        np.round((sub + dmin[:, None, None] * mins[:, :, None])
+                 / (d[:, None, None] * scales[:, :, None] + 1e-30)),
+        0,
+        31,
+    ).astype(np.uint8)
+    raw = q5_k_blocks(d, dmin, scales, mins, codes)
+    return raw.reshape(array.shape[0], array.shape[1] // 256 * Q5_K_BYTES)
 
 
 def q6_k_blocks(
@@ -188,6 +245,132 @@ def llama_tensor_plan(dims: dict[str, int] | None = None) -> dict[str, tuple[str
         "blk.0.ffn_up.weight": ("Q8_0", (ffn, hidden)),
         "blk.0.ffn_down.weight": ("Q4_K", (hidden, ffn)),
     }
+
+
+QWEN35_LINEAR = {
+    "key_heads": 2,
+    "value_heads": 2,
+    "key_head_dim": 128,
+    "value_head_dim": 128,
+    "conv_kernel": 4,
+}
+
+
+def qwen35_tensor_plan(
+    dims: dict[str, int] | None = None,
+) -> dict[str, tuple[str, tuple[int, ...]]]:
+    """A one-layer dense Qwen3.5 linear-attention fixture.
+
+    Shapes follow the real hybrid layout: ``key_heads == value_heads`` (so no
+    V-head permutation is needed), quantized projections are whole 256-value
+    blocks, and the depthwise convolution is stored squeezed to 2-D exactly as
+    llama.cpp writes it. The SSM scalars exercise the float fallback; the Q4_K
+    projections prove their codes can be preserved without touching the hybrid
+    runtime's non-matrix state.
+    """
+    dims = {**DEFAULT_DIMS, **(dims or {})}
+    hidden, ffn = dims["hidden"], dims["ffn"]
+    linear = {**QWEN35_LINEAR, **{k: v for k, v in dims.items() if k in QWEN35_LINEAR}}
+    key_dim = linear["key_heads"] * linear["key_head_dim"]
+    value_dim = linear["value_heads"] * linear["value_head_dim"]
+    conv_dim = 2 * key_dim + value_dim
+    return {
+        "token_embd.weight": ("Q4_K", (dims["vocab"], hidden)),
+        "output.weight": ("Q4_K", (dims["vocab"], hidden)),
+        "output_norm.weight": ("F32", (hidden,)),
+        "blk.0.attn_norm.weight": ("F32", (hidden,)),
+        # llama.cpp writes Qwen3.5's post-attention norm as
+        # `post_attention_norm`, not `ffn_norm`.
+        "blk.0.post_attention_norm.weight": ("F32", (hidden,)),
+        "blk.0.attn_qkv.weight": ("Q4_K", (conv_dim, hidden)),
+        "blk.0.attn_gate.weight": ("Q4_K", (value_dim, hidden)),
+        "blk.0.ssm_conv1d.weight": ("F32", (conv_dim, linear["conv_kernel"])),
+        "blk.0.ssm_dt.bias": ("F32", (linear["value_heads"],)),
+        "blk.0.ssm_a": ("F32", (linear["value_heads"],)),
+        "blk.0.ssm_beta.weight": ("Q4_K", (linear["value_heads"], hidden)),
+        "blk.0.ssm_alpha.weight": ("Q4_K", (linear["value_heads"], hidden)),
+        "blk.0.ssm_norm.weight": ("F32", (linear["value_head_dim"],)),
+        "blk.0.ssm_out.weight": ("Q4_K", (hidden, value_dim)),
+        "blk.0.ffn_gate.weight": ("Q6_K", (ffn, hidden)),
+        "blk.0.ffn_up.weight": ("Q8_0", (ffn, hidden)),
+        "blk.0.ffn_down.weight": ("Q4_K", (hidden, ffn)),
+    }
+
+
+def write_qwen35_gguf(
+    path: Path,
+    *,
+    arch: str = "qwen35",
+    dims: dict[str, int] | None = None,
+    seed: int = 13,
+    include_output: bool = True,
+) -> Path:
+    """Write a synthetic dense Qwen3.5 GGUF with its hybrid metadata.
+
+    ``include_output=False`` reproduces a tied checkpoint (Qwen3.5-0.8B ships no
+    ``output.weight``), which the config builder must translate into
+    ``tie_word_embeddings: true``.
+    """
+    dims = {**DEFAULT_DIMS, **(dims or {})}
+    linear = {**QWEN35_LINEAR, **{k: v for k, v in dims.items() if k in QWEN35_LINEAR}}
+    inner = linear["value_heads"] * linear["value_head_dim"]
+    writer = GGUFWriter(str(path), arch)
+    writer.add_context_length(64)
+    writer.add_embedding_length(dims["hidden"])
+    writer.add_block_count(dims["layers"])
+    writer.add_feed_forward_length(dims["ffn"])
+    writer.add_head_count(dims["heads"])
+    writer.add_head_count_kv(dims["kv_heads"])
+    writer.add_rope_dimension_count(dims["hidden"] // dims["heads"])
+    writer.add_key_value(f"{arch}.attention.key_length", 64, GGUFValueType.UINT32)
+    writer.add_key_value(
+        f"{arch}.attention.layer_norm_rms_epsilon", 1e-6, GGUFValueType.FLOAT32
+    )
+    writer.add_key_value(
+        f"{arch}.ssm.group_count", linear["key_heads"], GGUFValueType.UINT32
+    )
+    writer.add_key_value(
+        f"{arch}.ssm.time_step_rank", linear["value_heads"], GGUFValueType.UINT32
+    )
+    writer.add_key_value(
+        f"{arch}.ssm.state_size", linear["key_head_dim"], GGUFValueType.UINT32
+    )
+    writer.add_key_value(f"{arch}.ssm.inner_size", inner, GGUFValueType.UINT32)
+    writer.add_key_value(
+        f"{arch}.ssm.conv_kernel", linear["conv_kernel"], GGUFValueType.UINT32
+    )
+    writer.add_key_value(f"{arch}.full_attention_interval", 4, GGUFValueType.UINT32)
+    writer.add_key_value(
+        f"{arch}.rope.dimension_sections",
+        [1, 1, 1, 0],
+        GGUFValueType.ARRAY,
+        GGUFValueType.UINT32,
+    )
+    writer.add_token_list([f"token{i}" for i in range(dims["vocab"])])
+    writer.add_bos_token_id(1)
+    writer.add_eos_token_id(2)
+
+    generator = np.random.default_rng(seed)
+    plan = qwen35_tensor_plan(dims)
+    if not include_output:
+        plan = {name: spec for name, spec in plan.items() if name != "output.weight"}
+    for name, (kind, shape) in reversed(list(plan.items())):
+        values = generator.normal(0, 0.05, shape).astype(np.float32)
+        if "norm" in name:
+            values = (values * 0.1 + 1).astype(np.float32)
+        if name.endswith("ssm_a"):
+            values = -np.exp(values)
+        if kind == "F32":
+            writer.add_tensor(name, values)
+            continue
+        encoder, qtype = ENCODERS[kind]
+        packed = encoder(values)
+        writer.add_tensor(name, packed, raw_dtype=qtype)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return path
 
 
 def write_llama_gguf(

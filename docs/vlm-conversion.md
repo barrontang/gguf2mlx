@@ -23,10 +23,11 @@ Full Qwen2.5-VL, Qwen3-VL/3.5, LLaVA-NeXT/1.6, SigLIP, Pixtral and other layouts
 supported separately above. Other full layouts need separate
 architecture contracts, not aliases to these adapters.
 LLaVA and Qwen2-VL have offline, real `mlx-vlm` loader/processor/generation tests
-on Apple Silicon using tiny random checkpoints. MiniCPM-V 4.7 has portable
-conversion fixtures, but native image inference is unverified. **Large
-pretrained-model visual quality and cross-runtime perplexity parity are not
-broadly certified.**
+on Apple Silicon using tiny random checkpoints. MiniCPM-V 4.7 now runs its native
+image-path tests in the same `Vision` workflow job (`tests/test_vlm_minicpm.py`),
+but large **pretrained** caption quality is still unverified. **Large pretrained
+model visual quality and cross-runtime perplexity parity are not broadly
+certified.**
 For the pinned **Qwen2-VL-2B-Instruct Q4_K_M + F16 mmproj** pair, real-checkpoint
 acceptance is now complete: HF / GGUF-to-FP16 / llama.cpp score **12/12** on a
 fixed image diagnostic; uniform language-only MLX 4-bit has **11/12 exact
@@ -148,12 +149,15 @@ gguf2mlx convert --type vlm \
   semantics cannot be reliably inferred from tensor names or image mean/std
   alone, so matching HF assets remain required rather than guessed defaults.
 - Install `mlx-vlm` separately on Apple Silicon to load the output. The tested
-  runtime is pinned in `tests/requirements-vlm.txt` and should be installed in a
-  separate environment. **`mlx-vlm==0.7.6`'s LLaVA processor is incompatible
-  with `transformers==5.19.0`**: it forwards text-only `padding` to the image
-  processor, which now rejects it. Native CI uses Transformers 5.16.1; the
-  existing `dev` extra retains its newer Transformers requirement. Do not
-  combine the two environments. The lightweight `vlm` extra provides downloads only.
+  runtime is pinned to `mlx-vlm==0.7.10` in `tests/requirements-vlm.txt` and the
+  `vlm` extra, and should be installed in a separate environment. Older
+  `0.7.x` releases lack the `minicpmv4_7` model entry and 0.7.6's LLaVA
+  processor is incompatible with `transformers==5.19.0`: it forwards text-only
+  `padding` to the image processor, which now rejects it. Native CI uses
+  Transformers 5.16.1; the existing `dev` extra retains its newer Transformers
+  requirement. Do not combine the two environments. The `vlm` extra pulls the
+  matching `mlx-vlm` pin on Apple Silicon, but the pinned test environment in
+  `tests/requirements-vlm.txt` remains the reference for what CI exercises.
 
 GGUF vision quantization is not inherently unusable: quality depends on the
 source quantization and model. Hybrid conversion avoids that vision

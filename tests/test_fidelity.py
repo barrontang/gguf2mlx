@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -39,6 +40,27 @@ def converted(tmp_path):
         reader, "llama", output, "float16", max_shard_bytes=1 << 20
     )
     return tmp_path / "source.gguf", output, report
+
+
+def test_source_tensors_without_output_are_explained():
+    reader = SimpleNamespace(tensors=[
+        SimpleNamespace(name="token_embd.weight"),
+        SimpleNamespace(name="rope_freqs.weight"),
+        SimpleNamespace(name="mtp.0.attn_q.weight"),
+        SimpleNamespace(name="blk.4.nextn.attn_k.weight"),
+        SimpleNamespace(name="mystery.weight"),
+    ])
+
+    skipped = core._source_tensors_without_output(
+        reader, {"token_embd.weight"}
+    )
+
+    assert skipped == [
+        {"name": "blk.4.nextn.attn_k.weight", "reason": "mtp_head_not_consumed"},
+        {"name": "mtp.0.attn_q.weight", "reason": "mtp_head_not_consumed"},
+        {"name": "mystery.weight", "reason": "unmapped"},
+        {"name": "rope_freqs.weight", "reason": "reproduced_from_config"},
+    ]
 
 
 def test_compare_reports_zero_for_identical_values():

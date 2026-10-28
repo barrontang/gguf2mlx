@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -312,6 +313,72 @@ def test_qwen_bpe_without_unknown_does_not_register_normal_character(tmp_path, l
         tokenizer = Tokenizer.from_file(str(tmp_path / "tokenizer.json"))
         assert tokenizer.encode("!a", add_special_tokens=False).ids == [2]
         assert tokenizer.encode("!", add_special_tokens=False).ids == [0]
+
+
+@pytest.mark.parametrize("arch", sorted(core.QWEN_FAMILY_ARCHES))
+def test_every_qwen_arch_declares_no_normalizer(tmp_path, arch):
+    """No Qwen tokenizer has a normalizer; NFC would rewrite input before BPE.
+
+    The default for an unrecognized architecture is NFC, so every Qwen ID has
+    to be listed. Qwen3.5 was missing and silently got one.
+    """
+    reader = _FakeReader({
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.tokens": ["!", "a", "!a", "<s>", "</s>", "<pad>"],
+        "tokenizer.ggml.token_type": [1, 1, 1, 3, 3, 3],
+        "tokenizer.ggml.merges": ["! a"],
+        "tokenizer.ggml.bos_token_id": 3,
+        "tokenizer.ggml.eos_token_id": 4,
+        "tokenizer.ggml.padding_token_id": 5,
+    })
+    core.extract_tokenizer(reader, tmp_path, arch=arch)
+    tokenizer_json = json.loads((tmp_path / "tokenizer.json").read_text())
+    assert tokenizer_json["normalizer"] is None, f"{arch} must not normalize"
+
+
+@pytest.mark.parametrize("pre", sorted(core.QWEN_PRE_TOKENIZERS))
+def test_qwen_pre_tokenizer_values_are_recognized(tmp_path, pre):
+    """A `pre` value that falls through silently changes how text is split.
+
+    llama.cpp names the hybrid family `qwen35` while Qwen2/2.5/3 report `qwen2`;
+    an unlisted value took the legacy-BPE branch and warned.
+    """
+    reader = _FakeReader({
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": pre,
+        "tokenizer.ggml.tokens": ["!", "a", "!a", "<s>", "</s>", "<pad>"],
+        "tokenizer.ggml.token_type": [1, 1, 1, 3, 3, 3],
+        "tokenizer.ggml.merges": ["! a"],
+        "tokenizer.ggml.bos_token_id": 3,
+        "tokenizer.ggml.eos_token_id": 4,
+        "tokenizer.ggml.padding_token_id": 5,
+    })
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        core.extract_tokenizer(reader, tmp_path, arch="qwen2")
+    assert not [w for w in caught if "tokenizer.ggml.pre" in str(w.message)], (
+        f"tokenizer.ggml.pre={pre!r} still falls through to legacy BPE"
+    )
+    tokenizer_json = json.loads((tmp_path / "tokenizer.json").read_text())
+    assert tokenizer_json["normalizer"] is None
+
+
+def test_unknown_pre_tokenizer_still_warns(tmp_path):
+    """The fallback has to stay loud; only known values may pass quietly."""
+    reader = _FakeReader({
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "not-a-real-pre-tokenizer",
+        "tokenizer.ggml.tokens": ["!", "a", "!a", "<s>", "</s>", "<pad>"],
+        "tokenizer.ggml.token_type": [1, 1, 1, 3, 3, 3],
+        "tokenizer.ggml.merges": ["! a"],
+        "tokenizer.ggml.bos_token_id": 3,
+        "tokenizer.ggml.eos_token_id": 4,
+        "tokenizer.ggml.padding_token_id": 5,
+    })
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        core.extract_tokenizer(reader, tmp_path, arch="llama")
+    assert [w for w in caught if "tokenizer.ggml.pre" in str(w.message)]
 
 
 @pytest.mark.skipif(

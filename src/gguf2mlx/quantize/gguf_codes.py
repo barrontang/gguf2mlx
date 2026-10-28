@@ -90,7 +90,18 @@ AFFINE_GROUP_SIZE = 32
 
 #: Architectures whose tensor layout this pipeline can re-express without
 #: transforming a quantized payload. Everything else fails closed in the CLI.
-PRESERVE_ARCHES = frozenset({"llama", "qwen2", "qwen3", "mistral"})
+PRESERVE_ARCHES = frozenset({
+    "llama",
+    "qwen2",
+    "qwen3",
+    "mistral",
+    # Dense Qwen3.5 uses the same linear tensors plus SSM parameters. The SSM
+    # vectors and convolution are not matrices and therefore stay in float;
+    # only the quantized projections are re-expressed on MLX's affine grid.
+    "qwen35", "qwen3_5", "qwen3.5",
+    "qwen36", "qwen3_6", "qwen3.6",
+    "qwen38", "qwen3_8", "qwen3.8",
+})
 
 #: Relative-L2 ceiling for a preserved tensor. Only ``fp16`` scale/bias rounding
 #: is allowed inside it, so a mis-mapped block cannot hide underneath.
@@ -122,22 +133,25 @@ MIN_MLX_GROUP_SIZE = 32
 
 _BLOCK_ELEMENTS = {
     "Q4_K": 256,
+    "Q5_K": 256,
     "Q6_K": 256,
     "Q8_0": 32,
 }
 _TYPE_BYTES = {
     "Q4_K": 144,
+    "Q5_K": 176,
     "Q6_K": 210,
     "Q8_0": 34,
 }
 _AFFINE_BITS = {
     "Q4_K": 4,
+    "Q5_K": 5,
     "Q6_K": 6,
     "Q8_0": 8,
 }
 
 #: ``GGMLQuantizationType`` values this module understands.
-QTYPE_IDS = {"Q4_K": 12, "Q6_K": 14, "Q8_0": 8}
+QTYPE_IDS = {"Q4_K": 12, "Q5_K": 13, "Q6_K": 14, "Q8_0": 8}
 _NAME_BY_ID = {value: key for key, value in QTYPE_IDS.items()}
 
 
@@ -225,7 +239,7 @@ def pack_codes(codes: np.ndarray, bits: int) -> np.ndarray:
     if codes.ndim != 2:
         raise ValueError(f"codes must be 2-D, got shape {codes.shape}")
     rows, cols = codes.shape
-    if bits not in (4, 6, 8):
+    if bits not in (4, 5, 6, 8):
         raise ValueError(f"unsupported MLX affine bit-width: {bits}")
     if cols % AFFINE_GROUP_SIZE:
         raise ValueError(
@@ -246,7 +260,7 @@ def pack_codes(codes: np.ndarray, bits: int) -> np.ndarray:
 def unpack_codes(packed: np.ndarray, bits: int, cols: int) -> np.ndarray:
     """Inverse of :func:`pack_codes`; the basis of the conversion audit."""
     packed = np.ascontiguousarray(packed)
-    if bits not in (4, 6, 8):
+    if bits not in (4, 5, 6, 8):
         raise ValueError(f"unsupported MLX affine bit-width: {bits}")
     if cols % AFFINE_GROUP_SIZE:
         raise ValueError(f"column count {cols} is not a multiple of {AFFINE_GROUP_SIZE}")
@@ -354,6 +368,48 @@ def q4_k_to_affine(
         bits=4,
         group_size=32,
         qtype="Q4_K",
+        exact=True,
+    )
+
+
+def q5_k_to_affine(
+    raw: np.ndarray, shape: Any, *, floating_dtype: str = "float16"
+) -> MappingResult:
+    """Re-express a ``Q5_K`` tensor as affine 5-bit groups of 32.
+
+    ``Q5_K`` keeps its 6-bit scale and min per 32 values -- exactly MLX's group
+    -- and its 5-bit codes are the low nibble of ``qs`` plus one high bit taken
+    from ``qh``. So the codes are reusable verbatim, like ``Q4_K``, and only the
+    fp16 rounding of ``d*sc`` and ``-dmin*m`` is new.
+    """
+    rows, cols = _check_shape(shape, "Q5_K")
+    blocks = _blocks(raw, rows, cols, "Q5_K")
+
+    from gguf.quants import Q4_K
+
+    scales, mins = Q4_K.get_scale_min(blocks[:, 4:16].copy())
+    d = blocks[:, 0:2].copy().view("<f2").astype(np.float32).reshape(-1, 1)
+    dmin = blocks[:, 2:4].copy().view("<f2").astype(np.float32).reshape(-1, 1)
+    scale = (d * scales.astype(np.float32)).reshape(rows, cols // 32)
+    bias = (-dmin * mins.astype(np.float32)).reshape(rows, cols // 32)
+
+    # Layout per 176-byte block: d, dmin, scales[12], qh[32], qs[128]. ``qs``
+    # supplies the low nibble of 4 pairs of 32-value groups; ``qh`` supplies the
+    # fifth bit for all 8 groups, one bit per group per byte.
+    qh = blocks[:, 16:48].reshape(-1, 1, 32)
+    qs = blocks[:, 48:].reshape(-1, 4, 1, 32)
+    low = (qs >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)) & np.uint8(0x0F)
+    high = (qh >> np.arange(8, dtype=np.uint8).reshape(1, 8, 1)) & np.uint8(0x01)
+    codes = low.reshape(-1, cols) | (high.reshape(-1, cols) << np.uint8(4))
+    codes = codes.reshape(rows, cols // 32, 32)
+
+    return MappingResult(
+        packed=pack_codes(codes.reshape(rows, cols), 5),
+        scales=scale.astype(floating_dtype),
+        biases=bias.astype(floating_dtype),
+        bits=5,
+        group_size=32,
+        qtype="Q5_K",
         exact=True,
     )
 
@@ -617,6 +673,7 @@ def refit_tensor_to_affine(
 
 _MAPPERS = {
     "Q4_K": q4_k_to_affine,
+    "Q5_K": q5_k_to_affine,
     "Q6_K": q6_k_to_affine,
     "Q8_0": q8_0_to_affine,
 }

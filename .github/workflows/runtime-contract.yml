@@ -1,0 +1,55 @@
+name: Runtime contract
+
+# The converter writes a model_type into every config.json. This workflow asks
+# the minimum supported MLX runtimes whether they can resolve what was written.
+# It is separate from Vision conversion so a fast registry regression is not
+# hidden behind the larger image-path suite.
+
+on:
+  pull_request:
+    paths:
+      - "src/gguf2mlx/**"
+      - "tests/test_runtime_registry.py"
+      - "tests/requirements-vlm.txt"
+      - "pyproject.toml"
+      - ".github/workflows/runtime-contract.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/gguf2mlx/**"
+      - "tests/test_runtime_registry.py"
+      - "tests/requirements-vlm.txt"
+      - "pyproject.toml"
+      - ".github/workflows/runtime-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  minimum-runtime:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e . -r tests/requirements-vlm.txt
+      - name: Require the pinned runtimes (never pass by skipping)
+        run: |
+          python - <<'PY'
+          import importlib.metadata
+          import platform
+
+          import mlx.core  # noqa: F401
+          import mlx_lm  # noqa: F401
+          import mlx_vlm  # noqa: F401
+
+          assert platform.system() == "Darwin" and platform.machine() == "arm64"
+          assert importlib.metadata.version("mlx-lm") == "0.31.3"
+          assert importlib.metadata.version("mlx-vlm") == "0.7.10"
+          PY
+      - name: Enforce emitted-model registry conformance
+        run: python -m pytest tests/test_runtime_registry.py -q

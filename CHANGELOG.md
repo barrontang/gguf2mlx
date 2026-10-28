@@ -2,6 +2,119 @@
 
 ## Unreleased
 
+### Emitted `model_type` values are checked against the runtime registry
+
+Conversion could emit a `model_type` the installed runtime has no module for,
+which only surfaces as a load failure on the user's machine. The minimum
+runtimes are now `mlx-lm>=0.31.3` (Qwen3.5 landed in 0.31.0, `gemma4_text` in
+0.31.3) and `mlx-vlm==0.7.10` (`minicpmv4_7`), and `tests/test_runtime_registry.py`
+asserts every architecture ID this converter can emit resolves through
+`mlx_lm.utils._get_classes()` / `mlx_vlm.utils.get_model_and_args()` — including
+the `qwen2_vl_text` / `qwen3_vl_text` text hosts that the VLMs delegate to. A new
+`Runtime contract` workflow pins both versions on Apple Silicon and runs that
+suite; a portable inventory half fails when an adapter is added without the
+registry test being updated.
+
+### `preserve` covers dense Qwen3.5, and its hybrid layout is restored
+
+`--quant-source preserve` now accepts `qwen35` and its aliases (`qwen3_5`,
+`qwen3.5`, `qwen36`, `qwen38`). The quantized matrix projections of a
+linear-attention block keep their source codes; `A_log`, `dt_bias`, the
+depthwise `conv1d` and the gated norm have no affine matrix form and stay float,
+recorded as `F32_has_no_affine_reexpression`.
+
+Writing that fixture exposed two layout bugs in the float path, both of which
+produced artifacts that could not load or ran with wrong decay:
+
+- `A_log` was only restored for a tensor literally named `ssm_a`. Real GGUFs use
+  `blk.N.ssm_a`, so `log(-ssm_a)` never ran and every layer kept the raw
+  negative decay rate where MLX expects its logarithm.
+- `ssm_norm.weight` was de-shifted by 1. llama.cpp skips its `+1` centering for
+  `linear_attn.norm.weight` specifically, so subtracting 1 corrupted the norm.
+- The squeezed `(channels, kernel)` kernel is now widened to
+  `(channels, kernel, 1)`, which is what MLX's `Conv1d` wants and what keeps
+  `mlx_lm`'s `qwen3_5` sanitize from re-applying the HF `+1` norm offset.
+
+The weight audit learned a `reshaped` layout so the widened kernel is still
+value-compared instead of being excused as `transformed`.
+
+### Pinning the Qwen3.5 real checkpoint found four more defects
+
+`unsloth/Qwen3.5-0.8B-GGUF` Q4_K_M was supposed to be the easy part of the
+matrix. It found:
+
+- `Unsupported qwen35 tensor: blk.0.post_attention_norm.weight` — llama.cpp
+  names Qwen3.5's post-attention norm `post_attention_norm`, not `ffn_norm`, and
+  only the Llama spelling was mapped, so **every** conversion of a real Qwen3.5
+  file failed.
+- `Missing 1 parameters: language_model.lm_head.weight` — `build_config` forced
+  `tie_word_embeddings: false` for Qwen3.5 while the file ships no
+  `output.weight`. Tie/untie now follows the tensor list, as it already did for
+  Qwen3.
+- The first artifact was **1.446x** the source because 36 `Q5_K` tensors had no
+  affine re-expression and fell back to FP16. `Q5_K` is now preserved exactly:
+  its 6-bit scale/min is already per-32 values, and its 5-bit code is the `qs`
+  low nibble plus one bit from the `qh` plane, so MLX stores the same codes in
+  five words per group. Artifact: **1.084x**.
+- `tokenizer.ggml.pre='qwen35'` was unlisted, so the tokenizer fell through to
+  legacy BPE splitting **and** kept the default NFC normalizer — which no Qwen
+  tokenizer has. The model still loaded with finite logits; only a warning in the
+  matrix log gave it away. `QWEN_PRE_TOKENIZERS` and `QWEN_FAMILY_ARCHES` now
+  route every Qwen ID to the same no-normalizer path, and
+  `tests/test_tokenizer_fidelity.py` asserts `normalizer is None` for each of
+  them and that an unknown `pre` value still warns.
+
+The case now passes end to end locally on Apple Silicon (2026-10-26,
+`mlx-lm` 0.32.2): convert → weight gate (`115/133`) → preserve gate (170
+`exact`, 17 `inexact`) → `mlx_lm.load` → finite logits. Re-running the whole
+matrix against the same tree gives 12/12 green, so every pinned entry has local
+evidence; the `Load matrix` workflow has not been re-run since the Qwen3.5 entry
+was added, so the published run still shows eleven.
+
+### `publish` can be reviewed before it is visible
+
+- `--dry-run` resolves, downloads, converts, and builds the card and provenance,
+  then stops before `create_repo`/`upload_folder`.
+- `--verify-load` runs the same check as the release gate
+  (`fidelity.load_and_run`: load, one forward pass, finite logits) before the
+  destination repository exists, so a layout defect fails the run instead of
+  publishing an unloadable model. Loading alone would miss it: a tensor with the
+  right name and shape but the wrong layout loads cleanly and computes garbage.
+- Shard downloads and license copies stream in fixed-size chunks instead of
+  reading each file into memory, and the merged GGUF is written incrementally.
+- The model card now carries the source GGUF SHA-256 and byte count, the weight
+  and preserve gate results, the artifact disk size, a `base_model_relation`,
+  dtype/precision tags, and an exact reproduce command.
+
+### The report explains every source tensor that produced no output
+
+`conversion_report.json` schema 4 adds `source_tensors_without_output`, naming
+each dropped tensor with `reproduced_from_config`, `mtp_head_not_consumed`, or
+`unmapped`. Silence was the previous behaviour, which made MTP heads and
+`rope_freqs` indistinguishable from an adapter gap.
+
+### Documentation tracks the code again
+
+`llms.txt`, `docs/development.md`, `docs/support-matrix.md`,
+`docs/quality-gates.md`, `docs/publishing.md`, `docs/vlm-conversion.md` and the
+README no longer describe a Rust build, call direct-quant "proposed", or claim
+that source quantization is never preserved.
+
+Fixing the instances would only invite the fourth round, so
+`tests/test_docs_consistency.py` now asserts the invariants instead: every
+`CONVERTIBLE_ARCHES` and `PRESERVE_ARCHES` entry is named in `llms.txt` (alias
+spellings collapsed, word-boundary matched so `qwen3` is not satisfied by
+`qwen3.5`), the quoted runtime versions match `pyproject.toml`, every
+preservable block type appears in the gate table, no doc mentions the deleted
+crate, and `direct-quant-transcoding.md` no longer titles itself as proposed.
+Writing it immediately caught two live errors: `llms.txt` undercounted the
+canonical architectures by two (`qwen36`/`qwen38` are canonical, not aliases),
+and `--verify-load` was documented as running a forward pass while the code only
+called `load()`. The check now delegates to `fidelity.load_and_run`, so a
+publish-time verification and a CI gate agree on what "loadable" means — a
+non-finite logits result and a missing runtime both fail the run rather than
+passing silently.
+
 ### `preserve` stops expanding Q6_K to FP16
 
 `--quant-source preserve` re-expresses GGUF blocks on MLX's affine grid and

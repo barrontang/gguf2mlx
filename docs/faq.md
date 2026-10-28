@@ -19,11 +19,15 @@ recover information removed when the source GGUF was quantized.
 
 Not by default. MLX-LM and the uniform `--direct-quant` path perform a second
 quantization; the latter skips the FP16 staging directory. See
-`docs/direct-quant-transcoding.md`. For Qwen2-VL with Q4_K projections,
-`--quantize --direct-quant --preserve-source-quant` instead keeps those codes
-and 32-element groups, while other projections remain floating-point.
-Coefficient rounding to the output dtype still applies; see the
-[real-checkpoint report](qwen2-vl-real-validation.md).
+`docs/direct-quant-transcoding.md`.
+
+`--quant-source preserve` is the opt-in path that reuses the source blocks: Q4_K,
+Q5_K, Q6_K and Q8_0 codes are re-expressed on MLX's affine grid, with Q6_K
+re-fitted at the same width when its 16-value scales cannot fit a 32-value group.
+Historical spelling `--preserve-source-quant` still works, and Qwen2-VL keeps its
+vision/projector tensors floating-point. Coefficient rounding to the output dtype
+still applies; see the [real-checkpoint report](qwen2-vl-real-validation.md) and
+the [preserve tier](quality-gates.md#preserve-tier).
 
 ### Why is the converted model larger than the GGUF file?
 

@@ -2,11 +2,11 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/barrontang/gguf2mlx/conversion-report.schema.json",
   "title": "gguf2mlx conversion report",
-  "description": "Written as conversion_report.json next to every conversion. Schema 2 added the three-tier fidelity block; schema 3 splits the preserve gate into exact and inexact tiers and records the artifact size ratio. Older reports remain valid: fields added since their schema version are optional here.",
+  "description": "Written as conversion_report.json next to every conversion. Schema 2 added the three-tier fidelity block; schema 3 split the preserve gate into exact and inexact tiers and recorded the artifact size ratio; schema 4 records source tensors that intentionally or unexpectedly produced no output. Older reports remain valid: fields added since their schema version are optional here.",
   "type": "object",
   "required": ["schema_version", "architecture"],
   "properties": {
-    "schema_version": {"enum": [1, 2, 3]},
+    "schema_version": {"enum": [1, 2, 3, 4]},
     "architecture": {"type": "string"},
     "architecture_kind": {"enum": ["dense", "moe", "hybrid"]},
     "mixed_precision": {"type": "boolean"},
@@ -15,6 +15,20 @@
     "compressed_expert_tensors": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
     "unknown_tensors": {"type": "array", "items": {"type": "string"}},
     "tensor_decisions": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
+    "source_tensors_without_output": {
+      "type": "array",
+      "description": "Source GGUF tensors that were intentionally or unexpectedly not written to the MLX artifact, with a reason.",
+      "items": {
+        "type": "object",
+        "required": ["name", "reason"],
+        "properties": {
+          "name": {"type": "string"},
+          "reason": {
+            "enum": ["reproduced_from_config", "mtp_head_not_consumed", "unmapped"]
+          }
+        }
+      }
+    },
 
     "dtype": {"type": "string"},
     "source": {"type": ["string", "null"]},
@@ -134,13 +148,13 @@
     },
     "tensor_layout": {
       "type": "object",
-      "description": "Audit plan: output tensor -> source GGUF tensor and whether it was written through unchanged.",
+      "description": "Audit plan: output tensor -> source GGUF tensor and how it was written. `identity` is byte-for-byte, `reshaped` keeps the values on new axes (still value-compared), `transformed` is any other change (row permutation, fusion, split) and is not value-compared.",
       "additionalProperties": {
         "type": "object",
         "required": ["source", "layout"],
         "properties": {
           "source": {"type": "string"},
-          "layout": {"enum": ["identity", "transformed"]}
+          "layout": {"enum": ["identity", "reshaped", "transformed"]}
         }
       }
     },

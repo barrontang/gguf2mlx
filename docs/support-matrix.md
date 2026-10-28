@@ -20,7 +20,7 @@ MiniCPM-V 4.7 1B adapter.
 |---|---|---|---|---|---|---|---|
 | Llama | `llama`, `mistral` | ✅ | ✅ Llama-3.2-1B Q4_0/Q4_K_M/Q8_0 real GGUF in CI | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen | `qwen2`, dense `qwen3` | ✅ | ✅ Qwen2.5-0.5B Q4_0/Q4_K_M/Q8_0 and Qwen3-0.6B Q8_0 in CI | ❌ | — | ✅ generic package/verify | ❌ |
-| Qwen3.5 family | `qwen35`; aliases `qwen3_5`, `qwen3.5`, `qwen36`, `qwen3_6`, `qwen3.6`, `qwen38`, `qwen3_8`, `qwen3.8` | ✅ dense layouts | Portable fixtures; native runtime unverified | ❌ | — | ✅ generic package/verify | ❌ |
+| Qwen3.5 family | `qwen35`; aliases `qwen3_5`, `qwen3.5`, `qwen36`, `qwen3_6`, `qwen3.6`, `qwen38`, `qwen3_8`, `qwen3.8` | ✅ dense layouts + preserve | ✅ Qwen3.5-0.8B Q4_K_M preserve: local run passes convert → weight gate → preserve gate → `mlx_lm.load` → finite logits (nightly job pending); aliases fixture-tested | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 and Qwen3-30B-A3B real-GGUF uniform 4-bit smoke tests | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | DeepSeek | `deepseek2`, `deepseek3` | ✅ | ✅ V2 Lite real Q2_K smoke test; V3 runtime unverified | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | GLM | `glm4moe` | ✅ | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
@@ -30,7 +30,7 @@ MiniCPM-V 4.7 1B adapter.
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | Tiny image-path parity; pretrained quality unverified | ❌ | Language-only 4-bit | ✅ generic package/verify | ✅ Llama + CLIP only |
 | Qwen2-VL | `qwen2vl` + Qwen2-VL/mmproj | ✅ direct/hybrid fixture-validated | Named 2B direct checkpoint: 12/12 image diagnostic; see [report](qwen2-vl-real-validation.md) | ❌ | Uniform 4-bit: 11/12 exact; source-preserved Q4_K/float: 12/12 | ✅ generic package/verify | ✅ ViT + patch merger |
-| MiniCPM-V 4.7 1B | dense `qwen35` + `clip.projector_type=minicpmv4_7` | ✅ portable fixture-validated | Native image inference unverified | ❌ (35B-A3B excluded) | ❌ | ✅ generic package/verify | ✅ SigLIP + window/final mergers |
+| MiniCPM-V 4.7 1B | dense `qwen35` + `clip.projector_type=minicpmv4_7` | ✅ portable + native image path | Native image-path CI; pretrained caption quality unverified | ❌ (35B-A3B excluded) | ❌ | ✅ generic package/verify | ✅ SigLIP + window/final mergers |
 | Qwen-VL text encoder | `qwen3vl`, `qwen3_vl`, `qwen2vl`, `qwen2_vl` | ✅ `--type text-encoder`, BF16 default | Portable conversion only; native hidden-state/image quality unverified | ❌ | Explicit direct 4-bit only | ✅ generic package/verify | Text only; vision skipped |
 
 “Conversion” means that a code path exists. “End-to-end” means a converted model
@@ -43,27 +43,33 @@ directories and do not assert runtime compatibility.
 
 The ✅ end-to-end cells are produced by the `Load matrix` workflow, which
 downloads each pinned GGUF by SHA-256, converts it, runs the weight-fidelity
-gate, loads the result with `mlx_lm` and requires finite logits. Evidence:
-[run 39505897872](https://github.com/barrontang/gguf2mlx/actions/runs/39505897872)
-(11/11 entries green, 2026-10-21). The entry list lives in
+gate, loads the result with `mlx_lm` and requires finite logits. Published CI
+evidence: [run 39505897872](https://github.com/barrontang/gguf2mlx/actions/runs/39505897872)
+(11/11 entries green, 2026-10-21). A twelfth entry pins Qwen3.5-0.8B Q4_K_M in
+preserve mode; locally the full twelve-entry matrix is green on Apple Silicon
+(2026-10-26), including that entry, but the workflow has not been re-run since it
+was added, so the published run still shows eleven. The entry list lives in
 `tests/load_matrix.json`, and each job uploads the conversion report it produced.
 
 ### Pinned versus declared-only
 
-`CONVERTIBLE_ARCHES` lists 30 architecture IDs; the pinned matrix covers five
-(`llama`, `qwen2`, `qwen3`, `gemma2`, `phi3`). The difference is not implied — it
-is written down and enforced. `tests/test_load_matrix.py` fails when an
-architecture is convertible but is neither pinned nor listed in
-`DECLARED_COVERAGE_GAPS` with a reason, so a new adapter cannot quietly widen the
-support claim. Alias spellings (`qwen3_5`, `qwen3.5`, `qwen2vl`, …) share one
-canonical ID and one case.
+`CONVERTIBLE_ARCHES` lists 30 architecture IDs — 22 canonical plus 8 alias
+spellings; the pinned matrix covers six of those canonical architectures
+(`llama`, `qwen2`, `qwen3`, `qwen35`, `gemma2`, `phi3`). The
+difference is not implied — it is written down and enforced.
+`tests/test_load_matrix.py` fails when an architecture is convertible but is
+neither pinned nor listed in `DECLARED_COVERAGE_GAPS` with a reason, so a new
+adapter cannot quietly widen the support claim. Alias spellings (`qwen3_5`,
+`qwen3.5`, `qwen2vl`, …) share one canonical ID and one case. Separately,
+`tests/test_runtime_registry.py` checks every emitted `model_type` against the
+minimum pinned `mlx-lm`/`mlx-vlm` registries.
 
 | Architecture IDs without a pinned case | Reason |
 |---|---|
 | `deepseek2`, `deepseek3`, `glm4moe`, `glm-dsa`, `qwen2moe`, `qwen3moe` | MoE/MLA sources; the smallest public GGUFs exceed the per-runner download budget, and router protection needs its own case. `weekly-moe.yml` covers two families instead. |
 | `gemma`, `gemma3`, `gemma4` | share `gemma2`'s adapter path, which is pinned; no small pinned GGUF for the others yet |
 | `mistral`, `phi4` | share `llama`'s tensor map and `phi3`'s sliding-window adapter, both pinned |
-| `qwen35`, `qwen36`, `qwen38` (and their alias spellings) | hybrid adapters, fixture-tested only; no small pinned GGUF yet |
+| `qwen36`, `qwen38` (and their alias spellings) | newer hybrid variants share the dense Qwen3.5 adapter and are fixture-tested; only `qwen35` has a pinned real-model case |
 | `stablelm` | adapter ships; no pinned public GGUF yet |
 | `qwen2_vl`, `qwen3_vl` | full VLM entries need the matching HF repo beside the GGUF; `vision.yml` owns that path |
 
@@ -101,8 +107,8 @@ The source and both conversions require approximately 52 GiB of disk.
 
 Qwen3.5-family variants share the non-MoE Qwen3.5 tensor contract; Qwen3.x MoE
 and Gemma4 multimodal/audio components are not included in these text-model
-adapters. Native MLX-LM loading of the newly supported variants has not yet been
-validated against real checkpoints.
+adapters. `qwen35` is the only variant with a real-checkpoint run (Qwen3.5-0.8B,
+Q4_K_M, preserve); `qwen36` and `qwen38` remain fixture-tested only.
 
 #### DeepSeek-V2 Lite real-model validation
 

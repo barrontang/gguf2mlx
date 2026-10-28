@@ -10,6 +10,7 @@ from gguf.quants import dequantize
 from gguf2mlx.quantize import gguf_codes
 from tests.quant_fixtures import (
     encode_q4_k,
+    encode_q5_k,
     encode_q6_k,
     encode_q8_0,
     q4_k_blocks,
@@ -214,6 +215,7 @@ def test_q6_k_zero_scale_group_does_not_produce_nan():
     ("encoder", "qtype"),
     [
         (encode_q4_k, GGMLQuantizationType.Q4_K),
+        (encode_q5_k, GGMLQuantizationType.Q5_K),
         (encode_q8_0, GGMLQuantizationType.Q8_0),
         (lambda values: encode_q6_k(values, equal_pair_scales=True),
          GGMLQuantizationType.Q6_K),
@@ -238,7 +240,7 @@ def test_round_trip_stays_inside_the_audit_tolerance(encoder, qtype):
 
 def test_pack_and_unpack_round_trip_every_width():
     generator = np.random.default_rng(5)
-    for bits in (4, 6, 8):
+    for bits in (4, 5, 6, 8):
         codes = generator.integers(0, 1 << bits, (3, 128)).astype(np.uint8)
         packed = gguf_codes.pack_codes(codes, bits)
         assert packed.dtype == np.uint32
@@ -251,7 +253,7 @@ def test_packing_matches_mlx_core_dequantize():
     mx = pytest.importorskip("mlx.core")
     generator = np.random.default_rng(6)
     ones = None
-    for bits in (4, 6, 8):
+    for bits in (4, 5, 6, 8):
         codes = generator.integers(0, 1 << bits, (3, 64)).astype(np.uint8)
         packed = gguf_codes.pack_codes(codes, bits)
         ones = mx.ones((3, 2), dtype=mx.float16)
@@ -287,9 +289,9 @@ def test_affine_decode_matches_mlx_for_scaled_groups():
 
 
 def test_map_tensor_rejects_a_block_type_without_a_mapping():
-    with pytest.raises(gguf_codes.UnsupportedQuantType, match="Q5_K"):
+    with pytest.raises(gguf_codes.UnsupportedQuantType, match="Q4_1"):
         gguf_codes.map_tensor(
-            np.zeros(176, dtype=np.uint8), GGMLQuantizationType.Q5_K, (1, 256)
+            np.zeros(160, dtype=np.uint8), GGMLQuantizationType.Q4_1, (1, 256)
         )
 
 
@@ -315,7 +317,7 @@ def test_unaligned_row_length_is_rejected():
         )
 
 
-@pytest.mark.parametrize("bits", [2, 3, 5, 16])
+@pytest.mark.parametrize("bits", [2, 3, 7, 16])
 def test_unsupported_affine_widths_are_rejected(bits):
     with pytest.raises(ValueError, match="bit-width"):
         gguf_codes.pack_codes(np.zeros((1, 32), dtype=np.uint8), bits)
@@ -334,7 +336,10 @@ def test_affine_decode_validates_group_shapes():
 def test_qtype_helpers_agree_on_the_supported_set():
     assert gguf_codes.qtype_name(GGMLQuantizationType.Q4_K) == "Q4_K"
     assert gguf_codes.qtype_name(12) == "Q4_K"
-    assert gguf_codes.qtype_name(GGMLQuantizationType.Q5_K) is None
+    assert gguf_codes.qtype_name(GGMLQuantizationType.Q5_K) == "Q5_K"
+    assert gguf_codes.mlx_bits("Q5_K") == 5
+    assert gguf_codes.block_elements("Q5_K") == 256
+    assert gguf_codes.qtype_name(GGMLQuantizationType.Q4_1) is None
     assert gguf_codes.mlx_bits("Q8_0") == 8
     assert gguf_codes.block_elements("Q6_K") == 256
     assert gguf_codes.block_elements("nope") is None

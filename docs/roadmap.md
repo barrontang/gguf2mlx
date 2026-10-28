@@ -26,14 +26,22 @@ Completed:
 - `--eval-ppl` perplexity guardrail in the benchmark harness (reuses `mlx_lm.perplexity`; reports standard vs `--direct-quant` PPL delta)
 - three-tier fidelity gate (`exact` / `inexact` / lossless), the `verify` command and
   the documented `conversion-report.json` schema
-- `--quant-source preserve|requant` re-expressing GGUF `Q4_K`/`Q6_K`/`Q8_0` blocks on
-  MLX's affine grid instead of requantizing decoded floats, with a per-tensor audit in
-  the conversion report (`requant` remains the default); supported for llama, qwen2,
-  qwen3 and mistral, fail-closed elsewhere
-- `gguf2mlx publish`: split-GGUF discovery and merge, provenance record, license copy
-  and pinned converter version, with `publish-mlx.yml` reduced to a thin shell
-- pinned load matrix converting, weight-gating and `mlx_lm.load()`-ing 11 entries
-  across llama, qwen2, qwen3, gemma2 and phi3 (run 39505897872)
+- `--quant-source preserve|requant` re-expressing GGUF `Q4_K`/`Q5_K`/`Q6_K`/`Q8_0`
+  blocks on MLX's affine grid instead of requantizing decoded floats, with a
+  per-tensor audit in the conversion report (`requant` remains the default);
+  supported for llama, qwen2, qwen3, mistral and dense Qwen3.5, fail-closed
+  elsewhere
+- `gguf2mlx publish`: split-GGUF discovery and merge, bounded-memory streaming,
+  provenance record, license copy and pinned converter version, plus `--dry-run`
+  and `--verify-load` so a publish can be reviewed before it becomes visible;
+  `publish-mlx.yml` reduced to a thin shell
+- pinned load matrix converting, weight-gating and `mlx_lm.load()`-ing 12 entries
+  across llama, qwen2, qwen3, gemma2, phi3 and Qwen3.5 — green locally on Apple
+  Silicon (2026-10-26); the last published CI run covered the original 11 (run
+  39505897872)
+- a runtime registry contract (`mlx-lm>=0.31.3`, `mlx-vlm==0.7.10`) checked by
+  `tests/test_runtime_registry.py` and the `Runtime contract` workflow, so an
+  emitted `model_type` cannot silently outrun the installed runtime
 - CLI completion: `--force` for a non-empty output directory, `--json` for a
   machine-readable result, and a `logging` channel on stderr (`-v`/`-q`) that
   keeps stdout clean for `--json`
@@ -63,4 +71,4 @@ Remaining areas for contributors:
 Vision format references:
 [llama.cpp Qwen2-VL exporter](https://github.com/ggml-org/llama.cpp/blob/4413a192410fad1f054e9216114087a3e01527a0/conversion/qwenvl.py),
 [GGUF tensor mapping](https://github.com/ggml-org/llama.cpp/blob/4413a192410fad1f054e9216114087a3e01527a0/gguf-py/gguf/tensor_mapping.py),
-and the `mlx-vlm==0.7.6` loader/vision implementations exercised by the native tests.
+and the `mlx-vlm==0.7.10` loader/vision implementations exercised by the native tests.

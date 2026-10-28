@@ -45,7 +45,7 @@ import numpy as np
 
 from .quantize.gguf_codes import PRESERVE_INEXACT_TOLERANCE, PRESERVE_TOLERANCE
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 REPORT_NAME = "conversion_report.json"
 
 # A relative L2 error larger than these is not rounding: it means values changed
@@ -268,9 +268,11 @@ def audit_weights(
     """Compare written tensors against an independent decode of the source.
 
     ``layout`` maps output tensor name to ``{"source": <gguf name>, "layout":
-    "identity"|"transformed"}`` as recorded by the conversion pass. Only
-    ``identity`` tensors can be compared position-wise; the rest are counted so
-    the report never pretends to have checked more than it did.
+    "identity"|"reshaped"|"transformed"}`` as recorded by the conversion pass.
+    Only ``identity`` and ``reshaped`` tensors can be compared position-wise --
+    the latter after restoring the source shape, which proves the values were
+    re-indexed rather than changed. Everything else is counted so the report
+    never pretends to have checked more than it did.
     """
     by_source = {tensor.name: tensor for tensor in reader.tensors}
     shards = _ShardReader(output_dir)
@@ -286,7 +288,8 @@ def audit_weights(
     try:
         for name, meta in sorted(layout.items()):
             source = meta.get("source", "")
-            if meta.get("layout") != "identity":
+            kind = meta.get("layout")
+            if kind not in ("identity", "reshaped"):
                 skipped["transformed"] += 1
                 continue
             tensor = by_source.get(source)
@@ -302,6 +305,13 @@ def audit_weights(
                 skipped["unreadable"] += 1
                 mismatches.append(name)
                 continue
+
+            if kind == "reshaped" and reference.shape != stored.shape:
+                if reference.size != stored.size:
+                    mismatches.append(name)
+                    skipped["layout_mismatch"] += 1
+                    continue
+                reference = reference.reshape(stored.shape)
 
             if reference.shape != stored.shape:
                 # The plan claims this tensor was written through unchanged, so a
@@ -582,6 +592,7 @@ def build_report(
     module_bits: dict[str, int] | None = None,
     preserve_size: dict[str, Any] | None = None,
     preserve_fallback: str = "6bit",
+    source_tensors_without_output: Iterable[dict[str, str]] = (),
 ) -> dict[str, Any]:
     """Assemble the JSON payload written next to every conversion."""
     weight_gate = evaluate_weight_gate(
@@ -613,6 +624,7 @@ def build_report(
             },
         },
         "gates": {"weight": weight_gate["status"]},
+        "source_tensors_without_output": list(source_tensors_without_output),
     }
     if layout:
         # The audit plan, kept so `gguf2mlx verify --model-dir ... --weights` can

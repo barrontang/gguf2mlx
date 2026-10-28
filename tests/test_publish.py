@@ -265,6 +265,42 @@ def test_model_card_is_retagged_and_credits_the_source():
     assert card.text.endswith("Upstream card body.")
 
 
+def test_model_card_has_reproducible_conversion_metadata():
+    card = SimpleNamespace(
+        data=SimpleNamespace(tags=["gguf"], library_name=None, base_model=None),
+        text="Upstream body.",
+    )
+    publishing.update_model_card(
+        card,
+        source_repo="owner/model-GGUF",
+        source_revision="abc123",
+        precision="affine-4bit-group64",
+        tags={"quantized", "4-bit"},
+        base_model_relation="quantized",
+        disk_size=1234,
+        conversion_command="gguf2mlx publish --source owner/model-GGUF",
+        destination="owner/model-4bit",
+        source_gguf="weights/model.gguf",
+        gguf_sha256="a" * 64,
+        gguf_bytes=4321,
+        conversion_report={
+            "fidelity": {"weight": {"status": "pass", "tensors_compared": 12,
+                                     "max_relative_l2": 0.0001}},
+            "preserve": {"gate": "pass", "tensors_compared": 8},
+        },
+    )
+    assert card.data.base_model_relation == "quantized"
+    assert card.data.source_sha == "abc123"
+    assert card.data.disk_size == 1234
+    assert {"4-bit", "gguf2mlx", "mlx", "quantized"} <= set(card.data.tags)
+    assert "| GGUF SHA-256 | `" + "a" * 64 + "` |" in card.text
+    assert "| Weight gate | `pass` (12 tensors" in card.text
+    assert "| Preserve gate | `pass` (8 tensors) |" in card.text
+    assert "gguf2mlx publish --source owner/model-GGUF" in card.text
+    assert "from mlx_lm import generate, load" in card.text
+    assert "owner/model-4bit" in card.text
+
+
 def test_license_files_are_copied_and_others_ignored(tmp_path):
     blobs = {
         "LICENSE": b"apache",
@@ -338,7 +374,9 @@ def test_publish_end_to_end_merges_shards_and_records_provenance(tmp_path):
     card = uploaded["README.md"].decode()
     assert card.startswith("# MLX conversion")
     assert "owner/model-GGUF@immutable-source-commit" in card
-    assert hub.card.data.tags == ["gguf2mlx", "mlx", "text-generation"]
+    assert {"gguf2mlx", "mlx", "text-generation"} <= set(hub.card.data.tags)
+    assert "gguf" not in {tag.lower() for tag in hub.card.data.tags}
+    assert hub.card.data.tags == sorted(set(hub.card.data.tags))
 
     # The staging tree is temporary: nothing may survive a successful publish.
     leftovers = [path for path in (tmp_path / "work").iterdir()] if (tmp_path / "work").exists() else []
@@ -398,6 +436,9 @@ def test_publish_preserve_implies_direct_quant_without_requantizing(tmp_path):
     assert seen["quant_source"] == "preserve"
     assert seen["quantize"] is True and seen["direct_quant"] is True
     assert result.provenance["precision"] == "gguf-preserved-float16"
+    # Preserved artifacts mix source widths, so no single "N-bit" tag applies.
+    assert "gguf-preserved" in hub.card.data.tags
+    assert not [tag for tag in hub.card.data.tags if tag.endswith("-bit")]
 
 
 def test_publish_never_creates_a_repo_when_conversion_fails(tmp_path):
@@ -434,6 +475,136 @@ def test_publish_rejects_a_conversion_without_weights(tmp_path):
             convert_fn=empty_convert,
         )
     assert not hub.creates
+
+
+def test_publish_dry_run_never_writes_the_destination(tmp_path):
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+
+    result = publishing.publish(
+        "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub, dry_run=True,
+    )
+
+    assert result.dry_run is True
+    assert result.commit_url == ""
+    assert result.files
+    assert not hub.creates
+    assert not hub.uploads
+    assert "create" not in hub.events and "upload" not in hub.events
+
+
+def test_verify_load_runs_before_repo_creation(tmp_path):
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+    loaded = {}
+
+    def load_model(path):
+        assert (Path(path) / "config.json").is_file()
+        loaded["path"] = path
+        hub.events.append("load")
+        return object(), object()
+
+    result = publishing.publish(
+        "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+        verify_load=True, load_fn=load_model,
+    )
+
+    assert loaded["path"]
+    assert result.verified_load is True
+    assert hub.events[-3:] == ["load", "create", "upload"]
+
+
+def test_failed_load_verification_blocks_destination_writes(tmp_path):
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+
+    def broken_load(path):
+        raise RuntimeError("layout mismatch")
+
+    with pytest.raises(publishing.PublishError, match="layout mismatch"):
+        publishing.publish(
+            "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+            verify_load=True, load_fn=broken_load,
+        )
+    assert not hub.creates
+    assert not hub.uploads
+
+
+def test_verify_load_treats_a_non_finite_forward_pass_as_failure(tmp_path):
+    """``fidelity.load_and_run`` reports rather than raises; its verdict gates too."""
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+
+    def non_finite(path):
+        return {
+            "status": "fail",
+            "gated": True,
+            "stage": "forward",
+            "logits_finite": False,
+            "error": "forward pass produced non-finite logits",
+        }
+
+    with pytest.raises(publishing.PublishError, match=r"\(forward\).*non-finite"):
+        publishing.publish(
+            "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+            verify_load=True, load_fn=non_finite,
+        )
+    assert not hub.creates
+    assert not hub.uploads
+
+
+def test_verify_load_fails_when_the_mlx_runtime_is_missing(tmp_path):
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+
+    def unavailable(path):
+        return {
+            "status": "unavailable",
+            "gated": False,
+            "error": "mlx_lm is not installed: no module named 'mlx_lm'",
+        }
+
+    with pytest.raises(publishing.PublishError, match="mlx_lm is not installed"):
+        publishing.publish(
+            "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+            verify_load=True, load_fn=unavailable,
+        )
+    assert not hub.creates
+
+
+def test_publish_streams_downloaded_gguf_without_read_bytes(tmp_path, monkeypatch):
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+    real_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path):
+        if path.suffix == ".gguf":
+            raise AssertionError("publish must not buffer a GGUF with read_bytes()")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    publishing.publish(
+        "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+    )
+    assert hub.uploads
 
 
 def test_publish_refuses_a_partial_shard_set_before_downloading(tmp_path):
@@ -520,6 +691,8 @@ def test_cli_publish_forwards_options(monkeypatch, capsys):
             files=["config.json", "model.safetensors"],
             shards=["weights/model.gguf"],
             provenance={"gguf2mlx_version": "9.9.9"},
+            dry_run=kwargs["dry_run"],
+            verified_load=kwargs["verify_load"],
         )
 
     monkeypatch.setattr(publishing, "publish", fake_publish)
@@ -536,9 +709,37 @@ def test_cli_publish_forwards_options(monkeypatch, capsys):
     assert recorded["quant_source"] == "requant"
     assert recorded["dtype"] == "float16"
     assert recorded["token"] is None
+    assert recorded["dry_run"] is False
+    assert recorded["verify_load"] is False
     out = capsys.readouterr().out
     assert "Published owner/dst" in out
     assert "https://huggingface.co/commit/example" in out
+
+
+def test_cli_publish_dry_run_and_verify_load(monkeypatch, capsys):
+    from gguf2mlx import gguf2mlx as core
+
+    recorded = {}
+
+    def fake_publish(source, gguf, dest, **kwargs):
+        recorded.update(kwargs)
+        return SimpleNamespace(
+            destination=dest, commit_url="", files=["config.json", "model.safetensors"],
+            shards=["weights/model.gguf"], provenance={"gguf2mlx_version": "9.9.9"},
+            dry_run=True, verified_load=True,
+        )
+
+    monkeypatch.setattr(publishing, "publish", fake_publish)
+    core.main([
+        "publish", "--source", "owner/src", "--gguf", "m.gguf",
+        "--dest", "owner/dst", "--dry-run", "--verify-load",
+    ])
+    assert recorded["dry_run"] is True
+    assert recorded["verify_load"] is True
+    out = capsys.readouterr().out
+    assert "Dry run complete for owner/dst" in out
+    assert "runtime load check passed" in out
+    assert "Published" not in out
 
 
 def test_cli_publish_falls_back_to_the_hub_token(monkeypatch):

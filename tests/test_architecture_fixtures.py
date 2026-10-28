@@ -506,6 +506,10 @@ def test_qwen3_dense_and_qwen35_family_mappings_and_configuration():
     assert core._map_tensor_name("blk.0.ssm_beta.weight", "qwen35") == (
         "model.layers.0.linear_attn.in_proj_b.weight"
     )
+    # llama.cpp spells Qwen3.5's post-attention norm `post_attention_norm`.
+    assert core._map_tensor_name("blk.0.post_attention_norm.weight", "qwen35") == (
+        "model.layers.0.post_attention_layernorm.weight"
+    )
     assert core._map_tensor_name("blk.0.attn_q.weight", "qwen3.6") == (
         "model.layers.0.self_attn.q_proj.weight"
     )
@@ -537,19 +541,70 @@ def test_qwen3_dense_and_qwen35_family_mappings_and_configuration():
     assert config["full_attention_interval"] == 4
 
 
+@pytest.mark.parametrize("separate_output", [False, True])
+def test_qwen35_ties_embeddings_from_the_tensor_list(separate_output):
+    """Qwen3.5-0.8B ships no ``output.weight`` and is tied upstream.
+
+    Forcing ``tie_word_embeddings: false`` made mlx-lm build an ``lm_head`` the
+    artifact does not contain, so the real checkpoint failed to load with
+    "Missing 1 parameters: language_model.lm_head.weight".
+    """
+    metadata = {
+        "qwen35.vocab_size": 32,
+        "qwen35.embedding_length": 16,
+        "qwen35.block_count": 4,
+        "qwen35.attention.head_count": 4,
+        "qwen35.attention.head_count_kv": 2,
+        "qwen35.attention.key_length": 4,
+        "qwen35.feed_forward_length": 32,
+        "qwen35.context_length": 128,
+        "qwen35.ssm.group_count": 2,
+        "qwen35.ssm.time_step_rank": 2,
+        "qwen35.ssm.state_size": 8,
+        "qwen35.ssm.inner_size": 16,
+        "qwen35.ssm.conv_kernel": 4,
+        "qwen35.full_attention_interval": 4,
+    }
+    tensors = ["token_embd.weight", "blk.0.attn_norm.weight"]
+    if separate_output:
+        tensors.append("output.weight")
+
+    config = core.build_config(_FakeReader(metadata, tensors), "qwen35")
+
+    assert config["tie_word_embeddings"] is not separate_output
+    assert config["model_type"] == "qwen3_5"
+
+
 def test_qwen35_restores_exported_gated_delta_parameters():
+    """llama.cpp stores ``-exp(A_log)`` and a squeezed kernel; both are undone.
+
+    The tensor names are the real per-layer ones: keying the restore on a bare
+    ``ssm_a`` silently skipped every layer of every real checkpoint.
+    """
     source = np.array([-np.e, -np.e**2], dtype=np.float32)
 
     np.testing.assert_allclose(
-        core._restore_architecture_tensor("ssm_a", source, "qwen35"),
+        core._restore_architecture_tensor("blk.0.ssm_a", source, "qwen35"),
         np.array([1.0, 2.0], dtype=np.float32),
     )
-    np.testing.assert_array_equal(
+
+    # The gated norm is stored unshifted -- llama.cpp skips its `+1` centering
+    # for `linear_attn.norm.weight` -- so it must survive untouched.
+    norm = np.array([1.25, 0.5], dtype=np.float16)
+    assert core._restore_architecture_tensor("blk.0.ssm_norm.weight", norm, "qwen35") is norm
+
+    kernel = np.arange(12, dtype=np.float32).reshape(3, 4)
+    restored = core._restore_architecture_tensor("blk.0.ssm_conv1d.weight", kernel, "qwen35")
+    assert restored.shape == (3, 4, 1)
+    np.testing.assert_array_equal(restored[..., 0], kernel)
+    assert core._restore_layout("blk.0.ssm_conv1d.weight", "qwen35") == "reshaped"
+    assert core._restore_layout("blk.0.ssm_a", "qwen35") == "identity"
+
+    # A decay table that is not strictly negative cannot be a `-exp` image.
+    with pytest.raises(ValueError, match="finite negative"):
         core._restore_architecture_tensor(
-            "blk.0.ssm_norm.weight", np.array([1.25], dtype=np.float16), "qwen35"
-        ),
-        np.array([0.25], dtype=np.float16),
-    )
+            "blk.0.ssm_a", np.array([1.0], dtype=np.float32), "qwen35"
+        )
 
 
 def test_qwen3_dense_adapters_reject_expert_tensors():

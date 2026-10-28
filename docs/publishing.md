@@ -29,13 +29,47 @@ What it does, in order (all validation happens before the first network call):
    **a partial set is an error naming the missing indices**, because split
    GGUFs are byte slices of one file and a missing shard would publish a
    truncated model;
-4. downloads every shard, concatenates them back into one GGUF, converts it;
+4. downloads every shard and streams it into the merged GGUF in fixed-size
+   chunks, so peak memory is one buffer rather than one shard, then converts it;
 5. writes `gguf2mlx-provenance.json` (source repo, resolved commit, shard list,
-   GGUF SHA-256 and size, precision, converter version, quant source);
-6. rewrites the model card (`library_name: mlx`, `base_model: <source>`, `mlx`
-   and `gguf2mlx` tags) and copies `LICENSE`/`NOTICE`/`COPYING` files;
+   GGUF SHA-256 and size, precision, converter version, quant source, output
+   size, and the exact reproduce command);
+6. rewrites the model card: `library_name: mlx`, `base_model: <source>`,
+   `base_model_relation: quantized` when requantized, `disk_size`, the `mlx`
+   and `gguf2mlx` tags plus the artifact's dtype/precision tags, a conversion
+   table (source GGUF, SHA-256, byte counts, weight and preserve gate results),
+   a reproduce command, and a usage snippet — then copies
+   `LICENSE`/`NOTICE`/`COPYING` files;
 7. creates the destination repository and uploads the folder — but only after
    conversion produced `config.json` and at least one safetensors shard.
+
+### Dry runs and load verification
+
+Two flags make a publish reviewable before it becomes visible:
+
+```bash
+# Everything except the destination write: resolve, download, convert, and
+# build the card + provenance in the work tree, then report and exit.
+gguf2mlx publish --source ... --gguf ... --dest ... --dry-run
+
+# Load the converted directory with mlx-lm and run one forward pass before the
+# destination repo exists, so a layout defect fails the run instead of
+# publishing an unloadable model.
+gguf2mlx publish --source ... --gguf ... --dest ... --verify-load
+```
+
+`--dry-run` never calls `create_repo` or `upload_folder`. `--verify-load` runs
+before either, so a failed load leaves the destination untouched. Both are
+recorded on the result (`dry_run`, `verified_load`), and `--dry-run` is the only
+way to inspect the finished card without publishing.
+
+`--verify-load` delegates to the same check the release gate uses
+(`fidelity.load_and_run`): it loads the artifact, runs a single forward pass,
+and requires finite logits. That is deliberately stricter than loading alone —
+a tensor with the right name and shape but the wrong layout loads cleanly and
+still produces garbage. A missing runtime counts as a failure rather than a
+skip, because the flag was asked for explicitly. It requires MLX on Apple
+Silicon.
 
 `--quantize` enables lossy affine 4-bit (requires MLX, so Apple Silicon).
 `--quant-source preserve` keeps the source GGUF blocks instead of quantizing
@@ -43,8 +77,8 @@ from scratch: codes are copied verbatim, except for `Q6_K`, whose 16-value
 scales do not fit MLX's 32-value grid and are re-fitted at the same width (see
 the [quality gates](quality-gates.md#preserve-tier)); it still needs the
 result to be loadable by `mlx-lm`, so it is limited to `llama`, `qwen2`,
-`qwen3` and `mistral`. `--keep-work-dir` leaves the temporary tree in place for
-debugging.
+`qwen3`, `mistral`, and the Qwen3.5 family (`qwen35` and its aliases).
+`--keep-work-dir` leaves the temporary tree in place for debugging.
 
 Environment: `HF_TOKEN` is read when `--token` is absent. `--work-dir` moves the
 temporary download/convert tree (defaults to the system temp directory).

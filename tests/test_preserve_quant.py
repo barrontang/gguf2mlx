@@ -12,7 +12,7 @@ from safetensors import safe_open
 
 from gguf2mlx import fidelity, gguf2mlx
 from gguf2mlx.quantize import gguf_codes
-from tests.quant_fixtures import DEFAULT_DIMS, write_llama_gguf
+from tests.quant_fixtures import DEFAULT_DIMS, write_llama_gguf, write_qwen35_gguf
 
 
 @pytest.fixture(scope="module")
@@ -222,6 +222,72 @@ def test_unknown_fallback_is_rejected(source_gguf, tmp_path, capsys):
 @pytest.mark.parametrize("arch", ["llama", "qwen2", "qwen3", "mistral"])
 def test_preserve_is_supported_for_the_documented_architectures(tmp_path, arch):
     source = write_llama_gguf(tmp_path / f"{arch}.gguf", arch=arch, seed=11)
+    destination = tmp_path / "out"
+
+    assert _convert(source, destination, quant_source="preserve") is True
+    assert _report(destination)["preserve"]["gate"] == "pass"
+
+
+def test_preserve_reuses_qwen35_projection_codes_and_keeps_ssm_vectors_float(tmp_path):
+    source = write_qwen35_gguf(tmp_path / "qwen35.gguf")
+    destination = tmp_path / "out"
+
+    assert _convert(source, destination, quant_source="preserve") is True
+    report = _report(destination)
+    preserve = report["preserve"]
+    assert preserve["gate"] == "pass"
+    # The float fallbacks must still audit clean: keep-in-float is not a licence
+    # to shift values, so A_log is the only tensor the plan expects to change.
+    assert report["gates"]["weight"] == "pass"
+    assert preserve["preserved_by_qtype"]["Q4_K"] > 0
+    assert preserve["preserved_by_qtype"]["Q8_0"] == 1
+    # SSM scalars and the depthwise convolution have no affine matrix form.
+    assert preserve["kept_float16"]["counts"] == {
+        "F32_has_no_affine_reexpression": 7,
+    }
+
+    plan = preserve["plan"]
+    assert plan["model.layers.0.linear_attn.in_proj_qkv.weight"]["rows"] == "identity"
+    assert plan["model.layers.0.linear_attn.in_proj_b.weight"]["bits"] == 4
+    assert plan["model.layers.0.linear_attn.in_proj_a.weight"]["bits"] == 4
+    assert "model.layers.0.linear_attn.A_log" not in plan
+    assert "model.layers.0.linear_attn.conv1d.weight" not in plan
+
+    layout = report["tensor_layout"]
+    assert layout["model.layers.0.linear_attn.A_log"]["layout"] == "transformed"
+    assert layout["model.layers.0.linear_attn.conv1d.weight"]["layout"] == "reshaped"
+    assert layout["model.layers.0.linear_attn.norm.weight"]["layout"] == "identity"
+
+    # A_log is log(-ssm_a) and the squeezed kernel gains MLX's trailing axis;
+    # the norms are *not* offset (llama.cpp skips its +1 centering here).
+    source_tensors = {t.name: fidelity.reference_tensor(t) for t in GGUFReader(str(source)).tensors}
+    with safe_open(str(next(destination.glob("*.safetensors"))), framework="np") as handle:
+        a_log = handle.get_tensor("model.layers.0.linear_attn.A_log")
+        conv1d = handle.get_tensor("model.layers.0.linear_attn.conv1d.weight")
+        norm = handle.get_tensor("model.layers.0.linear_attn.norm.weight")
+
+    ssm_a = source_tensors["blk.0.ssm_a"]
+    assert np.all(ssm_a < 0)  # GGUF stores -exp(A_log)
+    assert np.allclose(a_log, np.log(-ssm_a), atol=1e-3)
+    assert conv1d.shape == (768, 4, 1)
+    assert np.allclose(conv1d[..., 0], source_tensors["blk.0.ssm_conv1d.weight"], atol=1e-3)
+    assert np.allclose(norm, source_tensors["blk.0.ssm_norm.weight"], atol=1e-3)
+
+    quantization = json.loads((destination / "config.json").read_text())["quantization"]
+    assert quantization["bits"] == 4 and quantization["group_size"] == 32
+    assert quantization["model.layers.0.mlp.up_proj"]["bits"] == 8
+    # Neither the gated norm nor any SSM state vector may be quantized.
+    assert not [
+        key
+        for key in quantization
+        if "conv1d" in key or "A_log" in key or "dt_bias" in key or "norm" in key
+    ]
+
+
+
+@pytest.mark.parametrize("arch", ["qwen36", "qwen38"])
+def test_preserve_accepts_qwen35_alias_architectures(tmp_path, arch):
+    source = write_qwen35_gguf(tmp_path / f"{arch}.gguf", arch=arch)
     destination = tmp_path / "out"
 
     assert _convert(source, destination, quant_source="preserve") is True

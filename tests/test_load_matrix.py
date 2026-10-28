@@ -78,6 +78,7 @@ def test_matrix_entries_are_complete_and_unique():
         assert not missing, f"{entry.get('filename')} is missing {sorted(missing)}"
         assert len(entry["sha256"]) == 64, f"{entry['filename']} has a truncated sha256"
         assert entry["filename"].endswith(".gguf")
+        assert entry.get("quant_source", "requant") in {"requant", "preserve"}
         key = (entry["arch"], entry["qtype"])
         assert key not in seen, f"duplicate matrix entry for {key}"
         seen.add(key)
@@ -121,7 +122,6 @@ DECLARED_COVERAGE_GAPS: dict[str, str] = {
     "qwen2_vl": "needs the matching HF repo beside the GGUF; vision.yml owns that path",
     "qwen2moe": "MoE; weekly-moe.yml exercises two families, not this matrix",
     "qwen3_vl": "needs the matching HF repo beside the GGUF; vision.yml owns that path",
-    "qwen35": "hybrid adapter, fixture-tested; no small pinned GGUF yet",
     "qwen36": "hybrid adapter, fixture-tested; no small pinned GGUF yet",
     "qwen38": "hybrid adapter, fixture-tested; no small pinned GGUF yet",
     "qwen3moe": "MoE; weekly-moe.yml exercises two families, not this matrix",
@@ -177,8 +177,10 @@ def test_converted_model_loads_and_runs(entry, tmp_path):
     )
 
     output = tmp_path / "converted"
+    preserve = entry.get("quant_source") == "preserve"
     try:
-        assert core.convert(str(source), str(output)) is True
+        options = {"quant_source": "preserve"} if preserve else {}
+        assert core.convert(str(source), str(output), **options) is True
 
         report = json.loads((output / fidelity.REPORT_NAME).read_text())
         weight = report["fidelity"]["weight"]
@@ -187,6 +189,12 @@ def test_converted_model_loads_and_runs(entry, tmp_path):
             f"(max relative L2 {weight['max_relative_l2']})"
         )
         assert weight["tensors_compared"] > 0
+        if preserve:
+            preserved = report["preserve"]
+            assert preserved["gate"] == "pass", preserved["gate"]
+            assert preserved["tiers"]["exact"]["max_relative_l2"] <= 1e-3
+            assert preserved["size"]["ratio"] <= 1.1, preserved["size"]
+            assert preserved["preserved_by_qtype"], preserved
 
         result = fidelity.load_and_run(output)
         assert result["status"] == "pass", result

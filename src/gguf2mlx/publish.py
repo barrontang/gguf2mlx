@@ -33,6 +33,7 @@ import hashlib
 import importlib.metadata
 import json
 import re
+import shlex
 import shutil
 import tempfile
 from collections.abc import Callable, Iterable, Sequence
@@ -47,6 +48,7 @@ __all__ = [
     "PublishError",
     "PublishResult",
     "build_provenance",
+    "copy_file_stream",
     "copy_license_files",
     "discover_shards",
     "merge_shards",
@@ -183,6 +185,14 @@ def discover_shards(
     return expected
 
 
+def copy_file_stream(source: Path, target: Path) -> int:
+    """Copy a file with bounded memory and return the byte count written."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with Path(source).open("rb") as reader, target.open("wb") as writer:
+        shutil.copyfileobj(reader, writer, COPY_CHUNK)
+    return target.stat().st_size
+
+
 def merge_shards(paths: Sequence[Path], target: Path) -> int:
     """Concatenate shard files into one GGUF and return its size in bytes.
 
@@ -276,20 +286,74 @@ def update_model_card(
     source_repo: str,
     source_revision: str,
     precision: str,
+    tags: Iterable[str] = (),
+    base_model_relation: str | None = None,
+    disk_size: int | None = None,
+    conversion_command: str | None = None,
+    destination: str | None = None,
+    source_gguf: str | None = None,
+    gguf_sha256: str | None = None,
+    gguf_bytes: int | None = None,
+    conversion_report: dict[str, Any] | None = None,
 ) -> Any:
     """Tag the upstream model card as an MLX conversion and prepend a notice."""
     card.data.library_name = "mlx"
     card.data.base_model = source_repo
+    card.data.source_sha = source_revision
+    if base_model_relation is not None:
+        card.data.base_model_relation = base_model_relation
+    if disk_size is not None:
+        card.data.disk_size = disk_size
     card.data.tags = sorted(
-        (set(card.data.tags or []) - {"gguf", "GGUF"}) | {"mlx", "gguf2mlx"}
+        (set(card.data.tags or []) - {"gguf", "GGUF"})
+        | {"mlx", "gguf2mlx"}
+        | set(tags)
     )
+    details = ""
+    rows = ["| Property | Value |", "|---|---|", f"| Precision | `{precision}` |"]
+    if source_gguf is not None:
+        rows.append(f"| Source GGUF | `{source_gguf}` |")
+    if gguf_bytes is not None:
+        rows.append(f"| GGUF bytes | {gguf_bytes:,} |")
+    if gguf_sha256 is not None:
+        rows.append(f"| GGUF SHA-256 | `{gguf_sha256}` |")
+    if disk_size is not None:
+        rows.append(f"| Converted bytes | {disk_size:,} |")
+    if conversion_report:
+        weight = (conversion_report.get("fidelity") or {}).get("weight") or {}
+        preserve = conversion_report.get("preserve") or {}
+        if weight.get("status"):
+            rows.append(
+                f"| Weight gate | `{weight['status']}` "
+                f"({weight.get('tensors_compared', 0)} tensors, max relative L2 "
+                f"{weight.get('max_relative_l2')}) |"
+            )
+        if preserve.get("gate"):
+            rows.append(
+                f"| Preserve gate | `{preserve['gate']}` "
+                f"({preserve.get('tensors_compared', 0)} tensors) |"
+            )
+    details += "\n## Conversion details\n\n" + "\n".join(rows) + "\n"
+    if conversion_command is not None:
+        details += (
+            "\n## Reproduce this conversion\n\n"
+            f"```bash\n{conversion_command}\n```\n"
+        )
+    if destination is not None:
+        details += (
+            "\n## Load with MLX-LM\n\n"
+            "```python\nfrom mlx_lm import generate, load\n\n"
+            f"model, tokenizer = load({destination!r})\n"
+            'print(generate(model, tokenizer, prompt="Hello", max_tokens=32))\n```\n'
+        )
     card.text = (
         "# MLX conversion\n\n"
         f"Converted from `{source_repo}@{source_revision}` using gguf2mlx "
         f"({precision}). See `{PROVENANCE_NAME}` for the exact source commit "
         "and precision. Conversion cannot recover precision lost in the GGUF "
-        "source.\n\n"
-        "## Original source model card\n\n" + (card.text or "")
+        f"source.\n{details}\n"
+        "## Original source model card\n\n"
+        + (card.text or "")
     )
     return card
 
@@ -311,9 +375,7 @@ def copy_license_files(
         if relative.is_absolute() or ".." in relative.parts:
             continue
         source = Path(download(filename))
-        target = output_dir / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(source.read_bytes())
+        copy_file_stream(source, output_dir / relative)
         copied.append(str(relative))
     return sorted(copied)
 
@@ -391,6 +453,8 @@ class PublishResult:
     files: list[str] = field(default_factory=list)
     licenses: list[str] = field(default_factory=list)
     commit_message: str = ""
+    dry_run: bool = False
+    verified_load: bool = False
 
 
 def sha256_file(path: Path) -> str:
@@ -427,6 +491,23 @@ def _default_convert() -> Callable[..., bool]:
     return convert
 
 
+def _default_load() -> Callable[[str], Any]:
+    """Verify with the same load-and-forward check the release gate uses.
+
+    Loading alone catches missing or unexpected tensors, but a tensor with the
+    wrong layout can load cleanly and still produce garbage. Reusing
+    ``fidelity.load_and_run`` means a publish-time check and a CI gate agree on
+    what "loadable" means, down to the finite-logits requirement.
+    """
+
+    def load(path: str) -> Any:
+        from gguf2mlx import fidelity
+
+        return fidelity.load_and_run(path)
+
+    return load
+
+
 def publish(
     source: str,
     gguf: str,
@@ -445,12 +526,18 @@ def publish(
     hub: Any = None,
     convert_fn: Callable[..., bool] | None = None,
     keep_work_dir: bool = False,
+    dry_run: bool = False,
+    verify_load: bool = False,
+    load_fn: Callable[[str], Any] | None = None,
 ) -> PublishResult:
     """Convert ``gguf`` from ``source`` and publish the result to ``dest``.
 
     All validation happens before the first network call. The destination is
     only created once conversion produced ``config.json`` and at least one
     safetensors shard, so a failed run never leaves a half-published repo.
+    ``dry_run`` prepares the same local artifact but skips both destination
+    writes. ``verify_load`` additionally loads that artifact with ``load_fn``
+    (or ``mlx_lm.load``) before any destination write.
     """
     validate_repo_id(source)
     validate_repo_id(dest)
@@ -489,7 +576,8 @@ def publish(
         local_shards: list[Path] = []
         for shard in shards:
             local = downloads / PurePosixPath(shard).name
-            local.write_bytes(client.download(source, shard, revision).read_bytes())
+            downloaded = client.download(source, shard, revision)
+            copy_file_stream(Path(downloaded), local)
             local_shards.append(local)
 
         if len(local_shards) == 1:
@@ -524,6 +612,25 @@ def publish(
         ):
             raise PublishError("conversion did not produce an MLX model directory")
 
+        disk_size = sum((output / name).stat().st_size for name in produced)
+        command = [
+            "gguf2mlx", "publish",
+            "--source", source,
+            "--gguf", gguf,
+            "--dest", dest,
+            "--source-revision", source_revision,
+            "--quant-source", quant_source,
+            "--q-mode", q_mode,
+            "--dtype", dtype,
+        ]
+        if not private:
+            command.append("--no-private")
+        if quantize:
+            command.extend(["--quantize", "--q-bits", str(q_bits)])
+        if q_group_size is not None:
+            command.extend(["--q-group-size", str(q_group_size)])
+        conversion_command = shlex.join(command)
+
         provenance = build_provenance(
             source_repo=source,
             source_revision=revision,
@@ -536,15 +643,40 @@ def publish(
                 "source_revision_requested": source_revision,
                 "quant_source": quant_source,
                 "dtype": dtype,
+                "output_bytes": disk_size,
+                "conversion_command": conversion_command,
             },
         )
         (output / PROVENANCE_NAME).write_text(
             json.dumps(provenance, indent=2) + "\n", encoding="utf-8"
         )
 
+        card_tags = {dtype, precision}
+        if quant_source == "preserve":
+            # Preserved artifacts keep several source widths at once, so a
+            # single "N-bit" tag would be wrong.
+            card_tags.update({"quantized", "gguf-preserved"})
+        elif wants_quant:
+            card_tags.update({"quantized", f"{q_bits}-bit"})
         card = client.load_model_card(client.download(source, CARD_NAME, revision))
         update_model_card(
-            card, source_repo=source, source_revision=revision, precision=precision
+            card,
+            source_repo=source,
+            source_revision=revision,
+            precision=precision,
+            tags=card_tags,
+            base_model_relation="quantized" if wants_quant else None,
+            disk_size=disk_size,
+            conversion_command=conversion_command,
+            destination=dest,
+            source_gguf=gguf,
+            gguf_sha256=provenance["gguf_sha256"],
+            gguf_bytes=provenance["gguf_bytes"],
+            conversion_report=json.loads(
+                (output / "conversion_report.json").read_text(encoding="utf-8")
+            )
+            if (output / "conversion_report.json").is_file()
+            else None,
         )
         card.save(output / CARD_NAME)
 
@@ -554,9 +686,30 @@ def publish(
             output_dir=output,
         )
 
-        client.create_repo(dest, private=private)
+        if verify_load:
+            loader = load_fn or _default_load()
+            try:
+                loaded = loader(str(output))
+            except Exception as error:
+                raise PublishError(f"load verification failed for {dest}: {error}") from error
+            if isinstance(loaded, dict):
+                # ``fidelity.load_and_run`` reports instead of raising, so a
+                # missing runtime and a bad layout are told apart by ``stage``.
+                if loaded.get("status") != "pass":
+                    stage = loaded.get("stage")
+                    detail = loaded.get("error") or loaded.get("status")
+                    where = f" ({stage})" if stage else ""
+                    raise PublishError(
+                        f"load verification failed for {dest}{where}: {detail}"
+                    )
+            elif loaded is None:
+                raise PublishError(f"load verification failed for {dest}: loader returned no model")
+
         message = f"Convert {source}@{revision} GGUF to MLX"
-        commit_url = client.upload_folder(dest, output, message)
+        commit_url = ""
+        if not dry_run:
+            client.create_repo(dest, private=private)
+            commit_url = client.upload_folder(dest, output, message)
         files = sorted(
             path.relative_to(output).as_posix()
             for path in output.rglob("*")
@@ -570,6 +723,8 @@ def publish(
             files=files,
             licenses=licenses,
             commit_message=message,
+            dry_run=dry_run,
+            verified_load=verify_load,
         )
     finally:
         cleanup()

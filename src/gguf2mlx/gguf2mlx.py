@@ -287,6 +287,38 @@ QWEN35_ARCHES = {
     "qwen35", "qwen3_5", "qwen3.5", "qwen36", "qwen3_6", "qwen3.6",
     "qwen38", "qwen3_8", "qwen3.8",
 }
+
+# Qwen tokenizers have no normalizer: BPE runs straight on the raw text after a
+# GPT-2-style regex split. Every Qwen architecture must be in this set, because
+# the default for anything else is NFC -- which silently rewrites some inputs
+# before they reach the vocabulary.
+QWEN_FAMILY_ARCHES = {
+    "qwen2",
+    "qwen3",
+    "qwen2moe",
+    "qwen3moe",
+    *QWEN35_ARCHES,
+    *QWEN_VL_TEXT_ARCHES,
+}
+
+# Values of ``tokenizer.ggml.pre`` that select that same Qwen pre-tokenizer.
+# llama.cpp names the hybrid family ``qwen35`` while Qwen2/2.5/3 report
+# ``qwen2``; an unlisted value falls through to "legacy BPE splitting" with a
+# warning, so the alias spellings are listed rather than inferred.
+QWEN_PRE_TOKENIZERS = {
+    "qwen2",
+    "qwen2.5-coder",
+    "qwen3",
+    "qwen35",
+    "qwen3.5",
+    "qwen3_5",
+    "qwen36",
+    "qwen3.6",
+    "qwen3_6",
+    "qwen38",
+    "qwen3.8",
+    "qwen3_8",
+}
 GEMMA_ARCHES = {"gemma", "gemma2", "gemma3", "gemma4"}
 PHI_ARCHES = {"phi3", "phi4"}
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
@@ -1144,7 +1176,10 @@ def build_config(
         config["model_type"] = "qwen3_5"
         config["architectures"] = ["Qwen3_5ForCausalLM"]
         config["attention_bias"] = False
-        config["tie_word_embeddings"] = False
+        # Tie/untie follows the tensor list: Qwen3.5-0.8B ships no `output.weight`
+        # and `tie_word_embeddings: true` upstream. Forcing False here made mlx-lm
+        # create an lm_head the artifact does not have, so loading failed with
+        # "Missing 1 parameters: language_model.lm_head.weight".
         config["head_dim"] = (
             get_metadata_int(reader, f"{arch}.attention.key_length")
             or hidden_size // num_heads
@@ -1450,13 +1485,48 @@ def _restore_architecture_tensor(gguf_name: str, arr: np.ndarray, arch: str) -> 
     ):
         return cast(np.ndarray, arr - np.array(1, dtype=arr.dtype))
     if arch in QWEN35_ARCHES:
-        if gguf_name == "ssm_a":
+        # llama.cpp exports `A_log` as `-exp(A_log)` and stores the depthwise
+        # convolution squeezed to 2-D. Both must be undone or the runtime sees a
+        # negative decay table where it expects a log and a 2-D kernel where
+        # MLX's Conv1d expects (channels, kernel, in_per_group).
+        #
+        # The norms are *not* offset: llama.cpp skips its `+1` centering for
+        # `linear_attn.norm.weight`, and mlx-lm's qwen3_5 `sanitize` only adds
+        # the offset back when it sees an HF-layout conv1d. Since this converter
+        # emits MLX layout, the GGUF norms are already the values mlx-lm wants.
+        if re.fullmatch(r"blk\.\d+\.ssm_a", gguf_name):
             if np.any(~np.isfinite(arr)) or np.any(arr >= 0):
                 raise ValueError("Qwen3.5 ssm_a must contain finite negative values")
             return cast(np.ndarray, np.log(-arr).astype(arr.dtype))
-        if re.fullmatch(r"blk\.\d+\.ssm_norm\.weight", gguf_name):
-            return cast(np.ndarray, arr - np.array(1, dtype=arr.dtype))
+        if re.fullmatch(r"blk\.\d+\.ssm_conv1d\.weight", gguf_name) and arr.ndim == 2:
+            return cast(np.ndarray, arr.reshape(arr.shape[0], arr.shape[1], 1))
     return arr
+
+
+def _restore_layout(gguf_name: str, arch: str) -> str:
+    """How :func:`_restore_architecture_tensor` reshapes ``gguf_name``.
+
+    ``reshaped`` means the values survive but the tensor's axes change, so the
+    fidelity audit can still compare them position-wise after a reshape instead
+    of giving up on the tensor.
+    """
+    if arch in QWEN35_ARCHES and re.fullmatch(
+        r"blk\.\d+\.ssm_conv1d\.weight", gguf_name
+    ):
+        return "reshaped"
+    return "identity"
+
+
+def _layout_label(gguf_name: str, arch: str, *, identical: bool, rotated: bool) -> str:
+    """Record what actually happened to one tensor for the fidelity audit."""
+    if rotated:
+        return "transformed"
+    if identical:
+        return "identity"
+    # A tensor that changed is only comparable when the change was a pure
+    # reshape; everything else (rotary unpermute, fusion, splits) is reported as
+    # transformed so the audit never claims more coverage than it has.
+    return "reshaped" if _restore_layout(gguf_name, arch) == "reshaped" else "transformed"
 
 
 # MLA-family tensor fragments shared by DeepSeek-V2/V3 and GLM-DSA.
@@ -1556,6 +1626,14 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
         mapped = _map_mla_tensor_name(gguf_name)
         if mapped is not None:
             return mapped
+    if arch in QWEN35_ARCHES and (match := re.fullmatch(
+        r"blk\.(\d+)\.post_attention_norm\.weight", gguf_name
+    )):
+        # llama.cpp names Qwen3.5's post-attention norm `post_attention_norm`,
+        # not `ffn_norm` as on Llama. Real Qwen3.5-0.8B GGUFs contain only this
+        # spelling, so leaving it out failed the whole conversion with
+        # "Unsupported qwen35 tensor".
+        return f"model.layers.{match.group(1)}.post_attention_layernorm.weight"
     if arch in QWEN35_ARCHES and (match := re.fullmatch(
         r"blk\.(\d+)\.(attn_qkv|attn_gate|ssm_conv1d|ssm_dt|ssm_a|"
         r"ssm_beta|ssm_alpha|ssm_norm|ssm_out)(?:\.weight|\.bias)?", gguf_name
@@ -2094,8 +2172,7 @@ def _build_tokenizer_json(
         raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
 
     normalizer: dict[str, Any] | None = (
-        None if arch in {"qwen2", "qwen2moe", "qwen3moe", *QWEN_VL_TEXT_ARCHES}
-        or model_type == "t5"
+        None if arch in QWEN_FAMILY_ARCHES or model_type == "t5"
         else {"type": "NFC"}
     )
     if precompiled_charsmap:
@@ -2148,7 +2225,9 @@ def _build_tokenizer_json(
                 "|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*"
                 "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
             )
-        elif tokenizer_pre in ("qwen2", "deepseek-r1-qwen", "kormo", "f2llmv2"):
+        elif tokenizer_pre in QWEN_PRE_TOKENIZERS | {
+            "deepseek-r1-qwen", "kormo", "f2llmv2"
+        }:
             normalizer = None
         else:
             warnings.warn(
@@ -2614,6 +2693,26 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
                 raise RuntimeError("Incomplete split kv_b tensor groups")
 
 
+def _source_tensors_without_output(
+    reader: GGUFReader, produced_sources: set[str]
+) -> list[dict[str, str]]:
+    """Explain every source tensor that did not contribute an output tensor."""
+    skipped: list[dict[str, str]] = []
+    for tensor in reader.tensors:
+        name = str(tensor.name)
+        if name in produced_sources:
+            continue
+        lowered = name.lower()
+        if name == "rope_freqs.weight":
+            reason = "reproduced_from_config"
+        elif re.search(r"(^|\.)(mtp|nextn)\.", lowered):
+            reason = "mtp_head_not_consumed"
+        else:
+            reason = "unmapped"
+        skipped.append({"name": name, "reason": reason})
+    return sorted(skipped, key=lambda item: item["name"])
+
+
 def extract_and_convert_weights(
     reader: GGUFReader, arch: str, output_dir: Path, dtype: str = "float16",
     max_shard_bytes: int = int(4.5 * 1e9),
@@ -2636,7 +2735,9 @@ def extract_and_convert_weights(
             writer.add(name, array, **({"dtype": "bfloat16"} if dtype == "bfloat16" else {}))
             layout[name] = {
                 "source": gguf_name,
-                "layout": "identity" if identity else "transformed",
+                "layout": _layout_label(
+                    gguf_name, arch, identical=identity, rotated=False
+                ),
             }
             del array
         if arch == "glm-dsa":
@@ -2664,6 +2765,9 @@ def extract_and_convert_weights(
         audit=audit_result,
         layout=layout,
         source=str(getattr(reader, "path", "") or "") or None,
+        source_tensors_without_output=_source_tensors_without_output(
+            reader, {record["source"] for record in layout.values()}
+        ),
     )
     fidelity.write_report(output_dir, report)
     weight = report["fidelity"]["weight"]
@@ -2945,18 +3049,20 @@ def extract_and_convert_weights_preserve(
                 del packed, scales, biases
                 continue
 
-            array = _decode_tensor_to_array(tensor, dtype, gguf_name)
-            if array is None:
+            decoded = _decode_tensor_to_array(tensor, dtype, gguf_name)
+            if decoded is None:
                 raise RuntimeError(f"Failed to convert tensor {gguf_name}")
-            array = _restore_architecture_tensor(gguf_name, array, arch)
+            array = _restore_architecture_tensor(gguf_name, decoded, arch)
             if heads:
                 array = gguf_codes.llama_rotary_rows(array, heads)
             writer.add(name, array)
             float_layout[name] = {
                 "source": gguf_name,
-                "layout": "transformed" if heads else "identity",
+                "layout": _layout_label(
+                    gguf_name, arch, identical=array is decoded, rotated=bool(heads)
+                ),
             }
-            del array
+            del array, decoded
         writer.finish()
 
     print(f"\n  ✓ Preserved {len(preserve_plan)} tensor(s) on the affine grid, "
@@ -3004,6 +3110,8 @@ def extract_and_convert_weights_preserve(
             "total_output_tensors": len(preserve_plan),
         }
 
+    produced_sources = {record["source"] for record in float_layout.values()}
+    produced_sources.update(record["source"] for record in preserve_plan.values())
     report = fidelity.build_report(
         architecture=arch,
         dtype=dtype,
@@ -3020,6 +3128,9 @@ def extract_and_convert_weights_preserve(
             "ratio": size_ratio,
         },
         preserve_fallback=fallback,
+        source_tensors_without_output=_source_tensors_without_output(
+            reader, produced_sources
+        ),
     )
     fidelity.write_report(output_dir, report)
     print(f"  {fidelity.summarize(report)}")
@@ -4348,15 +4459,24 @@ def _run_publish_command(args: argparse.Namespace) -> int:
             token=args.token or os.environ.get("HF_TOKEN"),
             work_dir=args.work_dir,
             keep_work_dir=args.keep_work_dir,
+            dry_run=args.dry_run,
+            verify_load=args.verify_load,
         )
     except PublishError as error:
         print(f"❌ Publish failed: {error}")
         return 1
-    print(f"✅ Published {result.destination} ({len(result.files)} files)")
+    if getattr(result, "dry_run", False):
+        print(f"✅ Dry run complete for {result.destination} ({len(result.files)} files)")
+    else:
+        print(f"✅ Published {result.destination} ({len(result.files)} files)")
     if result.commit_url:
         print(f"   {result.commit_url}")
-    print(f"   converter {result.provenance['gguf2mlx_version']}, "
-          f"{len(result.shards)} source shard(s)")
+    print(
+        f"   converter {result.provenance['gguf2mlx_version']}, "
+        f"{len(result.shards)} source shard(s)"
+    )
+    if getattr(result, "verified_load", False):
+        print("   runtime load check passed (load + finite-logit forward pass)")
     return 0
 
 
@@ -4471,6 +4591,16 @@ def main(argv: list[str] | None = None) -> None:
             "--keep-work-dir",
             action="store_true",
             help="Keep the temporary tree after the run (debugging)",
+        )
+        publish_parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Validate, download, convert, and build metadata without writing the destination",
+        )
+        publish_parser.add_argument(
+            "--verify-load",
+            action="store_true",
+            help="Load and run the converted model before creating the destination repo",
         )
 
         args = parser.parse_args(argv)

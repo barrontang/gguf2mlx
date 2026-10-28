@@ -36,7 +36,8 @@ CI; MLX is required only for `--quantize`.
 ```bash
 pip install gguf2mlx            # installs MLX + MLX-LM on Apple Silicon
 pipx install gguf2mlx           # isolated CLI; or: uv tool install gguf2mlx
-# extras: [vlm] / [publish] add Hugging Face Hub, [all] everything, [dev] toolchain
+# extras: [vlm] adds Hugging Face Hub + mlx-vlm, [publish] adds HF Hub,
+# [all] everything, [dev] toolchain
 ```
 
 ## Quick start
@@ -84,19 +85,25 @@ gguf2mlx verify --model-dir ./mlx-model --load
 Perplexity is recorded but never gated: cross-runtime PPL mixes quantization noise
 with conversion error, so it cannot prove a converter correct. Nightly, the pinned
 [load matrix](tests/load_matrix.json) converts real GGUFs and proves each one loads
-and runs (11/11 across llama, qwen2, qwen3, gemma2 and phi3).
+and runs. All twelve pinned entries pass on Apple Silicon — llama, qwen2, qwen3,
+gemma2 and phi3 across Q4_0 / Q4_K_M / Q8_0, plus Qwen3.5-0.8B Q4_K_M in preserve
+mode. The CI job for the full matrix has not been re-run since the Qwen3.5 entry
+was added, so the published run predates it; the local run is dated 2026-10-26.
 
 ## Preserve GGUF quantization
 
 `--quant-source preserve` re-expresses the GGUF blocks that are already there as
 MLX affine groups (`w = scale * code + bias`) on the blocks' 32-value grid instead
 of decoding to FP16 and quantizing again: the codes are kept and only the fp16
-rounding of scale and bias is new. Q4_K lands at 2.0-2.4e-4 relative L2 and Q8_0 is
-bit-exact; Q6_K, whose 16-value sub-block scales cannot fit a 32-value group when
-they disagree, is re-fitted at the source width and gated separately, keeping a
-Q6_K artifact at **1.067x** the GGUF instead of the 2.4x the old FP16 fallback
+rounding of scale and bias is new. Q4_K and Q5_K land in the 2e-4 to 8e-4 range
+(the 5th code bit comes from the block's high-bit plane) and Q8_0 is bit-exact;
+Q6_K, whose 16-value sub-block scales cannot fit a 32-value group when they
+disagree, is re-fitted at the source width and gated separately, keeping a Q6_K
+artifact at **1.067x** the GGUF instead of the 2.4x the old FP16 fallback
 produced (`--preserve-fallback 8bit|float16` trades error for size). It fails
-closed for anything but `llama`, `qwen2`, `qwen3` and `mistral`.
+closed for anything but dense `llama`, `qwen2`, `qwen3`, `mistral`, and the
+Qwen3.5-family hybrid layouts. Qwen3.5 SSM vectors and `conv1d` remain in float
+because they are not affine matrices; the projection tensors keep their codes.
 Numbers and tolerances: [Preserve tier](docs/quality-gates.md#preserve-tier).
 
 ```bash
@@ -108,12 +115,18 @@ gguf2mlx convert --input model-Q8_0.gguf --output ./mlx-model-q8 --quant-source 
 `gguf2mlx publish` downloads a hosted GGUF, converts it, and uploads the result
 with a provenance record and the source license files. Split GGUFs are merged, a
 partial shard set is rejected before anything is downloaded, and the destination
-repository is created only once conversion produced weights.
+repository is created only after a complete artifact exists. Downloads are
+streamed rather than buffered in memory.
 
 ```bash
 pip install "gguf2mlx[publish]"
+# Inspect the name, card, provenance, files, and size without writing remotely
 gguf2mlx publish --source bartowski/Model-GGUF --gguf Model-Q8_0.gguf \
-  --dest my-org/Model-MLX --source-revision main
+  --dest my-org/Model-MLX --source-revision main --dry-run
+
+# Require a real mlx-lm load before the destination repo is created
+gguf2mlx publish --source bartowski/Model-GGUF --gguf Model-Q8_0.gguf \
+  --dest my-org/Model-MLX --source-revision main --verify-load
 ```
 
 `publish-mlx.yml` is a thin shell around the same module. Details:
@@ -128,7 +141,7 @@ real-checkpoint validation.
 |---|---|---|---|
 | Llama | `llama`, `mistral` | ✅ + preserve | Llama-3.2-1B Q4_0/Q4_K_M/Q8_0 in the pinned load matrix |
 | Qwen | `qwen2`, dense `qwen3` | ✅ + preserve | Qwen2.5-0.5B, Qwen3-0.6B in the pinned load matrix |
-| Qwen3.5 family | `qwen35` + aliases | ✅ | portable fixtures |
+| Qwen3.5 family | `qwen35` + aliases | ✅ + preserve | Qwen3.5-0.8B Q4_K_M preserve case in the pinned load matrix |
 | Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | real GGUF: Qwen1.5-MoE, Qwen3-30B-A3B |
 | DeepSeek | `deepseek2`, `deepseek3` | ✅ | real GGUF: V2 Lite Q2_K |
 | GLM | `glm4moe`, `glm-dsa` | ✅ / ⚠️ experimental | none |
@@ -137,18 +150,19 @@ real-checkpoint validation.
 | StableLM | `stablelm` | ✅ | none |
 | LLaVA / Qwen2-VL / MiniCPM-V | mmproj pairs | ✅ | Qwen2-VL-2B real-image acceptance |
 
-`preserve` means `--quant-source preserve` is available (Q4_K, Q6_K, Q8_0); other
-architectures convert but must requantize. Convertible architectures without a
-pinned case are listed with reasons in the [support matrix](docs/support-matrix.md),
+`preserve` means `--quant-source preserve` is available (Q4_K, Q5_K, Q6_K, Q8_0);
+other architectures convert but must requantize. Convertible architectures without
+a pinned case are listed with reasons in the [support matrix](docs/support-matrix.md),
 and a test keeps that list exact. **Inspection-only** families (recognized via
 metadata, rejected on conversion) are listed in the same page.
 
 ## Vision-language models
 
-Three explicit adapters emit directories for `mlx-vlm`: **LLaVA-1.5**,
-**Qwen2-VL**, and **MiniCPM-V 4.7 1B**. Language weights and the projector come
-from GGUF; hybrid mode takes only the vision tower from a matching HF checkpoint.
-Qwen2.5-VL, Qwen3-VL full VLM, LLaVA-NeXT and SigLIP layouts are **not** supported.
+Three explicit adapters emit directories for **`mlx-vlm>=0.7.10`**:
+**LLaVA-1.5**, **Qwen2-VL**, and **MiniCPM-V 4.7 1B**. Language weights and the
+projector come from GGUF; hybrid mode takes only the vision tower from a matching
+HF checkpoint. MiniCPM-V 4.7 runs the native image path in CI. Qwen2.5-VL,
+Qwen3-VL full VLM, LLaVA-NeXT, and other SigLIP layouts are **not** supported.
 
 ```bash
 pip install "gguf2mlx[vlm]"

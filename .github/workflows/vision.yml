@@ -48,5 +48,6 @@ jobs:
       - name: Offline GGUF conversion and real image-path parity
         run: >-
           python -m pytest tests/test_vlm.py tests/test_vlm_cli.py
-          tests/test_vlm_qwen2.py tests/test_vlm_acceptance.py tests/test_vlm_runtime.py
+          tests/test_vlm_qwen2.py tests/test_vlm_minicpm.py
+          tests/test_vlm_acceptance.py tests/test_vlm_runtime.py
           -k "not real_checkpoint_image_smoke" -q

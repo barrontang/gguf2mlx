@@ -20,9 +20,11 @@
 | Executable Unigram and WordPiece tokenizer tests | Supported |
 | Gemma and Phi-3/Phi-4 architecture fixtures, including LongRoPE config | Supported |
 | Bounded-memory direct quantization (`--direct-quant`) | Supported |
+| Source-block preservation (`--quant-source preserve`, Q4_K/Q5_K/Q6_K/Q8_0) | Supported; gated per tensor |
+| Qwen3.5 dense hybrid adapter, including preserve | Supported; real Qwen3.5-0.8B checkpoint loads with finite logits |
 | StableLM conversion adapter | Supported |
 | LLaVA Llama + CLIP direct/hybrid VLM adapter | Native tiny-checkpoint image-path parity tested |
 | Qwen2-VL direct/hybrid VLM adapter | Tiny parity; named 2B direct checkpoint passes real-image acceptance |
-| MiniCPM-V 4.7 1B VLM adapter | Portable conversion fixtures; native image inference unverified |
+| MiniCPM-V 4.7 1B VLM adapter | Native image-path CI on tiny checkpoints; pretrained caption quality unverified |
 | Language-only 4-bit VLM conversion | Packed weights + native decoded-reference parity tested |
 | Qwen3-VL / Qwen2-VL text conditioning | Portable conversion fixtures; BF16/mRoPE preserved; native conditioning parity unverified |

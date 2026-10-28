@@ -1,6 +1,6 @@
 # Development
 
-> Local test invocations, opt-in real-model suites, the optional Rust extension and the regression inventory.
+> Local test invocations, opt-in real-model suites, runtime-contract checks, and the regression inventory.
 
 > Split out of the top-level README on 2026-10-20; content is unchanged apart from heading levels.
 
@@ -12,6 +12,9 @@ uv sync --all-extras
 # Tests
 pytest
 
+# Prose must match the code: architecture lists, runtime pins, and deleted modules
+pytest tests/test_docs_consistency.py
+
 # Opt-in MLX-LM integration test (Apple Silicon)
 GGUF2MLX_RUN_E2E=1 pytest tests/test_e2e.py
 
@@ -19,7 +22,13 @@ GGUF2MLX_RUN_E2E=1 pytest tests/test_e2e.py
 GGUF2MLX_RUN_VLM_E2E=1 HF_HUB_OFFLINE=1 \
 uv run --isolated --no-project --with-editable . \
   --with-requirements tests/requirements-vlm.txt \
-  pytest tests/test_vlm.py tests/test_vlm_cli.py tests/test_vlm_qwen2.py tests/test_vlm_runtime.py
+  pytest tests/test_vlm.py tests/test_vlm_cli.py tests/test_vlm_qwen2.py \
+  tests/test_vlm_minicpm.py tests/test_vlm_acceptance.py tests/test_vlm_runtime.py
+
+# Emitted model_type must resolve in the minimum pinned runtimes
+uv run --isolated --no-project --with-editable . \
+  --with-requirements tests/requirements-vlm.txt \
+  pytest tests/test_runtime_registry.py
 
 # Or install into a dedicated venv, not the dev environment:
 python3 -m venv .venv-vlm
@@ -61,24 +70,9 @@ python -m gguf2mlx.chat_validation ./converted-model --expect-marker '<|im_start
 ruff check src/ tests/ benchmarks/
 ```
 
-The repository includes a Rust crate at:
-
-- `rust/gguf2mlx-rs`
-
-To build and enable the optional PyO3 extension locally:
-
-```bash
-python -m pip install maturin
-maturin develop --manifest-path rust/gguf2mlx-rs/Cargo.toml
-```
-
-Current integration behavior:
-
-- Python CLI/UX remains the primary entrypoint.
-- The optional `gguf2mlx_rust` extension currently provides architecture detection
-  and dense/MoE/hybrid classification; conversion and CLI workflows remain in Python.
-- If the Rust extension is unavailable or errors, Python falls back to its existing
-  detection and classification logic.
+The Python converter is the only implementation. The former `gguf2mlx-rs` crate
+was deleted because it duplicated the Python detection path, was never released,
+and added a second toolchain to the release surface.
 
 Recent regression coverage includes:
 
@@ -98,7 +92,16 @@ Recent regression coverage includes:
 - VLM split-file conversion, ordered QKV and temporal-kernel reconstruction,
   hybrid vision-only replacement, M-RoPE and processor mismatch rejection
 - MiniCPM-V 4.7 dense Qwen3.5 text, separate SigLIP projector, merger mappings,
-  and processor/tokenizer validation
+  processor/tokenizer validation, and native image-path CI
+- runtime-registry conformance for every emitted LLM and full-VLM model type
+- Qwen3.5 preserved projection codes with SSM state kept in float
+- Q5_K preserved as 5-bit affine groups, checked against `gguf.quants.dequantize`
+  and `mlx.core.dequantize`
+- Qwen3.5 hybrid layout restoration: `A_log = log(-ssm_a)`, the squeezed
+  `conv1d` kernel widened to `(channels, kernel, 1)`, and the gated norm left
+  unshifted — plus a `reshaped` audit layout so the kernel is still value-compared
+- `publish --dry-run` never creating the destination, `--verify-load` running
+  before repository creation, and shard downloads streaming instead of buffering
 - native VLM image features and logits against original HF-layout weights
   (or an independently decoded quantized reference), image-change sensitivity,
   finite outputs and `mlx_vlm.generate`; F32/Q4_0 inputs and FP16/FP32/4-bit outputs
