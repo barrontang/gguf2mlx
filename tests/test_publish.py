@@ -587,6 +587,88 @@ def test_verify_load_fails_when_the_mlx_runtime_is_missing(tmp_path):
     assert not hub.creates
 
 
+def test_verify_load_retries_once_when_the_gpu_failed_not_the_artifact(tmp_path):
+    """A Metal timeout on a busy runner must not abort a publish.
+
+    The retry uses the same bytes, so a genuinely broken artifact fails again —
+    for a numerical reason — instead of slipping through.
+    """
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+    calls = []
+
+    def flaky(path):
+        calls.append(path)
+        if len(calls) == 1:
+            return {
+                "status": "fail", "gated": True, "stage": "forward", "retryable": True,
+                "error": "[METAL] Command buffer execution failed: Caused GPU Timeout Error",
+            }
+        return {"status": "pass", "gated": True, "stage": "forward", "logits_finite": True}
+
+    result = publishing.publish(
+        "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+        verify_load=True, load_fn=flaky,
+    )
+
+    assert len(calls) == 2
+    assert result.verified_load is True
+    assert hub.uploads
+
+
+def test_verify_load_retries_only_once(tmp_path):
+    """A persistent timeout is still a failure — two attempts, not a loop."""
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+    calls = []
+
+    def always_flaky(path):
+        calls.append(path)
+        return {
+            "status": "fail", "gated": True, "stage": "forward", "retryable": True,
+            "error": "Caused GPU Timeout Error",
+        }
+
+    with pytest.raises(publishing.PublishError, match=r"GPU Timeout"):
+        publishing.publish(
+            "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+            verify_load=True, load_fn=always_flaky,
+        )
+    assert len(calls) == 2
+    assert not hub.creates
+
+
+def test_verify_load_does_not_retry_non_finite_logits(tmp_path):
+    """A numerical failure is about the weights; retrying it would hide a defect."""
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+    calls = []
+
+    def non_finite(path):
+        calls.append(path)
+        return {
+            "status": "fail", "gated": True, "stage": "forward",
+            "logits_finite": False, "retryable": False,
+            "error": "forward pass produced non-finite logits",
+        }
+
+    with pytest.raises(publishing.PublishError, match="non-finite"):
+        publishing.publish(
+            "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+            verify_load=True, load_fn=non_finite,
+        )
+    assert len(calls) == 1
+
+
 def test_publish_streams_downloaded_gguf_without_read_bytes(tmp_path, monkeypatch):
     blobs, gguf_file = _gguf_blobs(tmp_path)
     hub = FakeHub(

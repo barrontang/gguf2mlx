@@ -201,3 +201,38 @@ def test_report_summary_is_readable(converted):
     _, _, report = converted
     assert "pass" in fidelity.summarize(report)
     assert "not measured" in fidelity.summarize({"fidelity": {"weight": {"status": "not_run"}}})
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "[METAL] Command buffer execution failed: Caused GPU Timeout Error "
+            "(00000002:kIOGPUCommandBufferCallbackErrorTimeout)."
+        ),
+        "kIOGPUCommandBufferCallbackErrorOutOfMemory",
+        "Command buffer execution failed",
+    ],
+)
+def test_gpu_side_failures_are_marked_retryable(message):
+    """A runner's GPU is not evidence about the artifact.
+
+    The nightly Load matrix went red on exactly these strings while the same
+    bytes passed locally, so they are classified rather than treated as a
+    conversion defect.
+    """
+    assert fidelity._is_retryable_gpu_error(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "forward pass produced non-finite logits",
+        "Received 1 parameters not in model: rope_freqs.weight",
+        "Missing 1 parameters: language_model.lm_head.weight",
+        "Unable to load tokenizer",
+    ],
+)
+def test_artifact_side_failures_are_not_retryable(message):
+    """Retrying these would hide a real defect behind a second attempt."""
+    assert fidelity._is_retryable_gpu_error(message) is False

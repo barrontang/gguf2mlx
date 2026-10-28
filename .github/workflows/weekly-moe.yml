@@ -1,5 +1,14 @@
 name: Weekly MoE validation
 
+# The MoE fixtures are 11-20 GB, so this job cannot download them on a hosted
+# runner. It expects a runner that already holds them and a repository variable
+# naming their paths. Until that variable exists the gate is *inactive*, and an
+# inactive gate must read as "skipped", not as a weekly red that teaches people
+# to ignore failures. A companion job says so out loud.
+#
+# Setting GGUF2MLX_MOE_MODELS to a JSON object re-arms the strict path below:
+# a key that is set but unusable still fails the run.
+
 on:
   schedule:
     - cron: "17 3 * * 1"
@@ -9,7 +18,16 @@ permissions:
   contents: read
 
 jobs:
+  notice-when-unconfigured:
+    if: vars.GGUF2MLX_MOE_MODELS == ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say that the weekly MoE gate is not armed
+        run: |
+          echo "::warning title=Weekly MoE gate inactive::GGUF2MLX_MOE_MODELS is unset, so this gate validated nothing. Set the repository variable to a JSON object mapping qwen3moe/deepseek2 to local GGUF paths on a runner that holds them."
+
   moe-e2e:
+    if: vars.GGUF2MLX_MOE_MODELS != ''
     runs-on: macos-14
     timeout-minutes: 180
     env:
@@ -29,9 +47,8 @@ jobs:
           import os
           from pathlib import Path
 
-          # An unset repository variable reaches the job as an empty string,
-          # which is not valid JSON. Treat it as "nothing configured" so the
-          # failure message names the real problem.
+          # Reaching this step means the variable is set, so an empty parse is a
+          # configuration error worth failing on rather than skipping past.
           models = json.loads(os.environ.get("GGUF2MLX_MOE_MODELS") or "{}")
           required = {"qwen3moe", "deepseek2"}
           missing = required - models.keys()

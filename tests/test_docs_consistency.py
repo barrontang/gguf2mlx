@@ -84,6 +84,28 @@ def test_every_preservable_architecture_is_documented():
     assert not missing, f"preserve mode accepts these but no doc names them: {missing}"
 
 
+def test_weekly_moe_claim_matches_its_workflow_guard():
+    """The support matrix promised MoE coverage from a job that cannot run.
+
+    `weekly-moe.yml` needs 11-20 GB of fixtures that no step downloads, so it
+    only works on a runner that already has them. Claiming it "covers two
+    families" was false while the repository variable was unset, and the job
+    spent weeks going red. The claim is allowed only while the workflow keeps
+    the guard that turns "unconfigured" into `skipped`.
+    """
+    if "weekly-moe" not in _read(SUPPORT):
+        return
+    workflow = _read(ROOT / ".github" / "workflows" / "weekly-moe.yml")
+    assert "vars.GGUF2MLX_MOE_MODELS != ''" in workflow, (
+        "docs/support-matrix.md claims weekly MoE coverage, but the workflow no "
+        "longer guards on GGUF2MLX_MOE_MODELS, so an unconfigured runner fails "
+        "the job every week instead of skipping it"
+    )
+    assert "inactive until `GGUF2MLX_MOE_MODELS`" in _read(SUPPORT), (
+        "the MoE coverage claim must say it is inactive until configured"
+    )
+
+
 def test_llms_txt_architecture_counts_are_right():
     """The stated counts are the kind of number that silently rots.
 

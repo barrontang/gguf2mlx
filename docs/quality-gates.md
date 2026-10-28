@@ -212,6 +212,20 @@ converting again. `--load` is the numerical tier: it imports `mlx_lm`, loads the
 directory, runs one short forward pass, and requires every logit to be finite.
 Both exit non-zero on failure, so either can gate a release or a CI job.
 
+A failure on a shared runner can come from the GPU rather than the weights. A
+Metal command buffer that times out, or an allocation that loses a race with
+another tenant, will succeed on a second attempt with the same bytes. Those are
+reported with `retryable: true`, and both the load matrix and
+`publish --verify-load` retry once before failing. The retry re-runs the same
+check, so an artifact that is actually wrong fails again for a numerical reason;
+a non-finite logits result is never marked retryable, and neither is a missing
+runtime, because retrying those would hide a defect behind a second attempt.
+
+That distinction exists because the nightly went red on `gemma2-q4_k_m` with
+`Caused GPU Timeout Error (…kIOGPUCommandBufferCallbackErrorTimeout)` while the
+same bytes loaded locally, and nothing in the report let a reader tell that
+apart from a broken conversion.
+
 After `mlx_lm.convert` quantization, the report is carried into the quantized
 directory with `artifact.stage = "mlx_lm_quantized"`: the weight audit describes
 the FP16 staging output, and the 4-bit weights are explicitly **not** covered by

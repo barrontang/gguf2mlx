@@ -532,6 +532,25 @@ def evaluate_preserve_gate(
     }
 
 
+#: Failures that say nothing about the artifact. A Metal command buffer that
+#: times out on a shared CI runner, or a GPU allocation that loses a race with
+#: another tenant, will succeed on a second attempt with the same bytes. They
+#: are flagged ``retryable`` so callers re-run the check instead of reporting a
+#: conversion defect; a genuinely broken artifact fails the retry for a
+#: numerical reason and is still reported as a failure.
+RETRYABLE_GPU_ERRORS = (
+    "kIOGPUCommandBufferCallbackErrorTimeout",
+    "kIOGPUCommandBufferCallbackErrorOutOfMemory",
+    "Command buffer execution failed",
+    "Caused GPU Timeout Error",
+)
+
+
+def _is_retryable_gpu_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker.lower() in lowered for marker in RETRYABLE_GPU_ERRORS)
+
+
 def load_and_run(model_dir: str | Path, prompt_ids: Iterable[int] = (1, 2, 3)) -> dict[str, Any]:
     """Load a converted directory with ``mlx_lm`` and check the forward pass.
 
@@ -539,6 +558,9 @@ def load_and_run(model_dir: str | Path, prompt_ids: Iterable[int] = (1, 2, 3)) -
     can still be assembled with the wrong layout. The check is deliberately
     small (one short forward pass, logits must be finite) so it can gate a
     release without a benchmark machine.
+
+    A failure carries ``retryable`` when the cause was the GPU rather than the
+    weights, so a caller can distinguish a busy runner from a broken artifact.
     """
     try:
         import mlx.core as mx
@@ -556,7 +578,10 @@ def load_and_run(model_dir: str | Path, prompt_ids: Iterable[int] = (1, 2, 3)) -
         loaded = load(str(model_dir))
         model, tokenizer = loaded[0], loaded[1]
     except Exception as exc:  # noqa: BLE001 - report, do not crash the CLI
-        return {"status": "fail", "gated": True, "stage": "load", "error": str(exc)}
+        return {
+            "status": "fail", "gated": True, "stage": "load",
+            "error": str(exc), "retryable": _is_retryable_gpu_error(str(exc)),
+        }
 
     try:
         tokens = mx.array([list(prompt_ids)])
@@ -575,7 +600,10 @@ def load_and_run(model_dir: str | Path, prompt_ids: Iterable[int] = (1, 2, 3)) -
             payload["error"] = "forward pass produced non-finite logits"
         return payload
     except Exception as exc:  # noqa: BLE001
-        return {"status": "fail", "gated": True, "stage": "forward", "error": str(exc)}
+        return {
+            "status": "fail", "gated": True, "stage": "forward",
+            "error": str(exc), "retryable": _is_retryable_gpu_error(str(exc)),
+        }
 
 
 def build_report(

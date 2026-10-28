@@ -197,6 +197,13 @@ def test_converted_model_loads_and_runs(entry, tmp_path):
             assert preserved["preserved_by_qtype"], preserved
 
         result = fidelity.load_and_run(output)
+        if result.get("status") != "pass" and result.get("retryable"):
+            # A Metal command-buffer timeout on a shared runner is the GPU's
+            # fault, not the artifact's: the same bytes pass on a second
+            # attempt. Retry once so a busy runner does not turn the nightly
+            # red for a reason no reader can distinguish from a real defect.
+            result = dict(fidelity.load_and_run(output))
+            result["retried_after"] = "gpu"
         assert result["status"] == "pass", result
         assert result["logits_finite"] is True
     finally:

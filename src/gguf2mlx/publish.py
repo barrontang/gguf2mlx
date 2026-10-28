@@ -688,22 +688,32 @@ def publish(
 
         if verify_load:
             loader = load_fn or _default_load()
-            try:
-                loaded = loader(str(output))
-            except Exception as error:
-                raise PublishError(f"load verification failed for {dest}: {error}") from error
-            if isinstance(loaded, dict):
-                # ``fidelity.load_and_run`` reports instead of raising, so a
-                # missing runtime and a bad layout are told apart by ``stage``.
-                if loaded.get("status") != "pass":
+            for attempt in (1, 2):
+                try:
+                    loaded = loader(str(output))
+                except Exception as error:
+                    raise PublishError(f"load verification failed for {dest}: {error}") from error
+                if isinstance(loaded, dict):
+                    if loaded.get("status") == "pass":
+                        break
+                    # ``fidelity.load_and_run`` reports instead of raising, and
+                    # flags GPU-side failures: those say nothing about the
+                    # artifact, so one more attempt is worth it before a
+                    # publish is aborted. A missing runtime and non-finite
+                    # logits are not retryable and fail immediately.
+                    if loaded.get("retryable") and attempt == 1:
+                        continue
                     stage = loaded.get("stage")
                     detail = loaded.get("error") or loaded.get("status")
                     where = f" ({stage})" if stage else ""
                     raise PublishError(
                         f"load verification failed for {dest}{where}: {detail}"
                     )
-            elif loaded is None:
-                raise PublishError(f"load verification failed for {dest}: loader returned no model")
+                if loaded is None:
+                    raise PublishError(
+                        f"load verification failed for {dest}: loader returned no model"
+                    )
+                break
 
         message = f"Convert {source}@{revision} GGUF to MLX"
         commit_url = ""

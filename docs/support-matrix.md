@@ -66,7 +66,7 @@ minimum pinned `mlx-lm`/`mlx-vlm` registries.
 
 | Architecture IDs without a pinned case | Reason |
 |---|---|
-| `deepseek2`, `deepseek3`, `glm4moe`, `glm-dsa`, `qwen2moe`, `qwen3moe` | MoE/MLA sources; the smallest public GGUFs exceed the per-runner download budget, and router protection needs its own case. `weekly-moe.yml` covers two families instead. |
+| `deepseek2`, `deepseek3`, `glm4moe`, `glm-dsa`, `qwen2moe`, `qwen3moe` | MoE/MLA sources; the smallest public GGUFs exceed the per-runner download budget, and router protection needs its own case. `weekly-moe.yml` can cover `qwen3moe` and `deepseek2` instead, but only on a runner that already holds those files: it is **inactive until `GGUF2MLX_MOE_MODELS` is set**, and reports `skipped` rather than passing. |
 | `gemma`, `gemma3`, `gemma4` | share `gemma2`'s adapter path, which is pinned; no small pinned GGUF for the others yet |
 | `mistral`, `phi4` | share `llama`'s tensor map and `phi3`'s sliding-window adapter, both pinned |
 | `qwen36`, `qwen38` (and their alias spellings) | newer hybrid variants share the dense Qwen3.5 adapter and are fixture-tested; only `qwen35` has a pinned real-model case |

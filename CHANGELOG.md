@@ -93,6 +93,33 @@ each dropped tensor with `reproduced_from_config`, `mtp_head_not_consumed`, or
 `unmapped`. Silence was the previous behaviour, which made MTP heads and
 `rope_freqs` indistinguishable from an adapter gap.
 
+### Three red CI jobs, none of which the converter caused
+
+The first push of this cycle turned four workflows red. Two were mine and two
+predated it:
+
+- `tests/requirements-vlm.txt` pinned `mlx==0.32.2` while `mlx-vlm==0.7.10`
+  requires `mlx>=0.32.4`, so `Runtime contract` and `Vision conversion` both
+  died in `pip install` before a single test ran. Pinned to `0.32.4`, the
+  version the Qwen3.5 run actually used, and the set now resolves.
+- The nightly `Load matrix` failed on `gemma2-q4_k_m` with
+  `[METAL] Command buffer execution failed: Caused GPU Timeout Error` — in the
+  forward pass, after the conversion and the weight gate had passed. The same
+  bytes load locally, and the two nights before passed in 8–9 minutes against
+  18m43s for this one, so the runner was contended. `fidelity.load_and_run` now
+  reports such failures with `retryable: true`, and the matrix and
+  `publish --verify-load` retry once. A non-finite logits result is not
+  retryable, so a real defect still fails on the first attempt.
+- `Weekly MoE validation` was failing every run because `GGUF2MLX_MOE_MODELS`
+  was never set, and no step can download the 11–20 GB fixtures it expects. It
+  now skips with a warning annotation when unconfigured instead of going red,
+  and still fails hard when the variable is set but names an unusable file. A
+  weekly red that no reader can act on is worse than an honest skip; the
+  support-matrix line that promised this coverage now says it is inactive until
+  configured, and `tests/test_docs_consistency.py` fails if that promise drifts
+  from the workflow guard again.
+
+
 ### Documentation tracks the code again
 
 `llms.txt`, `docs/development.md`, `docs/support-matrix.md`,
