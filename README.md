@@ -85,10 +85,9 @@ gguf2mlx verify --model-dir ./mlx-model --load
 Perplexity is recorded but never gated: cross-runtime PPL mixes quantization noise
 with conversion error, so it cannot prove a converter correct. Nightly, the pinned
 [load matrix](tests/load_matrix.json) converts real GGUFs and proves each one loads
-and runs. All twelve pinned entries pass on Apple Silicon — llama, qwen2, qwen3,
-gemma2 and phi3 across Q4_0 / Q4_K_M / Q8_0, plus Qwen3.5-0.8B Q4_K_M in preserve
-mode. The CI job for the full matrix has not been re-run since the Qwen3.5 entry
-was added, so the published run predates it; the local run is dated 2026-10-26.
+and runs. All twelve pinned entries are green in CI as of 2026-10-28 — llama,
+qwen2, qwen3, gemma2 and phi3 across Q4_0 / Q4_K_M / Q8_0, plus Qwen3.5-0.8B
+Q4_K_M in preserve mode.
 
 ## Preserve GGUF quantization
 

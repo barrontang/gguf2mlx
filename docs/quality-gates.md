@@ -261,13 +261,16 @@ The Qwen3.5 entry is pinned (`unsloth/Qwen3.5-0.8B-GGUF`, Q4_K_M,
 `bd258782…`) and runs with `quant_source: preserve`, so it simultaneously
 exercises the hybrid layout and the preserve tier.
 
-The whole matrix — all twelve entries — passes locally on Apple Silicon
-(2026-10-26, `mlx-lm` 0.32.2, `mlx` 0.32.4): conversion, the weight gate, the
-preserve gate where applicable, `mlx_lm.load` and a finite-logit forward pass.
-For the Qwen3.5 case specifically: weight gate `115/133` with a maximum relative
-L2 of 2.85e-04, preserve gate 170 `exact` / 17 `inexact`, a 1.084x artifact. The
-nightly `Load matrix` job has not been re-run since that entry was added, so the
-last published CI run predates it.
+All twelve entries pass, locally on Apple Silicon (2026-10-26) and in CI
+(2026-10-28): conversion, the weight gate, the preserve gate where applicable,
+`mlx_lm.load` and a finite-logit forward pass. For the Qwen3.5 case
+specifically: weight gate `115/133` with a maximum relative L2 of 2.85e-04,
+preserve gate 170 `exact` / 17 `inexact`, a 1.084x artifact.
+
+The CI green took three dispatches rather than one: the first full sweep came
+back 11/12 because `gemma2-q8_0`'s runner GPU hung, and the entry then passed in
+9m02s on a fresh job. That is the case the timeout-versus-hang split below was
+written for.
 
 ### What the Qwen3.5 case found
 

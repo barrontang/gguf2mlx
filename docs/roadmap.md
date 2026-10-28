@@ -36,9 +36,8 @@ Completed:
   and `--verify-load` so a publish can be reviewed before it becomes visible;
   `publish-mlx.yml` reduced to a thin shell
 - pinned load matrix converting, weight-gating and `mlx_lm.load()`-ing 12 entries
-  across llama, qwen2, qwen3, gemma2, phi3 and Qwen3.5 — green locally on Apple
-  Silicon (2026-10-26); the last published CI run covered the original 11 (run
-  39505897872)
+  across llama, qwen2, qwen3, gemma2, phi3 and Qwen3.5, green in CI on 2026-10-28
+  and locally on 2026-10-26
 - a runtime registry contract (`mlx-lm>=0.31.3`, `mlx-vlm==0.7.10`) checked by
   `tests/test_runtime_registry.py` and the `Runtime contract` workflow, so an
   emitted `model_type` cannot silently outrun the installed runtime

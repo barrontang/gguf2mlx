@@ -43,13 +43,12 @@ directories and do not assert runtime compatibility.
 
 The ✅ end-to-end cells are produced by the `Load matrix` workflow, which
 downloads each pinned GGUF by SHA-256, converts it, runs the weight-fidelity
-gate, loads the result with `mlx_lm` and requires finite logits. Published CI
-evidence: [run 39505897872](https://github.com/barrontang/gguf2mlx/actions/runs/39505897872)
-(11/11 entries green, 2026-10-21). A twelfth entry pins Qwen3.5-0.8B Q4_K_M in
-preserve mode; locally the full twelve-entry matrix is green on Apple Silicon
-(2026-10-26), including that entry, but the workflow has not been re-run since it
-was added, so the published run still shows eleven. The entry list lives in
-`tests/load_matrix.json`, and each job uploads the conversion report it produced.
+gate, loads the result with `mlx_lm` and requires finite logits. All twelve
+pinned entries are green in CI as of 2026-10-28, including the Qwen3.5 preserve
+entry added in this cycle; the earlier published run
+([39505897872](https://github.com/barrontang/gguf2mlx/actions/runs/39505897872),
+2026-10-21) covered eleven. The entry list lives in `tests/load_matrix.json`, and
+each job uploads the conversion report it produced.
 
 ### Pinned versus declared-only
 

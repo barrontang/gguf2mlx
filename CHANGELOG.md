@@ -64,12 +64,11 @@ matrix. It found:
   `tests/test_tokenizer_fidelity.py` asserts `normalizer is None` for each of
   them and that an unknown `pre` value still warns.
 
-The case now passes end to end locally on Apple Silicon (2026-10-26,
-`mlx-lm` 0.32.2): convert → weight gate (`115/133`) → preserve gate (170
-`exact`, 17 `inexact`) → `mlx_lm.load` → finite logits. Re-running the whole
-matrix against the same tree gives 12/12 green, so every pinned entry has local
-evidence; the `Load matrix` workflow has not been re-run since the Qwen3.5 entry
-was added, so the published run still shows eleven.
+The case now passes end to end, locally on Apple Silicon (2026-10-26,
+`mlx-lm` 0.32.2) and in CI (2026-10-28): convert → weight gate (`115/133`) →
+preserve gate (170 `exact`, 17 `inexact`) → `mlx_lm.load` → finite logits. All
+twelve pinned entries are green in CI, and re-running the full sweep locally
+gives 12/12 as well.
 
 ### `publish` can be reviewed before it is visible
 
