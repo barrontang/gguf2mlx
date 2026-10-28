@@ -669,6 +669,33 @@ def test_verify_load_does_not_retry_non_finite_logits(tmp_path):
     assert len(calls) == 1
 
 
+def test_verify_load_fails_immediately_on_a_gpu_hang(tmp_path):
+    """A hang is not retryable, and the error says what to do instead."""
+    blobs, gguf_file = _gguf_blobs(tmp_path)
+    hub = FakeHub(
+        files=[*blobs, "README.md"], blobs={**blobs, "README.md": b"# Upstream\n"},
+        cache=tmp_path / "cache",
+    )
+    calls = []
+
+    def hung(path):
+        calls.append(path)
+        return {
+            "status": "fail", "gated": True, "stage": "forward",
+            "retryable": False, "environment": "gpu_hang",
+            "error": "Caused GPU Hang Error",
+            "note": "re-run the job rather than retrying in this process",
+        }
+
+    with pytest.raises(publishing.PublishError, match="re-run the job"):
+        publishing.publish(
+            "owner/model-GGUF", gguf_file, "owner/model-MLX", hub=hub,
+            verify_load=True, load_fn=hung,
+        )
+    assert len(calls) == 1
+    assert not hub.uploads
+
+
 def test_publish_streams_downloaded_gguf_without_read_bytes(tmp_path, monkeypatch):
     blobs, gguf_file = _gguf_blobs(tmp_path)
     hub = FakeHub(

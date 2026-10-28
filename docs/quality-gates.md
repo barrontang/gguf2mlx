@@ -212,19 +212,25 @@ converting again. `--load` is the numerical tier: it imports `mlx_lm`, loads the
 directory, runs one short forward pass, and requires every logit to be finite.
 Both exit non-zero on failure, so either can gate a release or a CI job.
 
-A failure on a shared runner can come from the GPU rather than the weights. A
-Metal command buffer that times out, or an allocation that loses a race with
-another tenant, will succeed on a second attempt with the same bytes. Those are
-reported with `retryable: true`, and both the load matrix and
-`publish --verify-load` retry once before failing. The retry re-runs the same
-check, so an artifact that is actually wrong fails again for a numerical reason;
-a non-finite logits result is never marked retryable, and neither is a missing
-runtime, because retrying those would hide a defect behind a second attempt.
+A failure on a shared runner can come from the GPU rather than the weights, and
+the two such failures need different remedies:
 
-That distinction exists because the nightly went red on `gemma2-q4_k_m` with
-`Caused GPU Timeout Error (…kIOGPUCommandBufferCallbackErrorTimeout)` while the
-same bytes loaded locally, and nothing in the report let a reader tell that
-apart from a broken conversion.
+| Driver error | Meaning | What happens |
+|---|---|---|
+| `…ErrorTimeout` | the command buffer lost its scheduling slot | `retryable: true`; the matrix and `publish --verify-load` retry once, because the same bytes usually pass |
+| `…ErrorHang` | the Metal context is wedged | `environment: gpu_hang`, not retryable — the remedy is to re-run the **job**, since an in-process retry cannot recover |
+
+Non-finite logits and a missing runtime are never classified as either, so a
+real defect still fails on the first attempt instead of hiding behind a second
+one.
+
+That distinction exists because the nightly went red twice on the `gemma2`
+entries — once with `Caused GPU Timeout Error`, then with
+`Caused GPU Hang Error` where the in-process retry hung again and cost ten
+minutes for nothing. Both times the weight gate had already passed, `mlx` was
+the same 0.32.4 the previous green run used, and `gemma2-q4_k_m` passed on the
+same commit; nothing in the report let a reader tell any of that apart from a
+broken conversion.
 
 After `mlx_lm.convert` quantization, the report is carried into the quantized
 directory with `artifact.stage = "mlx_lm_quantized"`: the weight audit describes

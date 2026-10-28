@@ -102,14 +102,17 @@ predated it:
   requires `mlx>=0.32.4`, so `Runtime contract` and `Vision conversion` both
   died in `pip install` before a single test ran. Pinned to `0.32.4`, the
   version the Qwen3.5 run actually used, and the set now resolves.
-- The nightly `Load matrix` failed on `gemma2-q4_k_m` with
-  `[METAL] Command buffer execution failed: Caused GPU Timeout Error` — in the
-  forward pass, after the conversion and the weight gate had passed. The same
-  bytes load locally, and the two nights before passed in 8–9 minutes against
-  18m43s for this one, so the runner was contended. `fidelity.load_and_run` now
-  reports such failures with `retryable: true`, and the matrix and
-  `publish --verify-load` retry once. A non-finite logits result is not
-  retryable, so a real defect still fails on the first attempt.
+- The nightly `Load matrix` failed on the `gemma2` entries in the forward pass —
+  `Caused GPU Timeout Error` one night, `Caused GPU Hang Error` the next — after
+  the conversion and the weight gate had passed. The same bytes load locally,
+  `mlx` was the same `0.32.4` the previous green run used, and `gemma2-q4_k_m`
+  passed on the same commit in the same run, so the runner's GPU is the common
+  factor. `fidelity.load_and_run` now separates the two faults: a timeout is
+  `retryable: true` and is retried once, while a hang sets
+  `environment: gpu_hang` and is not retried at all, because a wedged Metal
+  context cannot recover inside the process that wedged it — retrying it only
+  spends another ten minutes failing. Non-finite logits and a missing runtime
+  are classified as neither, so a real defect still fails immediately.
 - `Weekly MoE validation` was failing every run because `GGUF2MLX_MOE_MODELS`
   was never set, and no step can download the 11–20 GB fixtures it expects. It
   now skips with a warning annotation when unconfigured instead of going red,

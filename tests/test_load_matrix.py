@@ -198,12 +198,20 @@ def test_converted_model_loads_and_runs(entry, tmp_path):
 
         result = fidelity.load_and_run(output)
         if result.get("status") != "pass" and result.get("retryable"):
-            # A Metal command-buffer timeout on a shared runner is the GPU's
+            # A Metal command-buffer *timeout* on a shared runner is the GPU's
             # fault, not the artifact's: the same bytes pass on a second
             # attempt. Retry once so a busy runner does not turn the nightly
             # red for a reason no reader can distinguish from a real defect.
+            # A *hang* is not retryable here — it wedges the Metal context, so
+            # the retry below is skipped and the failure names the remedy.
             result = dict(fidelity.load_and_run(output))
-            result["retried_after"] = "gpu"
+            result["retried_after"] = "gpu_timeout"
+        if result.get("status") != "pass" and result.get("environment") == "gpu_hang":
+            pytest.fail(
+                "the runner's GPU hung during the forward pass, so this entry "
+                "validated nothing; the Metal context does not recover in "
+                f"process — re-run this job. Detail: {result.get('error')}"
+            )
         assert result["status"] == "pass", result
         assert result["logits_finite"] is True
     finally:

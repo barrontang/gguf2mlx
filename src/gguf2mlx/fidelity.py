@@ -532,23 +532,49 @@ def evaluate_preserve_gate(
     }
 
 
-#: Failures that say nothing about the artifact. A Metal command buffer that
-#: times out on a shared CI runner, or a GPU allocation that loses a race with
-#: another tenant, will succeed on a second attempt with the same bytes. They
-#: are flagged ``retryable`` so callers re-run the check instead of reporting a
-#: conversion defect; a genuinely broken artifact fails the retry for a
-#: numerical reason and is still reported as a failure.
+#: GPU failures that a second attempt in the same process can survive. A command
+#: buffer that times out is a scheduling hiccup: the same submission usually
+#: completes on a retry.
 RETRYABLE_GPU_ERRORS = (
     "kIOGPUCommandBufferCallbackErrorTimeout",
-    "kIOGPUCommandBufferCallbackErrorOutOfMemory",
-    "Command buffer execution failed",
     "Caused GPU Timeout Error",
+)
+
+#: GPU failures that leave the context unusable. A command buffer that *hangs*
+#: does not recover by being resubmitted — the process's Metal context is
+#: wedged — so an in-process retry burns the runner's time and fails anyway.
+#: These are reported as an environment failure, because the remedy is "re-run
+#: the job", not "bisect the converter".
+FATAL_GPU_ERRORS = (
+    "kIOGPUCommandBufferCallbackErrorHang",
+    "Caused GPU Hang Error",
 )
 
 
 def _is_retryable_gpu_error(message: str) -> bool:
     lowered = message.lower()
     return any(marker.lower() in lowered for marker in RETRYABLE_GPU_ERRORS)
+
+
+def _is_fatal_gpu_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker.lower() in lowered for marker in FATAL_GPU_ERRORS)
+
+
+def _forward_failure(exc: Exception) -> dict[str, Any]:
+    """Describe a load/forward failure, separating the GPU's faults from ours."""
+    message = str(exc)
+    payload: dict[str, Any] = {
+        "status": "fail", "gated": True, "stage": "forward",
+        "error": message, "retryable": _is_retryable_gpu_error(message),
+    }
+    if _is_fatal_gpu_error(message):
+        payload["environment"] = "gpu_hang"
+        payload["note"] = (
+            "the Metal context is unusable after a hang; re-run the job rather "
+            "than retrying in this process or bisecting the converter"
+        )
+    return payload
 
 
 def load_and_run(model_dir: str | Path, prompt_ids: Iterable[int] = (1, 2, 3)) -> dict[str, Any]:
@@ -578,10 +604,9 @@ def load_and_run(model_dir: str | Path, prompt_ids: Iterable[int] = (1, 2, 3)) -
         loaded = load(str(model_dir))
         model, tokenizer = loaded[0], loaded[1]
     except Exception as exc:  # noqa: BLE001 - report, do not crash the CLI
-        return {
-            "status": "fail", "gated": True, "stage": "load",
-            "error": str(exc), "retryable": _is_retryable_gpu_error(str(exc)),
-        }
+        return dict(
+            _forward_failure(exc), stage="load",
+        )
 
     try:
         tokens = mx.array([list(prompt_ids)])
@@ -600,10 +625,7 @@ def load_and_run(model_dir: str | Path, prompt_ids: Iterable[int] = (1, 2, 3)) -
             payload["error"] = "forward pass produced non-finite logits"
         return payload
     except Exception as exc:  # noqa: BLE001
-        return {
-            "status": "fail", "gated": True, "stage": "forward",
-            "error": str(exc), "retryable": _is_retryable_gpu_error(str(exc)),
-        }
+        return _forward_failure(exc)
 
 
 def build_report(

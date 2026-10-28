@@ -706,8 +706,10 @@ def publish(
                     stage = loaded.get("stage")
                     detail = loaded.get("error") or loaded.get("status")
                     where = f" ({stage})" if stage else ""
+                    note = loaded.get("note")
+                    suffix = f" — {note}" if note else ""
                     raise PublishError(
-                        f"load verification failed for {dest}{where}: {detail}"
+                        f"load verification failed for {dest}{where}: {detail}{suffix}"
                     )
                 if loaded is None:
                     raise PublishError(

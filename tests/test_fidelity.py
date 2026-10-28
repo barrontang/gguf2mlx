@@ -210,18 +210,44 @@ def test_report_summary_is_readable(converted):
             "[METAL] Command buffer execution failed: Caused GPU Timeout Error "
             "(00000002:kIOGPUCommandBufferCallbackErrorTimeout)."
         ),
-        "kIOGPUCommandBufferCallbackErrorOutOfMemory",
-        "Command buffer execution failed",
+        "kIOGPUCommandBufferCallbackErrorTimeout",
     ],
 )
-def test_gpu_side_failures_are_marked_retryable(message):
-    """A runner's GPU is not evidence about the artifact.
+def test_gpu_timeouts_are_marked_retryable(message):
+    """A busy runner is not evidence about the artifact.
 
     The nightly Load matrix went red on exactly these strings while the same
-    bytes passed locally, so they are classified rather than treated as a
+    bytes passed locally, so a timeout is retried once rather than reported as a
     conversion defect.
     """
     assert fidelity._is_retryable_gpu_error(message) is True
+    assert fidelity._is_fatal_gpu_error(message) is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "[METAL] Command buffer execution failed: Caused GPU Hang Error "
+            "(00000003:kIOGPUCommandBufferCallbackErrorHang)."
+        ),
+        "Caused GPU Hang Error",
+    ],
+)
+def test_gpu_hangs_are_fatal_not_retryable(message):
+    """A hang wedges the Metal context, so an in-process retry cannot succeed.
+
+    gemma2-q8_0 hung twice in one job this way; the second attempt only cost ten
+    minutes. The classification says "re-run the job", which is the remedy that
+    actually works.
+    """
+    assert fidelity._is_fatal_gpu_error(message) is True
+    assert fidelity._is_retryable_gpu_error(message) is False
+
+    payload = fidelity._forward_failure(RuntimeError(message))
+    assert payload["environment"] == "gpu_hang"
+    assert payload["retryable"] is False
+    assert "re-run the job" in payload["note"]
 
 
 @pytest.mark.parametrize(
@@ -236,3 +262,7 @@ def test_gpu_side_failures_are_marked_retryable(message):
 def test_artifact_side_failures_are_not_retryable(message):
     """Retrying these would hide a real defect behind a second attempt."""
     assert fidelity._is_retryable_gpu_error(message) is False
+    assert fidelity._is_fatal_gpu_error(message) is False
+    payload = fidelity._forward_failure(RuntimeError(message))
+    assert payload["retryable"] is False
+    assert "environment" not in payload
