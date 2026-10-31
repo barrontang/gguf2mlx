@@ -382,8 +382,12 @@ def test_the_identity_post_norm_cannot_change_the_image_features(converted):
     ``llava_next`` computes ``post_layernorm`` on the CLS slot of the pooler
     output, and ``get_input_embeddings`` takes ``hidden_states[layer]`` instead.
     Perturbing the norm must therefore leave the features exactly where they were.
+
+    Both guards come first: the CI coverage job runs on Linux, where neither
+    package is installed, and importing ``mx`` above them turned a skip into a
+    collection-time failure.
     """
-    import mlx.core as mx
+    mx = pytest.importorskip("mlx.core", reason="needs the optional MLX runtime")
     pytest.importorskip("mlx_vlm", reason="needs the pinned VLM runtime")
     from mlx_vlm.models.llava_next import Model
 
