@@ -12,21 +12,40 @@ Apple Silicon.
 - Platform focus: macOS on Apple Silicon, including M1, M2, M3, and M4 Macs
 - Output: config, tokenizer assets, and sharded safetensors for MLX-LM
 - Optional output: MLX-LM requantized weights through `--quantize`
-- Optional output: `--quant-source preserve` re-expresses the source Q4_K, Q5_K,
-  Q6_K, and Q8_0 blocks on MLX's affine grid so the GGUF codes survive conversion
+- Optional output: `--quant-source preserve` re-expresses the source Q4_0, Q4_1,
+  Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, and Q8_0 blocks on MLX's affine grid so the GGUF
+  codes survive conversion. All but Q6_K are bit-exact; Q6_K is re-fitted because
+  its scale is per 16 values and MLX's smallest group is 32
+- Preserve cannot re-express Q2_K, Q3_K, or any `IQ` type (`IQ1_S` … `IQ4_XS`),
+  because their scale granularity does not divide 32 or their codebook is
+  non-uniform. iMatrix-guided exports land on those `IQ` types, so they convert
+  but do not preserve; the run names the block types and the tensor count
 - Preserve-enabled architectures: llama, qwen2, qwen3, mistral, and every
   Qwen3.5 alias (`qwen35`, `qwen3_5`, `qwen3.5`, `qwen36`, `qwen38`)
 - Preserve limitation: Qwen3.5 SSM state vectors (`A_log`, `dt_bias`) and the
   depthwise `conv1d` kernel have no affine matrix form, so they stay float
 - Conversion policy: unsupported architectures fail closed
-- Conversion-enabled architectures (22 canonical): llama, mistral, qwen2, qwen2moe,
-  qwen3, qwen3moe, qwen35, qwen36, qwen38, deepseek2, deepseek3, glm4moe, glm-dsa,
-  gemma, gemma2, gemma3, gemma4, stablelm, phi3, phi4, qwen2_vl, qwen3_vl
-- Accepted IDs are those 22 plus 8 alias spellings (`qwen3_5`, `qwen3.5`,
+- Conversion-enabled architectures (23 canonical): llama, mistral, mixtral, qwen2,
+  qwen2moe, qwen3, qwen3moe, qwen35, qwen36, qwen38, deepseek2, deepseek3,
+  glm4moe, glm-dsa, gemma, gemma2, gemma3, gemma4, stablelm, phi3, phi4,
+  qwen2_vl, qwen3_vl
+- Mixtral has no GGUF architecture of its own: `general.architecture = llama`
+  plus `llama.expert_count` is what identifies it, and both on-disk layouts are
+  handled (per-expert `ffn_gate.3.weight` from 2023 exports, and the stacked
+  `ffn_gate_exps.weight` written since llama.cpp's MoE refactor)
+- Accepted IDs are those 23 plus 8 alias spellings (`qwen3_5`, `qwen3.5`,
   `qwen3_6`, `qwen3.6`, `qwen3_8`, `qwen3.8`, `qwen2vl`, `qwen3vl`), so a
   metadata `model_type` resolves whichever way the file spells it
 - Phi adapters cover standard Phi-3, Phi-3 LongRoPE, and Phi-4 text models
-- Vision adapters cover Qwen2-VL, Qwen3-VL, and MiniCPM-V 4.7
+- Vision adapters cover Qwen2-VL, Qwen2.5-VL, Qwen3-VL, LLaVA, LLaVA-NeXT, and
+  MiniCPM-V 4.7
+- LLaVA-NeXT reconciles the stored CLIP block count with the HF one (real mmproj
+  files store 23 blocks for a 24-layer tower), moves `vision_feature_layer` to
+  match, emits the top-level `model.image_newline`, and resolves the two CLIP MLP
+  naming conventions (`ffn_up`/`ffn_down`) from tensor shapes rather than names
+- Qwen2.5-VL and Qwen3-VL convert from a language GGUF plus `mmproj` with zero
+  HF vision tensors (`vision_hf: 0`); Qwen2.5-VL shares Qwen2-VL's GGUF tensor
+  names but has RMSNorm blocks and a gated MLP, so it is a separate adapter
 - Runtime contract: MLX-LM `>=0.31.3`; MLX-VLM `==0.7.10` for vision output
 - Every conversion writes `conversion_report.json` with a deterministic weight
   gate, an optional preserve gate, and an explanation for every source tensor
@@ -35,6 +54,9 @@ Apple Silicon.
   immutable source revision, a provenance file, and a model card
 - `publish --dry-run` builds and validates the staging tree without creating a
   repository; `publish --verify-load` loads the result with MLX-LM first
+- Tokenizer assets are rebuilt by one builder per format
+  (`src/gguf2mlx/tokenizer.py`), validated against the `tokenizers` document
+  structure before writing, and refused with the offending GGUF key named
 - Tests include architecture fixtures, tokenizer behavior, atomic staging,
   packaging integrity, runtime-registry conformance, and opt-in real-GGUF and
   MLX-LM load tests

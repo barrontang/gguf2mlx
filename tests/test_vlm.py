@@ -347,7 +347,7 @@ def test_hf_config_cannot_mask_unsupported_gguf_architecture(model, source):
 
 
 @pytest.mark.parametrize("field,value,message", [
-    ("model_type", "llava_next", "Only HF"),
+    ("model_type", "llava_onevision", "Only HF"),
     ("vision_config", {"model_type": "siglip_vision_model"}, "CLIP"),
     ("text_config", {"model_type": "qwen2"}, "llama"),
     ("mm_projector_type", "linear", "two-linear"),
@@ -765,3 +765,29 @@ def test_hybrid_rejects_quantized_hf_vision_weights(model):
     save_file(vision, str(model.root / "model.safetensors"))
     with pytest.raises(ValueError, match="unsupported dtype"):
         convert(model, hf_fallback_vision=str(model.root))
+
+
+# -- the CLIP MLP naming conventions ------------------------------------------
+
+
+def test_a_clip_mlp_tensor_is_aimed_at_the_role_its_shape_proves():
+    """``ffn_up``/``ffn_down`` are not a fixed mapping, so the shape decides.
+
+    A pre-mtmd ``mmproj`` names the GELU input ``ffn_down``; the modern exporter
+    names it ``ffn_up``. A converted LLaVA directory that keeps the name instead of
+    the role loads and then scores images through a swapped MLP.
+    """
+    expected = {
+        "vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight": (8, 4),
+        "vision_tower.vision_model.encoder.layers.0.mlp.fc2.weight": (4, 8),
+    }
+    fc1 = "vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight"
+    fc2 = "vision_tower.vision_model.encoder.layers.0.mlp.fc2.weight"
+
+    # The legacy export's ffn_up is the output projection: (width, feed_forward).
+    assert vlm._swap_ffn_role(fc1, np.zeros((4, 8), np.float32), expected) == fc2
+    # The modern one already fits the name it was mapped to.
+    assert vlm._swap_ffn_role(fc1, np.zeros((8, 4), np.float32), expected) == fc1
+    # Nothing else is re-aimed.
+    attn = "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight"
+    assert vlm._swap_ffn_role(attn, np.zeros((4, 8), np.float32), expected) == attn

@@ -139,6 +139,7 @@ real-checkpoint validation.
 | Family | GGUF architecture IDs | Convert | End-to-end evidence |
 |---|---|---|---|
 | Llama | `llama`, `mistral` | ✅ + preserve | Llama-3.2-1B Q4_0/Q4_K_M/Q8_0 in the pinned load matrix |
+| Mixtral | `mixtral`, or `llama` + `llama.expert_count` | ✅ | both on-disk layouts; names checked against `mlx_lm.models.mixtral` |
 | Qwen | `qwen2`, dense `qwen3` | ✅ + preserve | Qwen2.5-0.5B, Qwen3-0.6B in the pinned load matrix |
 | Qwen3.5 family | `qwen35` + aliases | ✅ + preserve | Qwen3.5-0.8B Q4_K_M preserve case in the pinned load matrix |
 | Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | real GGUF: Qwen1.5-MoE, Qwen3-30B-A3B |
@@ -147,9 +148,10 @@ real-checkpoint validation.
 | Gemma | `gemma`, `gemma2`, `gemma3`, text `gemma4` | ✅ | Gemma-2-2B in the pinned matrix; others fixtures |
 | Phi | `phi3` (Phi-3, Phi-4) | ✅ | Phi-3-mini in the pinned matrix |
 | StableLM | `stablelm` | ✅ | none |
-| LLaVA / Qwen2-VL / MiniCPM-V | mmproj pairs | ✅ | Qwen2-VL-2B real-image acceptance |
+| LLaVA / Qwen2-VL / Qwen2.5-VL / Qwen3-VL / MiniCPM-V | mmproj pairs | ✅ | Qwen2-VL-2B real-image acceptance; Qwen2.5-VL-3B and Qwen3-VL-2B tensor-exact vs HF |
 
-`preserve` means `--quant-source preserve` is available (Q4_K, Q5_K, Q6_K, Q8_0);
+`preserve` means `--quant-source preserve` is available (Q4_0, Q4_1, Q5_0, Q5_1,
+Q4_K, Q5_K, Q6_K, Q8_0; `Q6_K` is re-fitted because its scale is per 16 values);
 other architectures convert but must requantize. Convertible architectures without
 a pinned case are listed with reasons in the [support matrix](docs/support-matrix.md),
 and a test keeps that list exact. **Inspection-only** families (recognized via
@@ -157,17 +159,28 @@ metadata, rejected on conversion) are listed in the same page.
 
 ## Vision-language models
 
-Three explicit adapters emit directories for **`mlx-vlm>=0.7.10`**:
-**LLaVA-1.5**, **Qwen2-VL**, and **MiniCPM-V 4.7 1B**. Language weights and the
-projector come from GGUF; hybrid mode takes only the vision tower from a matching
-HF checkpoint. MiniCPM-V 4.7 runs the native image path in CI. Qwen2.5-VL,
-Qwen3-VL full VLM, LLaVA-NeXT, and other SigLIP layouts are **not** supported.
+Five explicit adapters emit directories for **`mlx-vlm>=0.7.10`**:
+**LLaVA-1.5**, **Qwen2-VL**, **Qwen2.5-VL**, **Qwen3-VL**, and
+**MiniCPM-V 4.7 1B**. Language weights and the projector come from GGUF;
+Qwen2.5-VL and Qwen3-VL take the vision tower from GGUF too, so they need no HF
+weights at all. Hybrid mode takes only the vision tower from a matching HF
+checkpoint. MiniCPM-V 4.7 runs the native image path in CI. LLaVA-NeXT and other
+SigLIP layouts are **not** supported.
+
+Qwen2.5-VL shares Qwen2-VL's GGUF tensor names but not its maths
+(RMSNorm blocks, gated SiLU MLP, RMSNorm merger), so it is a separate adapter
+rather than an alias; pass the matching `--hf-model` and the `model_type` plus
+`clip.projector_type` metadata select the right one.
 
 ```bash
 pip install "gguf2mlx[vlm]"
 gguf2mlx convert --type vlm \
   --input qwen2-vl.gguf --mmproj qwen2-vl-mmproj.gguf \
   --hf-model Qwen/Qwen2-VL-2B-Instruct --output ./qwen2-vl-mlx
+
+gguf2mlx convert --type vlm \
+  --input qwen3-vl.gguf --mmproj qwen3-vl-mmproj.gguf \
+  --hf-model Qwen/Qwen3-VL-2B-Instruct --output ./qwen3-vl-mlx
 ```
 
 Flags, hybrid/offline paths and quantization policy: [VLM conversion](docs/vlm-conversion.md).

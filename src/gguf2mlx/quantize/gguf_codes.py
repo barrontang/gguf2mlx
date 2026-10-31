@@ -36,6 +36,37 @@ Per type:
     ``d`` is already ``fp16`` and ``128*d`` is an exact power-of-two scaling, so
     this mapping is bit-exact: measured relative L2 is 0.
 
+Legacy non-K types (block 32)
+    ``Q4_0`` (18 bytes), ``Q4_1`` (20), ``Q5_0`` (22) and ``Q5_1`` (24) all cover
+    exactly 32 values -- MLX's group size -- so they are the *easiest* exact
+    mappings, not the hardest:
+
+    ====== ================== ===================== ======== ==========
+    type   stored scales      decode                scale    bias
+    ====== ================== ===================== ======== ==========
+    Q4_0   ``d``              ``d*(q-8)``           ``d``    ``-8*d``
+    Q4_1   ``d``, ``m``       ``d*q+m``             ``d``    ``m``
+    Q5_0   ``d``              ``d*(q-16)``          ``d``    ``-16*d``
+    Q5_1   ``d``, ``m``       ``d*q+m``             ``d``    ``m``
+    ====== ================== ===================== ======== ==========
+
+    Every code is copied unchanged. For the ``_0`` variants the bias is a
+    power-of-two multiple of ``d``, which is exact in ``fp16``, so those are
+    bit-exact; for the ``_1`` variants ``m`` is already ``fp16`` and is copied
+    through. Relative L2 is 0 for all four (verified against
+    ``gguf.quants.dequantize`` in ``tests/test_gguf_codes.py``).
+
+    "Bit-exact" holds while the derived constant stays representable: ``-8*d``
+    leaves the ``fp16`` range for ``d > 8192`` and ``-16*d`` for ``d > 4096``.
+    A real model never reaches that (it implies weights around 1e6), but a
+    non-finite bias is not silent -- ``audit_preserved`` compares against the
+    reference decode and reports the tensor as a mismatch rather than passing.
+
+    The 5th bit of ``Q5_0``/``Q5_1`` is the one place ggml's layout is easy to
+    get wrong: ``qh`` is four bytes that must be read as a *single little-endian
+    ``uint32``*, value ``i`` taking bit ``i``. It is not four independent bytes
+    of eight bits each, which is how it is sometimes described.
+
 ``Q6_K`` (block 256, 210 bytes)
     Per 16 values: one signed 8-bit sub-block scale, 6-bit codes, one ``fp16``
     ``d`` per 256 values. ``w = d*sc*(q - 32)``.
@@ -66,6 +97,32 @@ Per type:
     defeat the point of the mode. It emits them at 6 bits under a separate
     gate with the tolerance in :data:`PRESERVE_INEXACT_TOLERANCE`; only block
     types with no mapping at all still decode to float.
+
+``Q2_K`` (84 bytes) and ``Q3_K`` (110 bytes)
+    Not mapped, and not for lack of effort: both also carry their scale **and
+    min** per 16 values, so they hit the same 16-versus-32 wall as ``Q6_K``, but
+    with only 2 or 3 code bits a least-squares refit has so few levels that the
+    error stops being "bounded and reported" and starts being a real loss of
+    precision. Fitting them would produce a tensor that is *worse* than the
+    source while still occupying the source's byte budget, so they are decoded
+    to float and recorded, not silently re-fitted.
+
+    The general rule this module encodes: a block format maps exactly onto MLX's
+    affine grid only when its scale granularity divides 32 -- that is, when its
+    scale is per 32 or per 256 values. ``Q4_0``/``Q4_1``/``Q5_0``/``Q5_1``/
+    ``Q8_0`` (32) and ``Q4_K``/``Q5_K`` (256, with 32-value sub-blocks) satisfy
+    it. ``Q2_K``/``Q3_K``/``Q6_K`` store 16-value sub-blocks and cannot.
+
+``IQ*`` and other codebook formats
+    ``IQ2_XXS``/``IQ2_XS``/``IQ3_XXS``/``IQ3_S``/``IQ2_S``/``IQ1_S``/``IQ1_M``/
+    ``IQ4_NL``/``IQ4_XS`` decode as ``d * kvalues[code]`` where ``kvalues`` is a
+    fixed non-uniform table (and, for the ``_XXS``/``_XS``/``_S`` variants, a
+    multi-level sign/hierarchy scheme). There is no ``scale*code + bias`` form
+    at all, so these fail closed: :func:`map_tensor` raises, the tensor is
+    decoded to float under the ``<TYPE>_has_no_affine_reexpression`` reason, and
+    the report names the type. That is the layout an iMatrix-guided
+    quantization produces, so an iMatrix source converts but does not preserve.
+    ``TQ1_0``/``TQ2_0``/``MXFP4`` are excluded for the same reason.
 
 Packing
 -------
@@ -132,18 +189,30 @@ _CHUNK_VALUES = 4 * 1024 * 1024
 MIN_MLX_GROUP_SIZE = 32
 
 _BLOCK_ELEMENTS = {
+    "Q4_0": 32,
+    "Q4_1": 32,
+    "Q5_0": 32,
+    "Q5_1": 32,
     "Q4_K": 256,
     "Q5_K": 256,
     "Q6_K": 256,
     "Q8_0": 32,
 }
 _TYPE_BYTES = {
+    "Q4_0": 18,
+    "Q4_1": 20,
+    "Q5_0": 22,
+    "Q5_1": 24,
     "Q4_K": 144,
     "Q5_K": 176,
     "Q6_K": 210,
     "Q8_0": 34,
 }
 _AFFINE_BITS = {
+    "Q4_0": 4,
+    "Q4_1": 4,
+    "Q5_0": 5,
+    "Q5_1": 5,
     "Q4_K": 4,
     "Q5_K": 5,
     "Q6_K": 6,
@@ -151,8 +220,38 @@ _AFFINE_BITS = {
 }
 
 #: ``GGMLQuantizationType`` values this module understands.
-QTYPE_IDS = {"Q4_K": 12, "Q5_K": 13, "Q6_K": 14, "Q8_0": 8}
+QTYPE_IDS = {
+    "Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7, "Q8_0": 8,
+    "Q4_K": 12, "Q5_K": 13, "Q6_K": 14,
+}
 _NAME_BY_ID = {value: key for key, value in QTYPE_IDS.items()}
+
+#: Block types that exist in GGUF and are rejected by ``preserve``, with the
+#: reason to show a reader. Anything here *converts* -- it is decoded to float
+#: and recorded -- but its codes are not reused, so the artifact does not shrink
+#: the way a preserved one does.
+NON_AFFINE_QTYPES = {
+    # 16-value sub-block scale and min; MLX's smallest group is 32.
+    "Q2_K": "sub_block_scale_is_per_16_values",
+    "Q3_K": "sub_block_scale_is_per_16_values",
+    # Non-uniform codebook: w = d * kvalues[code], which has no affine form.
+    "IQ1_S": "codebook_has_no_affine_form",
+    "IQ1_M": "codebook_has_no_affine_form",
+    "IQ2_XXS": "codebook_has_no_affine_form",
+    "IQ2_XS": "codebook_has_no_affine_form",
+    "IQ2_S": "codebook_has_no_affine_form",
+    "IQ3_XXS": "codebook_has_no_affine_form",
+    "IQ3_S": "codebook_has_no_affine_form",
+    "IQ4_NL": "codebook_has_no_affine_form",
+    "IQ4_XS": "codebook_has_no_affine_form",
+    # Ternary / block-float, neither of which is an affine integer grid.
+    "TQ1_0": "ternary_not_an_integer_grid",
+    "TQ2_0": "ternary_not_an_integer_grid",
+    "MXFP4": "block_float_has_no_affine_form",
+    # 8-bit with per-block sums, used only by ggml's CUDA kernels.
+    "Q8_1": "intermediate_type_never_stored_in_a_file",
+    "Q8_K": "intermediate_type_never_stored_in_a_file",
+}
 
 
 class UnsupportedQuantType(ValueError):
@@ -191,6 +290,19 @@ def qtype_name(qtype: Any) -> str | None:
     if isinstance(name, str) and name in _AFFINE_BITS:
         return name
     return _NAME_BY_ID.get(value)
+
+
+def non_affine_reason(qtype: Any) -> str | None:
+    """Why a known GGUF block type cannot be re-expressed, or ``None``.
+
+    Distinguishes "this type is understood and rejected for a stated reason"
+    from "this type is unknown to the module", which is what the conversion
+    report needs to tell a user apart.
+    """
+    name = qtype if isinstance(qtype, str) else getattr(qtype, "name", None)
+    if not isinstance(name, str):
+        return None
+    return NON_AFFINE_QTYPES.get(name)
 
 
 def mlx_bits(qtype: Any) -> int | None:
@@ -280,7 +392,7 @@ def unpack_codes(packed: np.ndarray, bits: int, cols: int) -> np.ndarray:
     unpacked = np.unpackbits(raw, axis=1, bitorder="little")
     unpacked = unpacked.reshape(rows, cols, bits).astype(np.uint16)
     weights = (np.uint16(1) << np.arange(bits, dtype=np.uint16)).reshape(1, 1, bits)
-    return np.sum(unpacked * weights, axis=-1).astype(np.uint8)
+    return cast(np.ndarray, np.sum(unpacked * weights, axis=-1).astype(np.uint8))
 
 
 def affine_decode(
@@ -339,6 +451,137 @@ def _check_shape(shape: Any, qtype: str) -> tuple[int, int]:
     if len(dims) != 2 or min(dims) <= 0:
         raise ValueError(f"{qtype} mapping needs a positive 2-D shape, got {dims}")
     return dims
+
+
+def _split_nibbles(qs: np.ndarray) -> np.ndarray:
+    """Unpack ``(blocks, 16)`` packed bytes into ``(blocks, 32)`` 4-bit codes.
+
+    ggml stores value ``i`` in the low nibble of byte ``i`` and value ``i + 16``
+    in the high nibble, so the two halves come out as separate runs rather than
+    interleaved pairs. Every 32-value format here (``Q4_0``, ``Q4_1``, ``Q4_K``)
+    uses that order.
+    """
+    packed = qs.reshape(-1, 1, 1, 16)
+    halves = (
+        packed >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)
+    ) & np.uint8(0x0F)
+    return cast(np.ndarray, halves.reshape(qs.shape[0], 32))
+
+
+def _fifth_bits(qh: np.ndarray) -> np.ndarray:
+    """The 5th bit of 32 codes from the 4-byte ``qh`` plane.
+
+    ``qh`` must be read as **one little-endian uint32**, with value ``i`` taking
+    bit ``i``. Reading it as four independent bytes of eight bits each produces
+    codes that decode to plausible-looking but wrong weights, which is the kind
+    of error a shape check cannot see.
+    """
+    words = np.ascontiguousarray(qh).copy().view("<u4").reshape(qh.shape[0], 1)
+    return ((words >> np.arange(32, dtype=np.uint32)) & np.uint32(1)).astype(np.uint8)
+
+
+def _legacy_blocks(
+    raw: np.ndarray, shape: Any, qtype: str
+) -> tuple[int, int, np.ndarray, int]:
+    """Validate a legacy 32-value block tensor and return its block view."""
+    rows, cols = _check_shape(shape, qtype)
+    blocks = _blocks(raw, rows, cols, qtype)
+    return rows, cols, blocks, cols // AFFINE_GROUP_SIZE
+
+
+def q4_0_to_affine(
+    raw: np.ndarray, shape: Any, *, floating_dtype: str = "float16"
+) -> MappingResult:
+    """Re-express ``Q4_0`` as affine 4-bit groups of 32.
+
+    ``w = d*(q-8)`` with ``q`` in ``[0, 15]``, so ``scale = d``, ``bias = -8*d``
+    and the source codes are reused unchanged. ``-8*d`` is a power-of-two
+    scaling of an ``fp16``, so the result is bit-exact.
+    """
+    rows, cols, blocks, groups = _legacy_blocks(raw, shape, "Q4_0")
+    d = blocks[:, 0:2].copy().view("<f2").astype(np.float32)
+    codes = _split_nibbles(blocks[:, 2:]).reshape(rows, cols)
+    return MappingResult(
+        packed=pack_codes(codes, 4),
+        scales=d.reshape(rows, groups).astype(floating_dtype),
+        biases=(-8.0 * d).reshape(rows, groups).astype(floating_dtype),
+        bits=4,
+        group_size=AFFINE_GROUP_SIZE,
+        qtype="Q4_0",
+        exact=True,
+    )
+
+
+def q4_1_to_affine(
+    raw: np.ndarray, shape: Any, *, floating_dtype: str = "float16"
+) -> MappingResult:
+    """Re-express ``Q4_1`` as affine 4-bit groups of 32.
+
+    ``w = d*q + m`` with ``q`` in ``[0, 15]`` and both ``d`` and ``m`` stored as
+    ``fp16``, so the mapping is an identity on the codes and on both constants.
+    """
+    rows, cols, blocks, groups = _legacy_blocks(raw, shape, "Q4_1")
+    d = blocks[:, 0:2].copy().view("<f2").astype(np.float32)
+    m = blocks[:, 2:4].copy().view("<f2").astype(np.float32)
+    codes = _split_nibbles(blocks[:, 4:]).reshape(rows, cols)
+    return MappingResult(
+        packed=pack_codes(codes, 4),
+        scales=d.reshape(rows, groups).astype(floating_dtype),
+        biases=m.reshape(rows, groups).astype(floating_dtype),
+        bits=4,
+        group_size=AFFINE_GROUP_SIZE,
+        qtype="Q4_1",
+        exact=True,
+    )
+
+
+def q5_0_to_affine(
+    raw: np.ndarray, shape: Any, *, floating_dtype: str = "float16"
+) -> MappingResult:
+    """Re-express ``Q5_0`` as affine 5-bit groups of 32.
+
+    ``w = d*(q-16)`` with ``q`` in ``[0, 31]``; the low nibble comes from ``qs``
+    and the fifth bit from ``qh``.
+    """
+    rows, cols, blocks, groups = _legacy_blocks(raw, shape, "Q5_0")
+    d = blocks[:, 0:2].copy().view("<f2").astype(np.float32)
+    high = _fifth_bits(blocks[:, 2:6])
+    low = _split_nibbles(blocks[:, 6:])
+    codes = (low | (high << np.uint8(4))).reshape(rows, cols)
+    return MappingResult(
+        packed=pack_codes(codes, 5),
+        scales=d.reshape(rows, groups).astype(floating_dtype),
+        biases=(-16.0 * d).reshape(rows, groups).astype(floating_dtype),
+        bits=5,
+        group_size=AFFINE_GROUP_SIZE,
+        qtype="Q5_0",
+        exact=True,
+    )
+
+
+def q5_1_to_affine(
+    raw: np.ndarray, shape: Any, *, floating_dtype: str = "float16"
+) -> MappingResult:
+    """Re-express ``Q5_1`` as affine 5-bit groups of 32.
+
+    ``w = d*q + m`` with ``q`` in ``[0, 31]``; both constants are stored as
+    ``fp16``, so this is exact like ``Q4_1``.
+    """
+    rows, cols, blocks, groups = _legacy_blocks(raw, shape, "Q5_1")
+    d = blocks[:, 0:2].copy().view("<f2").astype(np.float32)
+    m = blocks[:, 2:4].copy().view("<f2").astype(np.float32)
+    high = _fifth_bits(blocks[:, 4:8])
+    low = _split_nibbles(blocks[:, 8:])
+    codes = (low | (high << np.uint8(4))).reshape(rows, cols)
+    return MappingResult(
+        packed=pack_codes(codes, 5),
+        scales=d.reshape(rows, groups).astype(floating_dtype),
+        biases=m.reshape(rows, groups).astype(floating_dtype),
+        bits=5,
+        group_size=AFFINE_GROUP_SIZE,
+        qtype="Q5_1",
+        exact=True,
+    )
 
 
 def q4_k_to_affine(
@@ -442,7 +685,7 @@ def _group_sse(
 ) -> np.ndarray:
     """Squared error of one reconstructed group, summed over its values."""
     residual = codes * scale + bias - values
-    return np.sum(residual * residual, axis=-1)
+    return cast(np.ndarray, np.sum(residual * residual, axis=-1))
 
 
 def _codes_for(
@@ -672,6 +915,10 @@ def refit_tensor_to_affine(
 
 
 _MAPPERS = {
+    "Q4_0": q4_0_to_affine,
+    "Q4_1": q4_1_to_affine,
+    "Q5_0": q5_0_to_affine,
+    "Q5_1": q5_1_to_affine,
     "Q4_K": q4_k_to_affine,
     "Q5_K": q5_k_to_affine,
     "Q6_K": q6_k_to_affine,

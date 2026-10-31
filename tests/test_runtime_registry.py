@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -38,6 +39,7 @@ EXPECTED_LLM_MODEL_TYPES = frozenset({
     "glm_moe_dsa",
     "llama",
     "mistral",
+    "mixtral",
     "phi3",
     "qwen2",
     "qwen2_moe",
@@ -51,6 +53,18 @@ VLM_TEXT_HOSTS = {
     "qwen2_vl_text": "qwen2_vl",
     "qwen3_vl_text": "qwen3_vl",
 }
+
+# The `mlx_vlm==0.7.10` wheel ships one module directory per accepted
+# `model_type` and resolves it with ``importlib.import_module``, so a type
+# absent from that listing cannot load no matter what the adapter writes.
+MLX_VLM_0_7_10_MODEL_MODULES = frozenset({
+    "llava",
+    "llava_next",
+    "minicpmv4_7",
+    "qwen2_5_vl",
+    "qwen2_vl",
+    "qwen3_vl",
+})
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -85,7 +99,13 @@ def test_llm_registry_inventory_is_explicit() -> None:
 def test_vlm_registry_inventory_is_explicit() -> None:
     """Every full-VLM adapter must be represented in the runtime contract."""
     assert set(EXPECTED_VLM_MODEL_TYPES) == set(vlm.ARCHITECTURE_REGISTRY)
-    assert EXPECTED_VLM_MODEL_TYPES == {"llava", "qwen2_vl", "minicpmv4_7"}
+    assert EXPECTED_VLM_MODEL_TYPES == {
+        "llava", "llava_next", "qwen2_vl", "qwen2_5_vl", "qwen3_vl", "minicpmv4_7",
+    }
+    assert EXPECTED_VLM_MODEL_TYPES <= MLX_VLM_0_7_10_MODEL_MODULES, (
+        "these adapters emit a model_type the pinned mlx-vlm has no module for: "
+        f"{sorted(EXPECTED_VLM_MODEL_TYPES - MLX_VLM_0_7_10_MODEL_MODULES)}"
+    )
 
 
 def test_text_encoder_runtime_hosts_are_explicit() -> None:
@@ -93,14 +113,35 @@ def test_text_encoder_runtime_hosts_are_explicit() -> None:
     assert _converted_vlm_text_types() == set(VLM_TEXT_HOSTS)
 
 
+def test_runtime_floors_match_the_declared_extras() -> None:
+    """The floor the resolution checks skip below must be the installed floor.
+
+    Deliberately runtime-free: this has to hold in every environment, including
+    the older interpreters that cannot run the checks the floors protect. Without
+    it, relaxing a floor in ``pyproject.toml`` would silently turn several tests
+    into skips and no one would notice.
+    """
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    declared = {
+        name: tuple(int(part) for part in version.split("."))
+        for name, version in re.findall(
+            # No closing quote in the pattern: every pin carries a platform marker.
+            r'"(mlx-lm|mlx-vlm)>=([0-9][0-9.]*)',
+            pyproject.read_text(encoding="utf-8"),
+        )
+    }
+    expected = {"mlx-lm": MINIMUM_MLX_LM, "mlx-vlm": MINIMUM_MLX_VLM}
+    assert declared == expected, (
+        "the runtime floors asserted in this file no longer match pyproject.toml: "
+        f"tests declare {expected}, pyproject declares {declared}"
+    )
+
+
 def _require_mlx_lm() -> Any:
     mlx_lm = pytest.importorskip(
         "mlx_lm", reason="runtime registry checks need Apple Silicon and mlx-lm"
     )
-    lm_version = _version_tuple(importlib.metadata.version("mlx-lm"))
-    assert lm_version >= MINIMUM_MLX_LM, (
-        f"mlx-lm {lm_version} is older than the declared floor {MINIMUM_MLX_LM}"
-    )
+    _require_floor("mlx-lm", MINIMUM_MLX_LM)
     return mlx_lm
 
 
@@ -108,11 +149,25 @@ def _require_mlx_vlm() -> Any:
     mlx_vlm = pytest.importorskip(
         "mlx_vlm", reason="runtime registry checks need Apple Silicon and mlx-vlm"
     )
-    vlm_version = _version_tuple(importlib.metadata.version("mlx-vlm"))
-    assert vlm_version >= MINIMUM_MLX_VLM, (
-        f"mlx-vlm {vlm_version} is older than the declared floor {MINIMUM_MLX_VLM}"
-    )
+    _require_floor("mlx-vlm", MINIMUM_MLX_VLM)
     return mlx_vlm
+
+
+def _require_floor(distribution: str, floor: tuple[int, ...]) -> None:
+    """Skip — not fail — when the installed runtime predates the declared floor.
+
+    An older runtime cannot express the answer this test asks for, so a failure
+    would say nothing about the converter and only teach readers to ignore the
+    suite. The floor itself is still gated unconditionally, by
+    ``test_runtime_floors_match_the_declared_extras`` below, which needs no
+    runtime installed.
+    """
+    installed = _version_tuple(importlib.metadata.version(distribution))
+    if installed < floor:
+        pytest.skip(
+            f"{distribution} {'.'.join(map(str, installed))} predates the declared "
+            f"floor {'.'.join(map(str, floor))}; this environment cannot host the check"
+        )
 
 
 @pytest.mark.parametrize("model_type", sorted(EXPECTED_LLM_MODEL_TYPES))

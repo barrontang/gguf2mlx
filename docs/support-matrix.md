@@ -11,14 +11,15 @@
 
 Language-model conversion is enabled only for explicit adapters. Text conditioning
 adds a separate, opt-in contract for the four Qwen-VL identifiers above.
-Full-VLM detection and conversion provide LLaVA, Qwen2-VL, and a dense
-MiniCPM-V 4.7 1B adapter.
+Full-VLM detection and conversion provide LLaVA, LLaVA-NeXT (anyres), Qwen2-VL,
+Qwen2.5-VL, Qwen3-VL, and a dense MiniCPM-V 4.7 1B adapter.
 
 ### Conversion-enabled architectures
 
 | Family | GGUF architecture IDs | Conversion | End-to-end | MoE | Mixed precision | `.mlx` bundle | VLM |
 |---|---|---|---|---|---|---|---|
 | Llama | `llama`, `mistral` | ✅ | ✅ Llama-3.2-1B Q4_0/Q4_K_M/Q8_0 real GGUF in CI | ❌ | — | ✅ generic package/verify | ❌ |
+| Mixtral | `mixtral`, or `llama` with `llama.expert_count > 0` | ✅ both on-disk layouts (requant only; `preserve` refuses it) | ✅ fixture-pinned name and shape conformance against `mlx_lm.models.mixtral`; no pinned real GGUF (smallest public quant is ~18 GB) | ✅ | — | ✅ generic package/verify | ❌ |
 | Qwen | `qwen2`, dense `qwen3` | ✅ | ✅ Qwen2.5-0.5B Q4_0/Q4_K_M/Q8_0 and Qwen3-0.6B Q8_0 in CI | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen3.5 family | `qwen35`; aliases `qwen3_5`, `qwen3.5`, `qwen36`, `qwen3_6`, `qwen3.6`, `qwen38`, `qwen3_8`, `qwen3.8` | ✅ dense layouts + preserve | ✅ Qwen3.5-0.8B Q4_K_M preserve: local run passes convert → weight gate → preserve gate → `mlx_lm.load` → finite logits (nightly job pending); aliases fixture-tested | ❌ | — | ✅ generic package/verify | ❌ |
 | Qwen MoE | `qwen2moe`, `qwen3moe` | ✅ | ✅ Qwen1.5 and Qwen3-30B-A3B real-GGUF uniform 4-bit smoke tests | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
@@ -29,7 +30,10 @@ MiniCPM-V 4.7 1B adapter.
 | StableLM | `stablelm` | ✅ | ❌ | ❌ | — | ✅ generic package/verify | ❌ |
 | GLM | `glm-dsa` | ⚠️ experimental | ❌ | ✅ | ⚠️ experimental; JANG runtime unverified | ✅ generic package/verify | ❌ |
 | LLaVA | `llava`, or `llama` + CLIP/mmproj | ✅ direct/hybrid fixture-validated | Tiny image-path parity; pretrained quality unverified | ❌ | Language-only 4-bit | ✅ generic package/verify | ✅ Llama + CLIP only |
+| LLaVA-NeXT (anyres) | `llava_next` + CLIP-L/336 `mmproj` | ✅ direct (no HF vision) | ✅ llava-v1.6-vicuna-7b Q4_K_M + F16 mmproj: 378/378 mmproj tensors consumed, 380/380 emitted names match the HF index by name and shape, 375/375 tower parameters load strictly into mlx-vlm and the tower runs. The text half must come from the same HF checkpoint: llama.cpp's LLaVA exports drop the `<image>` row and are refused by name | ❌ | Not measured | ✅ generic package/verify | ✅ CLIP + anyres projector + `model.image_newline` |
 | Qwen2-VL | `qwen2vl` + Qwen2-VL/mmproj | ✅ direct/hybrid fixture-validated | Named 2B direct checkpoint: 12/12 image diagnostic; see [report](qwen2-vl-real-validation.md) | ❌ | Uniform 4-bit: 11/12 exact; source-preserved Q4_K/float: 12/12 | ✅ generic package/verify | ✅ ViT + patch merger |
+| Qwen2.5-VL | `qwen2vl` + `clip.projector_type=qwen2.5vl_merger` | ✅ direct (no HF vision) | ✅ Qwen2.5-VL-3B-Instruct Q4_K_M + F16 mmproj: 824/824 tensors match the HF index by name and shape; fused QKV / stacked patch embedding / merger within 3e-8 of the checkpoint | ❌ | Not measured | ✅ generic package/verify | ✅ RMSNorm ViT + gated SiLU MLP + RMSNorm merger |
+| Qwen3-VL | `qwen3vl` + `clip.projector_type=qwen3vl_merger` | ✅ direct (no HF vision) | ✅ Qwen3-VL-2B-Instruct Q4_K_M + F16 mmproj: 625/625 tensors match the HF index by name and shape; deepstack mergers mapped by rank | ❌ | Not measured | ✅ generic package/verify | ✅ fused QKV + deepstack mergers + learned pos_embed |
 | MiniCPM-V 4.7 1B | dense `qwen35` + `clip.projector_type=minicpmv4_7` | ✅ portable + native image path | Native image-path CI; pretrained caption quality unverified | ❌ (35B-A3B excluded) | ❌ | ✅ generic package/verify | ✅ SigLIP + window/final mergers |
 | Qwen-VL text encoder | `qwen3vl`, `qwen3_vl`, `qwen2vl`, `qwen2_vl` | ✅ `--type text-encoder`, BF16 default | Portable conversion only; native hidden-state/image quality unverified | ❌ | Explicit direct 4-bit only | ✅ generic package/verify | Text only; vision skipped |
 
@@ -40,6 +44,17 @@ The mixed-precision contract validator checks agreement between
 loading the result in a JANG-compatible runtime. `.mlx` bundle packaging and
 integrity verification are architecture-independent operations on emitted model
 directories and do not assert runtime compatibility.
+
+The Qwen2.5-VL and Qwen3-VL vision claims have two independent checks behind
+them, because neither is sufficient alone. `tests/test_vlm_qwen25.py` and
+`tests/test_vlm_qwen3.py` drive synthetic fixtures that prove the converter
+*assembles* what each adapter declares; `tests/test_vlm_real_mmproj.py` reads the
+downloaded `mmproj` files and proves each declaration matches what llama.cpp
+actually shipped — every source named, every shape right, and the assembled
+target shape reproduced from real sources. Neither test can substitute for the
+other: a fixture can only contain the tensors the plan asks for, so a plan that
+invents a tensor passes it. The tensor *count* is pinned in that test so a
+regenerated fixture changes the count instead of passing quietly.
 
 The ✅ end-to-end cells are produced by the `Load matrix` workflow, which
 downloads each pinned GGUF by SHA-256, converts it, runs the weight-fidelity
@@ -52,7 +67,7 @@ each job uploads the conversion report it produced.
 
 ### Pinned versus declared-only
 
-`CONVERTIBLE_ARCHES` lists 30 architecture IDs — 22 canonical plus 8 alias
+`CONVERTIBLE_ARCHES` lists 31 architecture IDs — 23 canonical plus 8 alias
 spellings; the pinned matrix covers six of those canonical architectures
 (`llama`, `qwen2`, `qwen3`, `qwen35`, `gemma2`, `phi3`). The
 difference is not implied — it is written down and enforced.
@@ -68,6 +83,7 @@ minimum pinned `mlx-lm`/`mlx-vlm` registries.
 | `deepseek2`, `deepseek3`, `glm4moe`, `glm-dsa`, `qwen2moe`, `qwen3moe` | MoE/MLA sources; the smallest public GGUFs exceed the per-runner download budget, and router protection needs its own case. `weekly-moe.yml` can cover `qwen3moe` and `deepseek2` instead, but only on a runner that already holds those files: it is **inactive until `GGUF2MLX_MOE_MODELS` is set**, and reports `skipped` rather than passing. |
 | `gemma`, `gemma3`, `gemma4` | share `gemma2`'s adapter path, which is pinned; no small pinned GGUF for the others yet |
 | `mistral`, `phi4` | share `llama`'s tensor map and `phi3`'s sliding-window adapter, both pinned |
+| `mixtral` | 8x7B MoE; the smallest public quant is ~18 GB, over the per-runner budget. `tests/test_mixtral.py` pins both on-disk layouts and checks every emitted name against `mlx_lm.models.mixtral` instead |
 | `qwen36`, `qwen38` (and their alias spellings) | newer hybrid variants share the dense Qwen3.5 adapter and are fixture-tested; only `qwen35` has a pinned real-model case |
 | `stablelm` | adapter ships; no pinned public GGUF yet |
 | `qwen2_vl`, `qwen3_vl` | full VLM entries need the matching HF repo beside the GGUF; `vision.yml` owns that path |
@@ -75,6 +91,29 @@ minimum pinned `mlx-lm`/`mlx-vlm` registries.
 Pin an entry by adding it to `tests/load_matrix.json` and deleting its line from
 `DECLARED_COVERAGE_GAPS` — the test fails on a stale line, so the two cannot
 drift apart.
+
+#### MoE naming matrix
+
+Every accepted MoE layout names its router and its experts differently, and the
+per-family suites cannot see each other. `tests/test_moe_matrix.py` holds one row
+per layout and checks three things: the router lands on the module mlx-lm
+instantiates, the stacked experts land in that family's switch module, and the
+shared-expert module is spelled the way that family spells it.
+
+| Layout | Router | Routed experts | Shared expert |
+|---|---|---|---|
+| `qwen2moe` | `mlp.gate` | `mlp.switch_mlp.*` | `mlp.shared_expert` + `mlp.shared_expert_gate` |
+| `qwen3moe` | `mlp.gate` | `mlp.switch_mlp.*` | none |
+| `deepseek2`, `deepseek3`, `glm4moe`, `glm-dsa` | `mlp.gate` (+ `e_score_correction_bias`) | `mlp.switch_mlp.*` | `mlp.shared_experts` |
+| `mixtral` | `block_sparse_moe.gate` | `block_sparse_moe.switch_mlp.*` | none |
+| `gemma4` | `router.proj` (+ `router.scale`) | `experts.switch_glu.*` | none |
+
+The table is checked against `mlx_lm.models.<family>` parameter trees, not only
+against itself, so a plausible-looking row that names a module the runtime does
+not have fails. `glm-dsa` is the one layout outside the runtime half — its
+`glm_moe_dsa` arguments need an indexer configuration this matrix has no other
+use for — and a separate assertion fails if that gap changes in either direction,
+so it cannot be forgotten once a tiny configuration exists.
 
 #### Qwen3 MoE real-model validation
 

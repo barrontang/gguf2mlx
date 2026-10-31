@@ -5,7 +5,7 @@ Qwen2.5-VL and Qwen3.x use different vision blocks and are not aliases.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 
@@ -13,7 +13,32 @@ from . import gguf2mlx as core
 from . import vlm
 
 
-class Qwen2VisionAdapter:
+class Qwen2VisionAdapter(vlm.MropePlanAdapter):
+    """Qwen2-VL's ViT: LayerNorm blocks, a two-layer MLP, and a plain merger.
+
+    Inheriting ``PlanAdapter`` is not cosmetic. The converter reads
+    ``stacked_targets`` off every plan adapter to decide whether a multi-source
+    target is stacked on a new axis (the temporal patch embedding) or
+    concatenated along an existing one (the QKV projections), so a plan adapter
+    that does not declare it raises ``AttributeError`` mid-conversion.
+    """
+
+    name = "Qwen2-VL"
+    text_arch = "qwen2"
+    nested_text_config = False
+    processor_type = "Qwen2VLImageProcessor"
+    processor_geometry = (
+        ("patch_size", "patch_size"),
+        ("temporal_patch_size", "temporal_patch_size"),
+        ("merge_size", "spatial_merge_size"),
+    )
+    special_tokens: ClassVar[dict[str, str]] = {
+        "image_token_id": "<|image_pad|>",
+        "video_token_id": "<|video_pad|>",
+        "vision_start_token_id": "<|vision_start|>",
+        "vision_end_token_id": "<|vision_end|>",
+    }
+
     def __init__(self, config: dict):
         if config.get("architectures") not in (None, ["Qwen2VLForConditionalGeneration"]):
             raise ValueError("Unsupported Qwen2-VL HF architecture")
@@ -129,11 +154,11 @@ class Qwen2VisionAdapter:
 
     def _add(
         self, target: str, shape: tuple[int, ...], sources: tuple[str, ...],
-        source_shape: tuple[int, ...] | None = None,
+        source_shape: tuple[int, ...] | None = None, axis: int = 0,
     ) -> None:
         target = "vision_tower." + target
         self.expected[target] = shape
-        self.vision_plan.append((target, sources, 0))
+        self.vision_plan.append((target, sources, axis))
         for source in sources:
             self.source_shapes[source] = source_shape or shape
 
@@ -143,7 +168,7 @@ class Qwen2VisionAdapter:
         merged = v * self.vision["spatial_merge_size"] ** 2
         self._add(
             "patch_embed.proj.weight", (v, 3, 2, p, p),
-            ("v.patch_embd.weight", "v.patch_embd.weight.1"), (v, 3, p, p),
+            ("v.patch_embd.weight", "v.patch_embd.weight.1"), (v, 3, p, p), axis=2,
         )
         for i in range(self.vision["depth"]):
             for suffix in ("weight", "bias"):

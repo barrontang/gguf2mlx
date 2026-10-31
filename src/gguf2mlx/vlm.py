@@ -12,7 +12,7 @@ import json
 import re
 import shutil
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 from gguf import GGMLQuantizationType, GGUFReader
@@ -35,7 +35,10 @@ VLM_ARCHITECTURES = {
 }
 ARCHITECTURE_REGISTRY = {
     "llava": "llama_clip_mlp",
+    "llava_next": "llama_clip_mlp_anyres",
     "qwen2_vl": "qwen2_vit_patch_merger",
+    "qwen2_5_vl": "qwen25_vit_gated_merger",
+    "qwen3_vl": "qwen3_vit_deepstack_merger",
     "minicpmv4_7": "qwen35_siglip_window_merger",
 }
 ASSETS = (
@@ -216,10 +219,13 @@ def _validate_config(config: dict) -> tuple[dict, dict]:
     return text, vision
 
 
-def _language_shapes(text: dict, *, attention_bias: bool = False) -> dict[str, tuple[int, ...]]:
+def _language_shapes(
+    text: dict, *, attention_bias: bool = False, qk_norm: bool = False,
+) -> dict[str, tuple[int, ...]]:
     shapes: dict[str, tuple[int, ...]] = {}
     h, f, vocab = text["hidden_size"], text["intermediate_size"], text["vocab_size"]
     kv = h // text["num_attention_heads"] * text["num_key_value_heads"]
+    head_dim = text.get("head_dim", h // text["num_attention_heads"])
     shapes["language_model.model.embed_tokens.weight"] = (vocab, h)
     if not text.get("tie_word_embeddings", False):
         shapes["language_model.lm_head.weight"] = (vocab, h)
@@ -234,10 +240,172 @@ def _language_shapes(text: dict, *, attention_bias: bool = False) -> dict[str, t
             "mlp.down_proj.weight": (h, f),
         }.items():
             shapes[prefix + name] = shape
+        if qk_norm:
+            shapes[prefix + "self_attn.q_norm.weight"] = (head_dim,)
+            shapes[prefix + "self_attn.k_norm.weight"] = (head_dim,)
         if attention_bias:
             for part, size in (("q", h), ("k", kv), ("v", kv)):
                 shapes[prefix + f"self_attn.{part}_proj.bias"] = (size,)
     return shapes
+
+
+class PlanAdapter:
+    """Base for architectures that own an explicit vision tensor plan.
+
+    Each adapter builds ``expected`` (every output name and shape), ``vision_plan``
+    (output name, the GGUF sources it is assembled from, and the concat axis) and
+    ``source_shapes`` (the shape each source must have). ``convert_vlm`` assembles
+    the plan, so an adapter cannot emit a tensor it did not declare, and a source
+    tensor the plan does not name is rejected rather than dropped.
+    """
+
+    #: human-readable family name used in error messages
+    name = "vision adapter"
+    #: GGUF architecture IDs the text half may declare
+    gguf_text_architectures: tuple[str, ...] = ("qwen2vl",)
+    #: architecture passed to ``core._map_tensor_name`` for the language half
+    text_arch = "qwen2"
+    #: ``image_processor_type`` the original HF processor must declare
+    processor_type = "Qwen2VLImageProcessor"
+    #: whether mlx-vlm reads text hyperparameters from a nested ``text_config``
+    nested_text_config = False
+    #: whether the language half carries per-head Q/K RMSNorm weights
+    qk_norm = False
+    #: (processor key, vision config key) pairs that must agree
+    processor_geometry: tuple[tuple[str, str], ...] = (
+        ("patch_size", "patch_size"),
+        ("temporal_patch_size", "temporal_patch_size"),
+        ("merge_size", "spatial_merge_size"),
+    )
+    #: whether the GGUF uses the historical ``qwen2vl_merger`` ffn_up/down flip
+    #:
+    #: A default rather than a ``ClassVar`` because Qwen2-VL is the one adapter
+    #: that *derives* the answer: ``configure_layout`` reads ``clip.projector_type``
+    #: and flips this per instance, since the same adapter object serves both the
+    #: current and the historical exporter. Every other adapter leaves it alone.
+    legacy_merger: bool = False
+    #: set by ``convert_vlm`` before ``configure_layout``: the vision tower is
+    #: coming from the HF checkpoint, so GGUF-only reconciliation must stand down.
+    vision_from_hf: bool = False
+    #: whether ``--preserve-source-quant`` may reuse this family's language codes
+    supports_source_preserve: bool = True
+    #: parameters the adapter writes itself because no file carries them.
+    #: Class-level defaults that a concrete adapter *replaces* per instance; none
+    #: of them is ever mutated in place, so the shared empty dicts stay empty.
+    identity_fills: dict[str, np.ndarray] = {}  # noqa: RUF012
+    #: why each identity-filled parameter is unobservable
+    identity_reasons: dict[str, str] = {}  # noqa: RUF012
+    #: ``config.json`` values the adapter overrides after reconciliation
+    output_overrides: dict[str, Any] = {}  # noqa: RUF012
+    #: selected hidden state, once the stored block count is known
+    feature_layer: int = -2
+    #: targets built by stacking sources along ``axis`` (a *new* axis) rather
+    #: than concatenating them along an existing one.
+    stacked_targets: ClassVar[tuple[str, ...]] = ("patch_embed.proj.weight",)
+    #: target-name fragments that belong to the projector, not the tower, so a
+    #: hybrid run does not discard them along with the vision weights
+    projector_markers: ClassVar[tuple[str, ...]] = (".merger.", "multi_modal_projector.")
+    special_tokens: ClassVar[dict[str, str]] = {}
+
+    # Set by each concrete adapter; declared here so the shared text-metadata
+    # checks type-check against one contract.
+    text: dict
+    vision: dict
+    expected: dict[str, tuple[int, ...]]
+    vision_plan: list[tuple[str, tuple[str, ...], int]]
+    source_shapes: dict[str, tuple[int, ...]]
+    source_names: set[str]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if not cls.special_tokens:
+            cls.special_tokens = {
+                "image_token_id": "<|image_pad|>",
+                "video_token_id": "<|video_pad|>",
+                "vision_start_token_id": "<|vision_start|>",
+                "vision_end_token_id": "<|vision_end|>",
+            }
+
+    def configure_layout(self, readers: list[Any]) -> None:
+        """Reject layouts the adapter does not implement; the default has none."""
+
+    def validate_processor(self, processor: dict, readers: list[Any]) -> None:
+        """Cross-check the HF image processor against the declared vision geometry."""
+        for key, vision_key in self.processor_geometry:
+            if processor.get(key) != self.vision[vision_key]:
+                raise ValueError(
+                    f"{self.name} processor {key} missing or incompatible with vision"
+                )
+
+    def normalize_source(self, name: str, array: np.ndarray) -> np.ndarray:
+        """Adjust a decoded source whose export shape differs from the plan."""
+        return array
+
+    def restore_text(self, name: str, array: np.ndarray) -> np.ndarray:
+        """Undo a GGUF text-side permutation; the default has none."""
+        return array
+
+    def validate_text_metadata(self, reader: Any) -> None:
+        """Check the language GGUF against the dimensions the adapter resolved.
+
+        Only the shared half of the contract lives here. Rotary layout is
+        family-specific -- Qwen's mRoPE and Llama's unscaled RoPE share no keys --
+        so :class:`MropePlanAdapter` adds the former and each other family adds
+        its own.
+        """
+        architecture = core.get_metadata_str(reader, "general.architecture")
+        if architecture not in self.gguf_text_architectures:
+            raise ValueError(
+                f"{self.name} requires GGUF architecture in "
+                f"{list(self.gguf_text_architectures)}, not {architecture!r}"
+            )
+        for src, dst in {
+            "embedding_length": "hidden_size", "feed_forward_length": "intermediate_size",
+            "block_count": "num_hidden_layers", "attention.head_count": "num_attention_heads",
+            "attention.head_count_kv": "num_key_value_heads",
+        }.items():
+            value = core.get_metadata_int(reader, f"{architecture}.{src}")
+            if value is not None and value != self.text[dst]:
+                raise ValueError(f"GGUF {src} missing or incompatible with HF {dst}")
+        for src, expected in {
+            "vocab_size": self.text["vocab_size"],
+            "rope.dimension_count": self.text.get(
+                "head_dim", self.text["hidden_size"] // self.text["num_attention_heads"]
+            ),
+        }.items():
+            value = core.get_metadata_int(reader, f"{architecture}.{src}")
+            if value is not None and value != expected:
+                raise ValueError(f"GGUF {src} is incompatible with HF config")
+        for src, dst in {
+            "rope.freq_base": "rope_theta", "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+        }.items():
+            float_value = core.get_metadata_float(reader, f"{architecture}.{src}")
+            if float_value is not None and not np.isclose(
+                float_value, self.text[dst], rtol=1e-5, atol=0
+            ):
+                raise ValueError(f"GGUF {src} is incompatible with HF {dst}")
+
+
+class MropePlanAdapter(PlanAdapter):
+    """Plan adapter whose language half uses Qwen's interleaved mRoPE.
+
+    The dimension sections are a Qwen-only metadata field, so this lives in its
+    own class rather than in the base: a Llama-text adapter inheriting the base
+    would otherwise demand a key llama.cpp never writes.
+    """
+
+    def validate_text_metadata(self, reader: Any) -> None:
+        super().validate_text_metadata(reader)
+        architecture = core.get_metadata_str(reader, "general.architecture")
+        sections = core.get_metadata_array_int(
+            reader, f"{architecture}.rope.dimension_sections"
+        )
+        expected_sections = self.text["rope_scaling"]["mrope_section"]
+        if sections not in (expected_sections, expected_sections + [0]):
+            raise ValueError("GGUF mrope dimension_sections missing or incompatible")
+        scaling = core.get_metadata_str(reader, f"{architecture}.rope.scaling.type")
+        if scaling not in (None, "none", "mrope"):
+            raise ValueError("Unsupported GGUF mRoPE scaling type")
 
 
 def _expected_shapes(text: dict, vision: dict) -> dict[str, tuple[int, ...]]:
@@ -340,7 +508,73 @@ def _validate_vision_metadata(reader: Any, vision: dict) -> None:
         raise ValueError("GGUF CLIP activation is incompatible with HF vision hidden_act")
 
 
-def _validate_tokenizer(reader: Any, root: Path, text: dict, config: dict) -> None:
+def _vocabulary_gap_message(
+    count: int, text: dict, by_id: dict[int, str], config: dict,
+) -> str:
+    """Explain a GGUF/HF vocabulary size gap by naming what breaks first.
+
+    Both directions are refusals, but they mean opposite things to the caller: a
+    GGUF that is *longer* than the HF vocabulary carries rows no token names, and
+    a GGUF that is *shorter* is missing rows a prompt can still ask for.
+    """
+    vocab = text["vocab_size"]
+    if count > vocab:
+        return (
+            f"GGUF tokenizer declares {count} tokens but the HF text config declares "
+            f"vocab_size {vocab}; {count - vocab} GGUF rows have no HF token. "
+            "Supply a GGUF converted from the same HF checkpoint."
+        )
+    named = ", ".join(
+        f"{index}={by_id[index]}"
+        for index in range(count, min(count + 4, vocab))
+        if index in by_id
+    )
+    raw_image_index = config.get("image_token_index", config.get("image_token_id"))
+    # bool is an int subclass, so it has to be excluded before the range test.
+    image_index: int | None = (
+        raw_image_index
+        if isinstance(raw_image_index, int) and not isinstance(raw_image_index, bool)
+        else None
+    )
+    consequence = (
+        f" config.image_token_index={image_index} "
+        f"({by_id.get(image_index, 'unnamed')}) is one of them: mlx-vlm embeds the "
+        "prompt before it splices in image features, so that row has to exist."
+        if image_index is not None and count <= image_index < vocab else
+        " mlx-vlm embeds every prompt token before it splices in image features, "
+        "so a token outside the embedding table cannot be run."
+    )
+    return (
+        f"GGUF tokenizer declares {count} tokens but the HF text config declares "
+        f"vocab_size {vocab}: HF ID(s) {count}..{vocab - 1} "
+        f"({named or 'unnamed by the HF tokenizer'}) have no row in the GGUF "
+        f"embedding table.{consequence} Supply a GGUF converted from the same HF "
+        "checkpoint rather than a repack that trimmed the extra rows."
+    )
+
+
+def _clip_mlp_role_hint(name: str, array: Any, expected_shape: tuple[int, ...]) -> str:
+    """Explain a transposed CLIP/SigLIP ffn tensor as the role swap it usually is.
+
+    ``ffn_up`` and ``ffn_down`` carry the same two names in both llama.cpp
+    exporters, in opposite roles, so the only visible symptom of a mislabelled
+    file is that the expansion and projection arrive transposed. A bare "got X,
+    expected Y" sends readers looking for a corrupt file instead.
+    """
+    if not name.endswith((".mlp.fc1.weight", ".mlp.fc2.weight")):
+        return ""
+    if tuple(array.shape) != tuple(reversed(expected_shape)):
+        return ""
+    return (
+        " — a CLIP/SigLIP MLP is width -> feed_forward -> width, so this file "
+        "labels the expansion and projection under the opposite ffn_up/ffn_down "
+        "roles from the one this adapter resolved"
+    )
+
+
+def _validate_tokenizer(
+    reader: Any, root: Path, text: dict, config: dict, adapter: Any = None,
+) -> None:
     document = _read_json(root / "tokenizer.json")
     tokenizer_config = _read_json(root / "tokenizer_config.json")
     model = document.get("model", {})
@@ -389,7 +623,7 @@ def _validate_tokenizer(reader: Any, root: Path, text: dict, config: dict) -> No
         )
     tokens = core.get_metadata_array_str(reader, "tokenizer.ggml.tokens")
     if len(tokens) != text["vocab_size"]:
-        raise ValueError("GGUF tokenizer vocabulary must match HF text embedding vocab_size")
+        raise ValueError(_vocabulary_gap_message(len(tokens), text, by_id, config))
     last_hf_token = max(by_id, default=-1)
     for i, token in enumerate(tokens):
         if i not in by_id and i > last_hf_token and token == f"[PAD{i}]":
@@ -406,9 +640,8 @@ def _validate_tokenizer(reader: Any, root: Path, text: dict, config: dict) -> No
         if gguf_id is not None and hf_id is not None and gguf_id != hf_id:
             raise ValueError(f"HF/GGUF {kind} token IDs differ")
     special_tokens = (
-        {"image_token_id": "<|image_pad|>", "video_token_id": "<|video_pad|>",
-         "vision_start_token_id": "<|vision_start|>", "vision_end_token_id": "<|vision_end|>"}
-        if config.get("model_type") == "qwen2_vl" else {"image_token_index": "<image>"}
+        dict(adapter.special_tokens) if adapter is not None
+        else {"image_token_index": "<image>"}
     )
     for key, token in special_tokens.items():
         image_id = config.get(key, 32000 if key == "image_token_index" else None)
@@ -436,9 +669,14 @@ def _read_optional_json(path: Path) -> dict:
     return _read_json(path) if path.is_file() else {}
 
 
-def _validate_processor(readers: list[Any], root: Path, vision: dict, architecture: str) -> None:
+def _validate_processor(
+    readers: list[Any], root: Path, vision: dict, architecture: str, adapter: Any = None,
+) -> None:
     processor = _read_json(root / "preprocessor_config.json")
-    expected_type = "Qwen2VLImageProcessor" if architecture == "qwen2_vl" else "CLIPImageProcessor"
+    expected_type = (
+        adapter.processor_type if adapter is not None
+        else "Qwen2VLImageProcessor" if architecture == "qwen2_vl" else "CLIPImageProcessor"
+    )
     if processor.get("image_processor_type") not in (expected_type, expected_type + "Fast"):
         raise ValueError(f"HF image processor must be {expected_type}")
     for key in ("image_mean", "image_std"):
@@ -456,7 +694,9 @@ def _validate_processor(readers: list[Any], root: Path, vision: dict, architectu
                     gguf_value, value, rtol=1e-5, atol=1e-7
                 ):
                     raise ValueError(f"GGUF/HF image processor {key} mismatch")
-    if architecture == "qwen2_vl":
+    if adapter is not None:
+        adapter.validate_processor(processor, readers)
+    elif architecture == "qwen2_vl":
         for key, vision_key in (
             ("patch_size", "patch_size"), ("temporal_patch_size", "temporal_patch_size"),
             ("merge_size", "spatial_merge_size"),
@@ -510,6 +750,33 @@ def _map_projector(name: str) -> str:
     return f"multi_modal_projector.{linear}.{match[2]}"
 
 
+def _swap_ffn_role(
+    mapped: str, array: np.ndarray, expected: dict[str, tuple[int, ...]],
+) -> str:
+    """Re-aim a CLIP MLP tensor at the role its dimensions prove it fills.
+
+    The two exporters disagree about the layer names: ``clip.cpp``'s LLaVA-era
+    loader reads ``ffn_down`` as the GELU input and ``ffn_up`` as the output
+    projection, the modern mtmd graph reads ``ffn_up`` as the expansion. Both
+    files are in the wild under both names, and the names carry no marker, so a
+    tensor that fits the sibling target exactly -- and its own not at all -- is
+    re-aimed rather than rejected. Equal-width MLPs stay ambiguous, and there the
+    name mapping stands, as before.
+    """
+    for current, other in ((".mlp.fc1.", ".mlp.fc2."), (".mlp.fc2.", ".mlp.fc1.")):
+        if current not in mapped:
+            continue
+        sibling = mapped.replace(current, other)
+        if (
+            tuple(array.shape) != expected[mapped]
+            and sibling in expected
+            and tuple(array.shape) == expected[sibling]
+        ):
+            return sibling
+        return mapped
+    return mapped
+
+
 def _decode(tensor: Any, dtype: str) -> np.ndarray:
     shape = tuple(int(dim) for dim in reversed(tensor.shape))
     if not shape or any(dim <= 0 for dim in shape):
@@ -561,16 +828,24 @@ def _hf_vision_name(
 ) -> str | None:
     if architecture == "minicpmv4_7":
         return minicpm.hf_vision_name(name) if minicpm else None
-    if architecture == "qwen2_vl":
+    if architecture in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl"):
         for prefix in ("visual.", "model.visual.", "vision_tower."):
             if name.startswith(prefix):
                 suffix = name[len(prefix):]
-                # The merger (including its norm) always comes from GGUF.
-                return None if suffix.startswith("merger.") else "vision_tower." + suffix
+                # Every merger, the deepstack mergers and the learned position
+                # embedding are reconstructed from GGUF metadata and weights;
+                # taking them from the HF checkpoint too would double-own them.
+                if suffix.startswith(("merger.", "deepstack_merger_list.", "pos_embed.")):
+                    return None
+                return "vision_tower." + suffix
         return None
     for prefix in (VISION_PREFIX, "model." + VISION_PREFIX, "vision_model."):
         if name.startswith(prefix):
             return VISION_PREFIX + name[len(prefix):]
+    if architecture == "llava_next" and name == "model.image_newline":
+        # The anyres separator row lives outside ``vision_tower`` in mlx-vlm's
+        # llava_next module, so the prefix rules above cannot reach it.
+        return "image_newline"
     return None
 
 
@@ -708,6 +983,27 @@ def _repack_q4_k(tensor: Any, dtype: str) -> tuple[np.ndarray, np.ndarray, np.nd
     )
 
 
+def _vision_adapter(architecture: str, config: dict) -> Any:
+    """Instantiate the plan adapter that owns ``architecture``, if any."""
+    if architecture == "qwen2_vl":
+        from .vision_qwen2 import Qwen2VisionAdapter
+
+        return Qwen2VisionAdapter(config)
+    if architecture == "qwen2_5_vl":
+        from .vision_qwen25 import Qwen25VisionAdapter
+
+        return Qwen25VisionAdapter(config)
+    if architecture == "qwen3_vl":
+        from .vision_qwen3 import Qwen3VisionAdapter
+
+        return Qwen3VisionAdapter(config)
+    if architecture == "llava_next":
+        from .vision_llava import LlavaNextAdapter
+
+        return LlavaNextAdapter(config)
+    return None
+
+
 def convert_vlm(
     gguf_path: str,
     output_path: Path,
@@ -752,13 +1048,18 @@ def convert_vlm(
     architecture = config.get("model_type")
     if not isinstance(architecture, str) or architecture not in ARCHITECTURE_REGISTRY:
         raise ValueError(
-            "Only HF model_type='llava', 'qwen2_vl', or 'minicpmv4_7' is supported."
+            "Only HF model_type in "
+            + ", ".join(repr(name) for name in sorted(ARCHITECTURE_REGISTRY))
+            + " is supported."
         )
-    qwen = minicpm = None
-    if architecture == "qwen2_vl":
-        from .vision_qwen2 import Qwen2VisionAdapter
-
-        qwen = Qwen2VisionAdapter(config)
+    qwen = _vision_adapter(architecture, config)
+    if qwen is not None:
+        # An adapter that reconciles the GGUF against the HF checkpoint must know
+        # which side is authoritative for the tower before ``configure_layout``:
+        # in hybrid mode the HF tower wins and no GGUF-only arithmetic applies.
+        qwen.vision_from_hf = bool(hf_fallback_vision)
+    minicpm = None
+    if qwen is not None:
         text, vision = qwen.text, qwen.vision
     elif architecture == "minicpmv4_7":
         from .vision_minicpm import MiniCPMV47Adapter
@@ -771,8 +1072,12 @@ def convert_vlm(
         text, vision = minicpm.text, minicpm.vision
     else:
         text, vision = _validate_config(config)
-    if preserve_source_quant and not qwen:
-        raise ValueError("--preserve-source-quant currently supports Qwen2-VL only")
+    if preserve_source_quant and (qwen is None or not qwen.supports_source_preserve):
+        raise ValueError(
+            "--preserve-source-quant currently needs an architecture with a "
+            "vision tensor plan that reuses GGUF codes (Qwen2-VL, Qwen2.5-VL, "
+            "Qwen3-VL); LLaVA-NeXT and MiniCPM-V must requantize"
+        )
     if minicpm and direct_quant:
         raise ValueError("MiniCPM-V 4.7 direct quantization is not supported")
     reader = GGUFReader(gguf_path)
@@ -786,7 +1091,7 @@ def convert_vlm(
     if minicpm:
         minicpm.validate_tokenizer(reader, root)
     else:
-        _validate_tokenizer(reader, root, text, config)
+        _validate_tokenizer(reader, root, text, config, qwen)
     readers = [reader]
     if mmproj:
         companion = GGUFReader(mmproj)
@@ -819,7 +1124,7 @@ def convert_vlm(
             raise ValueError("SigLIP projector companions are unsupported")
         _validate_vision_metadata(current, vision)
     if not minicpm:
-        _validate_processor(readers, root, vision, architecture)
+        _validate_processor(readers, root, vision, architecture, qwen)
     expected = (
         {**minicpm.expected, **minicpm_text_expected}
         if minicpm else qwen.expected if qwen else _expected_shapes(text, vision)
@@ -828,6 +1133,7 @@ def convert_vlm(
     raw_seen: set[str] = set()
     counts = {"language": 0, "projector": 0, "vision_gguf": 0, "vision_hf": 0,
               "vision_gguf_ignored": 0, "language_tied_head_ignored": 0,
+              "vision_identity_filled": 0,
               "legacy_position_placeholder_ignored": 0, "separator_embedding_ignored": 0}
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -846,7 +1152,7 @@ def convert_vlm(
         if tuple(array.shape) != expected[name]:
             raise ValueError(
                 f"VLM shape mismatch for {name}: got {tuple(array.shape)}, "
-                f"expected {expected[name]}"
+                f"expected {expected[name]}{_clip_mlp_role_hint(name, array, expected[name])}"
             )
         seen.add(name)
         counts[category] += 1
@@ -893,7 +1199,7 @@ def convert_vlm(
             if name in raw_seen:
                 raise ValueError(f"Duplicate GGUF tensor across inputs: {name}")
             raw_seen.add(name)
-            if qwen and name.startswith(("v.", "mm.")):
+            if qwen and (name.startswith(("v.", "mm.")) or name in qwen.source_names):
                 if qwen.legacy_merger and name == "v.position_embd.weight":
                     placeholder = _decode(tensor, "float32")
                     if placeholder.shape != (10, 10) or np.any(placeholder):
@@ -901,7 +1207,9 @@ def convert_vlm(
                     counts["legacy_position_placeholder_ignored"] += 1
                     continue
                 if name not in qwen.source_names:
-                    raise ValueError(f"Unsupported Qwen2-VL vision/projector tensor: {name}")
+                    raise ValueError(
+                        f"Unsupported {qwen.name} vision/projector tensor: {name}"
+                    )
                 qwen_tensors[name] = tensor
             elif name.startswith("v."):
                 if minicpm and name == "v.tok_embd_sep":
@@ -924,6 +1232,8 @@ def convert_vlm(
                     (vision["hidden_size"], 1), (1, vision["hidden_size"]),
                 ):
                     array = array.reshape(vision["hidden_size"])
+                if not minicpm:
+                    mapped = _swap_ffn_role(mapped, array, expected)
                 emit(mapped, array, "vision_gguf")
             elif name.startswith("mm."):
                 mapped = minicpm.map_projector(name) if minicpm else _map_projector(name)
@@ -937,16 +1247,18 @@ def convert_vlm(
                         raise ValueError("Tied language output.weight shape differs from token embeddings")
                     counts["language_tied_head_ignored"] += 1
                     continue
-                text_arch = "qwen2" if qwen else "qwen35" if minicpm else "llama"
+                text_arch = qwen.text_arch if qwen else "qwen35" if minicpm else "llama"
                 mapped = "language_model." + core._map_tensor_name(name, text_arch)
                 if mapped not in expected or not mapped.startswith("language_model."):
-                    family = "Qwen2-VL" if qwen else "MiniCPM-V" if minicpm else "Llama"
+                    family = qwen.name if qwen else "MiniCPM-V" if minicpm else "Llama"
                     raise ValueError(f"Unsupported {family} GGUF tensor: {name}")
                 decode_dtype = "float32" if direct_quant else dtype
                 array = _decode(tensor, decode_dtype)
                 if minicpm:
                     array = core._restore_architecture_tensor(name, array, "qwen35")
-                elif not qwen:
+                elif qwen:
+                    array = qwen.restore_text(name, array)
+                else:
                     array = _restore_llama(name, array, text)
                 emit(mapped, array, "language", tensor)
                 if name == "token_embd.weight" and validate_tied_head:
@@ -962,24 +1274,38 @@ def convert_vlm(
         )
     if qwen:
         for name, sources, axis in qwen.vision_plan:
-            category = "projector" if ".merger." in name else "vision_gguf"
+            category = (
+                "projector"
+                if any(marker in name for marker in qwen.projector_markers)
+                else "vision_gguf"
+            )
             if category == "vision_gguf" and hf_fallback_vision:
                 counts["vision_gguf_ignored"] += sum(src in qwen_tensors for src in sources)
                 continue
             missing_sources = [src for src in sources if src not in qwen_tensors]
             if missing_sources:
-                raise ValueError(f"Missing required Qwen2-VL tensors: {', '.join(missing_sources)}")
-            arrays = [_decode(qwen_tensors[src], dtype) for src in sources]
+                raise ValueError(
+                    f"Missing required {qwen.name} tensors: {', '.join(missing_sources)}"
+                )
+            arrays = [
+                qwen.normalize_source(src, _decode(qwen_tensors[src], dtype))
+                for src in sources
+            ]
             for src, array in zip(sources, arrays):
                 if array.shape != qwen.source_shapes[src]:
-                    raise ValueError(f"Qwen2-VL shape mismatch for {src}: {array.shape}")
+                    raise ValueError(f"{qwen.name} shape mismatch for {src}: {array.shape}")
             if len(arrays) == 1:
                 array = arrays[0]
-            elif name.endswith("patch_embed.proj.weight"):
-                array = np.stack(arrays, axis=2)
+            elif name.removeprefix("vision_tower.") in qwen.stacked_targets:
+                array = np.stack(arrays, axis=axis)
             else:
                 array = np.concatenate(arrays, axis=axis)
             emit(name, array, category)
+        # Parameters no file carries, written by the adapter itself. They are
+        # emitted through ``emit`` so they are shape-checked against the plan and
+        # counted, and their justification travels with the report.
+        for name, array in qwen.identity_fills.items():
+            emit(name, array, "vision_identity_filled")
     if hf_fallback_vision:
         # Pin subsequent downloads to the resolved asset revision when available.
         files, vision_index = _vision_files(
@@ -1016,16 +1342,18 @@ def convert_vlm(
         path = root / asset
         if path.is_file():
             shutil.copyfile(path, output_path / asset)
-    config["text_config"] = text
     config["torch_dtype"] = dtype
-    config["text_config"]["torch_dtype"] = dtype
+    config["text_config"] = {**text, "torch_dtype": dtype}
     config["vision_config"]["torch_dtype"] = dtype
     if qwen:
-        config.update(text)
         config["model_type"] = architecture
         config["vision_config"] = {**vision, "torch_dtype": dtype}
+        config.update(qwen.output_overrides)
+        if not qwen.nested_text_config:
+            # mlx-vlm rebuilds ``text_config`` from the root of config.json for
+            # this family, so the language hyperparameters must also be flat.
+            config.update(text)
     elif minicpm:
-        config["text_config"] = {**text, "torch_dtype": dtype}
         config["vision_config"] = {**vision, "torch_dtype": dtype}
     if direct_quant:
         if not quantized:
@@ -1055,6 +1383,10 @@ def convert_vlm(
             "OITHW (mlx-vlm sanitize converts to OTHWI)" if qwen
             else "OIHW (mlx-vlm CLIP sanitize converts to OHWI)"
         ),
+        "vision_identity_fills": (
+            dict(getattr(qwen, "identity_reasons", {})) if qwen else {}
+        ),
+        "vision_layout": dict(getattr(qwen, "layout_report", {})) if qwen else {},
         "quantization": {
             "method": (
                 "preserve_source_q4_k" if preserve_source_quant else

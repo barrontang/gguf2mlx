@@ -27,7 +27,8 @@ from typing import Any, cast
 import numpy as np
 from tqdm import tqdm
 
-from . import fidelity
+from . import families, fidelity, tokenizer
+from .families import GEMMA_ARCHES, QWEN35_ARCHES
 from .quantize import gguf_codes
 from .qwen_vl_text import QWEN_VL_TEXT_ARCHES, Qwen3VLTextEncoderConverter
 from .streaming import StreamingShardWriter
@@ -175,6 +176,22 @@ def get_metadata_array_int(reader: GGUFReader, key: str) -> list[int]:
         return []
 
 
+def get_metadata_bool_array(reader: GGUFReader, key: str) -> list[bool] | None:
+    """Extract a boolean array, distinguishing "absent" from "empty"."""
+    field = reader.get_field(key)
+    if field is None:
+        return None
+    try:
+        vals = field.contents()
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if isinstance(vals, np.ndarray):
+        return [bool(v) for v in vals.tolist()]
+    if isinstance(vals, (list, tuple)):
+        return [bool(v) for v in vals]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Architecture detection & config building
 # ---------------------------------------------------------------------------
@@ -183,6 +200,8 @@ def get_metadata_array_int(reader: GGUFReader, key: str) -> list[int]:
 ARCH_MAP: dict[str, str] = {
     "llama": "llama",
     "mistral": "mistral",
+    # Not a GGUF architecture: derived from llama/expert_count by ``_mixtral_or``.
+    "mixtral": "mixtral",
     "falcon": "falcon",
     "mpt": "mpt",
     "gptneox": "gpt_neox",
@@ -258,6 +277,7 @@ CONVERTIBLE_ARCHES = {
     "gemma4",
     "llama",
     "mistral",
+    "mixtral",
     "phi3",
     "phi4",
     "qwen2",
@@ -283,46 +303,30 @@ STRICT_ADAPTER_ARCHES = {
     "qwen38", "qwen3_8", "qwen3.8",
 }
 
-QWEN35_ARCHES = {
-    "qwen35", "qwen3_5", "qwen3.5", "qwen36", "qwen3_6", "qwen3.6",
-    "qwen38", "qwen3_8", "qwen3.8",
-}
+# The Qwen/Gemma family sets and the Qwen ``tokenizer.ggml.pre`` aliases live in
+# ``families`` so the tokenizer builders can read them without importing this
+# module. These two names are rebound rather than imported with ``as`` so the
+# re-export is a plain assignment: ``core.QWEN_FAMILY_ARCHES`` keeps working for
+# tests and benchmarks, and there is exactly one definition of each set.
+QWEN_FAMILY_ARCHES = families.QWEN_FAMILY_ARCHES
+QWEN_PRE_TOKENIZERS = families.QWEN_PRE_TOKENIZERS
 
-# Qwen tokenizers have no normalizer: BPE runs straight on the raw text after a
-# GPT-2-style regex split. Every Qwen architecture must be in this set, because
-# the default for anything else is NFC -- which silently rewrites some inputs
-# before they reach the vocabulary.
-QWEN_FAMILY_ARCHES = {
-    "qwen2",
-    "qwen3",
-    "qwen2moe",
-    "qwen3moe",
-    *QWEN35_ARCHES,
-    *QWEN_VL_TEXT_ARCHES,
-}
-
-# Values of ``tokenizer.ggml.pre`` that select that same Qwen pre-tokenizer.
-# llama.cpp names the hybrid family ``qwen35`` while Qwen2/2.5/3 report
-# ``qwen2``; an unlisted value falls through to "legacy BPE splitting" with a
-# warning, so the alias spellings are listed rather than inferred.
-QWEN_PRE_TOKENIZERS = {
-    "qwen2",
-    "qwen2.5-coder",
-    "qwen3",
-    "qwen35",
-    "qwen3.5",
-    "qwen3_5",
-    "qwen36",
-    "qwen3.6",
-    "qwen3_6",
-    "qwen38",
-    "qwen3.8",
-    "qwen3_8",
-}
-GEMMA_ARCHES = {"gemma", "gemma2", "gemma3", "gemma4"}
 PHI_ARCHES = {"phi3", "phi4"}
 SUPPORTED_MLX_LM_Q_GROUP_SIZES = {32, 64, 128}
-MOE_ARCHES = {"qwen2moe", "qwen3moe", "deepseek2", "deepseek3", "glm4moe", "glm-dsa"}
+MOE_ARCHES = {
+    "qwen2moe", "qwen3moe", "deepseek2", "deepseek3", "glm4moe", "glm-dsa", "mixtral",
+}
+
+#: GGUF architecture names llama.cpp uses for Mixtral. The expert count in the
+#: metadata, not the name, is what makes the file a Mixtral; see ``_mixtral_or``.
+MIXTRAL_SOURCE_ARCHES = {"llama", "mistral"}
+
+#: Architectures whose attention block is Llama's, tensor for tensor. Mixtral
+#: belongs here because llama.cpp only *adds* the MoE block: the Q/K rotary
+#: row-interleave and the KV head count are the Llama ones, so anything gated on
+#: ``arch == "llama"`` has to include it or the attention weights come out
+#: permuted.
+LLAMA_ATTENTION_ARCHES = {"llama", "mixtral"}
 DIRECT_QUANT_SUPPORTED_ARCHES = {
     "llama",
     "gemma",
@@ -369,6 +373,11 @@ _EXPERT_PATTERNS = (
     ".switch_mlp.",
     ".experts.",
 )
+#: The pre-refactor Mixtral export: one tensor per expert, e.g.
+#: ``blk.0.ffn_gate.3.weight``. It is *not* a substring match -- ``ffn_gate.`` is
+#: also how a dense Llama names its single MLP -- so it needs an anchored regex
+#: that requires the expert index.
+_PER_EXPERT_TENSOR = re.compile(r"\.ffn_(?:gate|up|down)\.\d+\.weight$")
 _ATTENTION_PATTERNS = (
     "attn_q",
     "attn_k",
@@ -412,7 +421,7 @@ def detect_architecture(reader: GGUFReader) -> str:
         return arch
 
     if arch:
-        return arch
+        return _mixtral_or(reader, arch)
     # Try fallback based on model name
     if name:
         name_lower = name.lower()
@@ -421,11 +430,43 @@ def detect_architecture(reader: GGUFReader) -> str:
         # `deepseek-r1-distill-qwen` before broad ARCH_MAP substring checks.
         for pattern, mapped_arch in MODEL_NAME_ARCH_FALLBACKS:
             if re.search(pattern, name_lower):
-                return mapped_arch
+                return _mixtral_or(reader, mapped_arch)
         for gguf_arch in sorted(ARCH_MAP, key=len, reverse=True):
             if gguf_arch in name_lower:
-                return gguf_arch
+                return _mixtral_or(reader, gguf_arch)
     return "unknown"
+
+
+def _mixtral_or(reader: GGUFReader, arch: str) -> str:
+    """Name the MoE layout that llama.cpp encodes as plain ``llama``.
+
+    Mixtral has no GGUF architecture of its own: the exporter emits
+    ``general.architecture = llama`` plus ``llama.expert_count``, and llama.cpp
+    routes it through the Llama graph. The distinguishing fact is the expert
+    count, so it is read rather than inferred from the tensor names -- the names
+    differ between exports (``ffn_gate.3.weight`` before llama.cpp's MoE
+    refactor, ``ffn_gate_exps.weight`` after), while the metadata does not.
+
+    The internal name is ``mixtral`` because that is what mlx-lm calls the model,
+    and because the MLX module path differs from every other MoE family
+    (``block_sparse_moe`` rather than ``mlp``).
+    """
+    if arch in MIXTRAL_SOURCE_ARCHES and (get_metadata_int(reader, f"{arch}.expert_count") or 0) > 0:
+        return "mixtral"
+    return arch
+
+
+def _expert_metadata(reader: GGUFReader, arch: str, key: str) -> int | None:
+    """Read an expert KV from the architecture, falling back to the llama one.
+
+    llama.cpp has no ``mixtral`` namespace: Mixtral's expert count lives under
+    ``llama.expert_count`` even though the internal architecture name is
+    ``mixtral``. Keeping that fallback in one place is what lets the rest of the
+    code say ``f"{arch}.{key}"`` for architectures that do own their namespace.
+    """
+    return get_metadata_int(reader, f"{arch}.{key}") or get_metadata_int(
+        reader, f"llama.{key}",
+    )
 
 
 def classify_architecture(reader: GGUFReader, arch: str | None = None) -> str:
@@ -434,7 +475,9 @@ def classify_architecture(reader: GGUFReader, arch: str | None = None) -> str:
     tensor_names = [tensor.name for tensor in reader.tensors]
 
     has_experts = any(
-        any(pattern in name for pattern in _EXPERT_PATTERNS) for name in tensor_names
+        any(pattern in name for pattern in _EXPERT_PATTERNS)
+        or _PER_EXPERT_TENSOR.search(name)
+        for name in tensor_names
     )
     has_dense_mlp = any(
         re.search(r"ffn_(gate|up|down)\.weight$", name) and "_exps" not in name
@@ -452,7 +495,9 @@ def classify_tensor(gguf_name: str, hf_name: str | None = None) -> str:
     names = (gguf_name, hf_name or "")
     if any(pattern in name for name in names for pattern in _ROUTER_PATTERNS):
         return "router"
-    if any(pattern in name for name in names for pattern in _EXPERT_PATTERNS):
+    if any(pattern in name for name in names for pattern in _EXPERT_PATTERNS) or any(
+        _PER_EXPERT_TENSOR.search(name) for name in names
+    ):
         return "expert_mlp"
     if any(pattern in name for name in names for pattern in _ATTENTION_PATTERNS):
         return "attention"
@@ -474,6 +519,18 @@ def validate_moe_layout(reader: GGUFReader, arch: str, architecture_kind: str) -
         raise RuntimeError(
             f"Detected {architecture_kind} architecture {arch!r}, but no recognized "
             "router tensor was found; refusing conversion to avoid corrupt routing"
+        )
+    # The per-expert layout can only be assembled when the expert count is known:
+    # stacking "as many as arrived" would produce a loadable model whose expert
+    # indices no longer match the router's output columns.
+    per_expert = sorted({
+        tensor.name for tensor in reader.tensors
+        if _PER_EXPERT_TENSOR.search(tensor.name)
+    })
+    if per_expert and not _expert_metadata(reader, arch, "expert_count"):
+        raise RuntimeError(
+            f"Per-expert MoE tensors such as {per_expert[0]!r} need "
+            f"{arch}.expert_count metadata; refusing to guess the expert count"
         )
 
 
@@ -584,7 +641,7 @@ def _build_glm_dsa_config(reader: GGUFReader, config: dict[str, Any]) -> dict[st
 # Architectures whose runtime rope layer understands an HF ``rope_scaling``
 # block. Anything else has no place to put a llama3 frequency table.
 ROPE_SCALING_ARCHES = {
-    "llama", "mistral", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "stablelm",
+    "llama", "mistral", "mixtral", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "stablelm",
 }
 # Plausible ``original_max_position_embeddings`` values for llama3 scaling.
 _ROPE_ORIGINAL_CONTEXT_CANDIDATES = tuple(
@@ -699,6 +756,14 @@ def build_config(
     defaults (which silently produce an unloadable model). Callers that only
     inspect metadata keep the lenient behaviour.
     """
+    # llama.cpp stores Mixtral's KVs under ``llama`` (there is no ``mixtral``
+    # namespace), so every metadata read below must keep using ``llama``. The
+    # layout is remembered separately and re-applied to the emitted config, which
+    # is the only place the distinction reaches the artifact.
+    moe_layout = "mixtral" if arch == "mixtral" else None
+    if moe_layout:
+        arch = "llama"
+
     if arch == "phi4":
         original_reader = reader
 
@@ -972,6 +1037,34 @@ def build_config(
                     if declared is not None and declared != inferred:
                         raise ValueError(f"Qwen2MoE {metadata_key} disagrees with tensor shapes")
                     config[config_key] = inferred
+
+    if moe_layout == "mixtral":
+        # mlx-lm's MixtralArgs names the expert count ``num_local_experts`` and
+        # takes the per-expert width from ``intermediate_size``. Mixtral has no
+        # dense MLP and no shared expert, so ``llama.feed_forward_length`` already
+        # *is* that width (14336 for 8x7B) and must not be replaced by a derived
+        # value -- doing so would silently mis-size every SwitchGLU.
+        experts = _expert_metadata(reader, "mixtral", "expert_count")
+        if not experts:
+            raise ValueError(
+                "Mixtral conversion requires llama.expert_count metadata; without "
+                "it the expert groups cannot be validated or stacked"
+            )
+        config.update({
+            "model_type": "mixtral",
+            "architectures": ["MixtralForCausalLM"],
+            "num_local_experts": experts,
+            "num_experts_per_tok": (
+                _expert_metadata(reader, "mixtral", "expert_used_count") or 2
+            ),
+            # The internal layout name, so the report says which MLX module set
+            # the tensors were written for rather than repeating the GGUF's KV
+            # namespace.
+            "_gguf_architecture": "mixtral",
+        })
+        expert_width = _expert_metadata(reader, "mixtral", "expert_feed_forward_length")
+        if expert_width is not None:
+            config["intermediate_size"] = expert_width
 
     if arch == "deepseek2":
         def required_int(key: str) -> int:
@@ -1403,6 +1496,36 @@ def _map_llama_tensor_name(gguf_name: str) -> str:
     return gguf_name
 
 
+def _map_mixtral_tensor_name(gguf_name: str) -> str:
+    """Map Mixtral's MoE block onto mlx-lm's ``block_sparse_moe`` module.
+
+    Mixtral's attention and norms *are* Llama's, so everything except the router
+    and the experts falls through to the Llama mapper. The two exceptions carry
+    the whole risk: mlx-lm puts them under ``block_sparse_moe``, while Qwen-MoE
+    and DeepSeek put the equivalent weights under ``mlp``. Emitting the ``mlp``
+    path here would produce a file that converts cleanly and then fails to load
+    with the entire MoE block missing, which is why Mixtral gets an explicit
+    function instead of a flag on the shared mapper.
+
+    The stacked form is handled here. The legacy per-expert form
+    (``ffn_gate.3.weight``, one tensor per expert) cannot be named at all --
+    it has to be assembled -- so it is handled in ``_plan_tensor_emit``.
+    """
+    match = re.fullmatch(
+        r"blk\.(\d+)\.(ffn_gate_inp|ffn_(?:gate|up|down)_exps)\.weight", gguf_name,
+    )
+    if match is not None:
+        layer_idx, source = match.groups()
+        suffix = {
+            "ffn_gate_inp": "gate.weight",
+            "ffn_gate_exps": "switch_mlp.gate_proj.weight",
+            "ffn_up_exps": "switch_mlp.up_proj.weight",
+            "ffn_down_exps": "switch_mlp.down_proj.weight",
+        }[source]
+        return f"model.layers.{layer_idx}.block_sparse_moe.{suffix}"
+    return _map_llama_tensor_name(gguf_name)
+
+
 def _map_gemma_tensor_name(gguf_name: str) -> str:
     """Map Gemma 2/3 tensors: four norms per block, not two.
 
@@ -1691,6 +1814,8 @@ def _map_tensor_name(gguf_name: str, arch: str) -> str:
         mapped = _map_phi3_tensor_name(gguf_name)
     elif arch in {"gemma2", "gemma3"}:
         mapped = _map_gemma_tensor_name(gguf_name)
+    elif arch == "mixtral":
+        mapped = _map_mixtral_tensor_name(gguf_name)
     elif arch == "qwen2moe" and (
         match := re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down|gate_inp)_shexp\.weight", gguf_name)
     ):
@@ -1799,28 +1924,59 @@ def extract_tokenizer(
             for i, token in enumerate(tokens)
         ]
 
-    if not tokens:
-        raise ValueError("GGUF has no tokenizer.ggml.tokens; cannot reconstruct a tokenizer")
-    if len(set(tokens)) != len(tokens):
-        raise ValueError("GGUF tokenizer vocabulary contains duplicate tokens")
-    if any(not 0 <= token_id < len(tokens) for token_id in (additional_special_token_ids or [])):
-        raise ValueError("Additional special token ID is outside the vocabulary")
-    if token_types and len(token_types) != len(tokens):
-        raise ValueError("GGUF tokenizer requires a type for every token")
-    if scores and (len(scores) != len(tokens) or not np.isfinite(scores).all()):
-        raise ValueError("GGUF tokenizer requires a finite score for every token")
+    # ``TokenizerSource`` is the validated description of the GGUF tokenizer
+    # fields, and the only thing later decisions read. Gathering the fields once
+    # means a key can only be interpreted in one place: the alternative -- loose
+    # locals threaded through config writing, JSON building and the post-processor
+    # patch -- is how the normalizer and the vocabulary drifted apart before.
+    charsmap = reader.get_field("tokenizer.ggml.precompiled_charsmap")
+    source = tokenizer.TokenizerSource(
+        model=source_model,
+        tokens=tokens,
+        token_types=token_types,
+        merges=merges,
+        scores=scores,
+        bos_id=bos_id,
+        eos_id=eos_id,
+        pad_id=pad_id,
+        unk_id=unk_id,
+        sep_id=sep_id,
+        mask_id=get_metadata_int(reader, "tokenizer.ggml.mask_token_id"),
+        pre=tokenizer_pre,
+        arch=arch,
+        add_space_prefix=add_space_prefix,
+        do_lower_case=get_metadata_bool(reader, "tokenizer.ggml.normalizer.lowercase"),
+        remove_extra_whitespaces=get_metadata_bool(
+            reader, "tokenizer.ggml.remove_extra_whitespaces",
+        ),
+        strip_accents=get_metadata_bool(reader, "tokenizer.ggml.normalizer.strip_accents"),
+        precompiled_charsmap=(
+            base64.b64encode(bytes(charsmap.contents())).decode("ascii")
+            if charsmap is not None else None
+        ),
+        special_token_ids=tuple(additional_special_token_ids or ()),
+    )
+    source.validate()
+    # Role IDs are checked against the raw fields, before any fallback runs: a
+    # declared value that does not name a token is a broken export, while an
+    # absent one is normal and gets inferred below.
     for role in ("bos", "eos", "unknown", "padding", "separator", "seperator", "mask"):
         token_id = get_metadata_int(reader, f"tokenizer.ggml.{role}_token_id")
         if token_id is not None and not 0 <= token_id < len(tokens):
             raise ValueError(f"GGUF tokenizer {role}_token_id is outside the vocabulary")
-    if unk_id == -1:
-        unk_id = next((i for i, kind in enumerate(token_types) if kind == 2), -1)
-        if unk_id == -1:
-            unk_id = next((tokens.index(t) for t in ("<unk>", "[UNK]") if t in tokens), -1)
-    if pad_id == -1:
-        pad_id = next((tokens.index(t) for t in ("<pad>", "[PAD]") if t in tokens), -1)
-    if sep_id is None and model_type == "wordpiece" and "[SEP]" in tokens:
-        sep_id = tokens.index("[SEP]")
+    if source.unk_id == -1:
+        source.unk_id = next((i for i, kind in enumerate(token_types) if kind == 2), -1)
+        if source.unk_id == -1:
+            source.unk_id = next(
+                (tokens.index(token) for token in ("<unk>", "[UNK]") if token in tokens), -1,
+            )
+    if source.pad_id == -1:
+        source.pad_id = next(
+            (tokens.index(token) for token in ("<pad>", "[PAD]") if token in tokens), -1,
+        )
+    if source.sep_id is None and model_type == "wordpiece" and "[SEP]" in tokens:
+        source.sep_id = tokens.index("[SEP]")
+    unk_id, pad_id, sep_id = source.unk_id, source.pad_id, source.sep_id
 
     # --- Fix BOS/EOS for Qwen, DeepSeek, and similar families ---
     # These models use special tokens like <|endoftext|> (BOS) and <|im_end|> (EOS)
@@ -1938,35 +2094,14 @@ def extract_tokenizer(
             warnings.warn(f"Invalid tokenizer.huggingface.json; rebuilding tokenizer: {error}")
 
     if tokenizer_json is None:
-        charsmap = reader.get_field("tokenizer.ggml.precompiled_charsmap")
-        encoded_charsmap = None
-        if charsmap is not None:
-            encoded_charsmap = base64.b64encode(bytes(charsmap.contents())).decode("ascii")
-        tokenizer_json = _build_tokenizer_json(
-            tokens,
-            token_types,
-            merges,
-            scores,
-            source_model,
-            bos_id,
-            eos_id,
-            pad_id,
-            unk_id=unk_id,
-            add_space_prefix=add_space_prefix,
-            arch=arch,
-            tokenizer_pre=tokenizer_pre,
-            do_lower_case=get_metadata_bool(reader, "tokenizer.ggml.normalizer.lowercase"),
-            strip_accents=get_metadata_bool(reader, "tokenizer.ggml.normalizer.strip_accents"),
-            precompiled_charsmap=encoded_charsmap,
-            special_token_ids=(additional_special_token_ids or []) + [
-                token_id for token_id in (
-                    sep_id, get_metadata_int(reader, "tokenizer.ggml.mask_token_id"),
-                ) if token_id is not None
-            ],
-            remove_extra_whitespaces=get_metadata_bool(
-                reader, "tokenizer.ggml.remove_extra_whitespaces",
-            ),
+        source.bos_id, source.eos_id = bos_id, eos_id
+        # The separator and mask tokens are special for ``added_tokens`` purposes
+        # even though no role slot above consumes them, so they are promoted here
+        # rather than being discovered a second time inside the builder.
+        source.special_token_ids += tuple(
+            token_id for token_id in (sep_id, source.mask_id) if token_id is not None
         )
+        tokenizer_json = source.build()
         end_id = sep_id if model_type == "wordpiece" and add_sep_token else eos_id
         add_end_token = add_sep_token if model_type == "wordpiece" else add_eos_token
         if add_bos_token or add_end_token:
@@ -2024,28 +2159,13 @@ def extract_tokenizer(
         print("  ✓ Saved tokenizer.json")
 
 
+
+
 def _sentencepiece_bpe_merges(
     tokens: list[str], token_types: list[int], scores: list[float],
 ) -> list[list[str]]:
-    if len(scores) != len(tokens) or not np.isfinite(scores).all():
-        raise ValueError("SentencePiece BPE requires a finite score for every token")
-    if token_types and len(token_types) != len(tokens):
-        raise ValueError("SentencePiece BPE requires a type for every token")
-    vocab = {
-        token: i for i, token in enumerate(tokens)
-        if not token_types or token_types[i] == 1
-    }
-    candidates: list[tuple[str, str, float]] = []
-    for token, token_id in vocab.items():
-        splits = [
-            (token[:i], token[i:]) for i in range(1, len(token))
-            if token[:i] in vocab and token[i:] in vocab
-        ]
-        splits.sort(key=lambda pair: (vocab[pair[0]], vocab[pair[1]]))
-        candidates.extend((left, right, scores[token_id]) for left, right in splits)
-    # SentencePiece selects the highest-scored adjacent piece, not Unigram's best path.
-    candidates.sort(key=lambda item: (item[2], len(item[0]), len(item[1])), reverse=True)
-    return [[left, right] for left, right, _ in candidates]
+    """Re-export of :func:`gguf2mlx.tokenizer.sentencepiece_bpe_merges`."""
+    return tokenizer.sentencepiece_bpe_merges(tokens, token_types, scores)
 
 
 def _build_tokenizer_json(
@@ -2067,285 +2187,95 @@ def _build_tokenizer_json(
     precompiled_charsmap: str | None = None,
     special_token_ids: list[int] | None = None,
 ) -> dict:
-    """Build a complete tokenizer.json for HuggingFace tokenizers."""
-    vocab = {}
-    for i, token in enumerate(tokens):
-        vocab[token] = i
+    """Assemble the tokenizer fields into a source, then build from it.
 
-    # Token type codes: 1=normal, 2=unknown, 3=control, 4=user_defined, 5=unused, 6=byte
-    # (mapping kept as a comment; token_types per-token is consumed below)
-    added_tokens = []
-    normal_tokens = []
-    for i, token in enumerate(tokens):
-        tt = token_types[i] if i < len(token_types) else 1
-        # Preserve GGUF control and user-defined token semantics.
-        role_token = i in (bos_id, eos_id, pad_id, unk_id) or i in (special_token_ids or [])
-        if tt in (2, 3, 4) or role_token:
-            special = tt in (2, 3) or role_token
-            added_tokens.append(
-                {
-                    "id": i,
-                    "content": token,
-                    "single_word": False,
-                    "lstrip": False,
-                    "rstrip": False,
-                    "normalized": False,
-                    "special": special,
-                }
-            )
-        else:
-            normal_tokens.append(token)
-
-    normalized_model_type = {"bert": "wordpiece", "t5": "unigram"}.get(
-        model_type.lower(), model_type.lower(),
-    )
-
-    # Build model block
-    has_byte_fallback = any(
-        (i < len(token_types) and token_types[i] == 6)
-        or (token.startswith("<0x") and token.endswith(">"))
-        for i, token in enumerate(tokens)
-    )
-    sentencepiece_bpe = normalized_model_type == "llama" or (
-        arch == "gemma" and normalized_model_type in ("spm", "sentencepiece", "unigram")
-    )
-    if sentencepiece_bpe:
-        if not 0 <= unk_id < len(tokens):
-            raise ValueError("SentencePiece BPE reconstruction requires a valid unknown_token_id")
-        model_block = {
-            "type": "BPE",
-            "vocab": vocab,
-            "merges": _sentencepiece_bpe_merges(tokens, token_types, scores),
-            "unk_token": tokens[unk_id],
-            "byte_fallback": has_byte_fallback,
-            "fuse_unk": True,
-        }
-    elif normalized_model_type in ("bpe", "gpt2"):
-        for merge in merges:
-            pieces = merge.split(" ")
-            if len(pieces) != 2 or any(piece not in vocab for piece in pieces):
-                raise ValueError(f"Invalid GGUF BPE merge: {merge!r}")
-            if "".join(pieces) not in vocab:
-                raise ValueError(f"GGUF BPE merge result is missing from the vocabulary: {merge!r}")
-        byte_fallback = any(
-            (i < len(token_types) and token_types[i] == 6)
-            or (token.startswith("<0x") and token.endswith(">"))
-            for i, token in enumerate(tokens)
-        )
-        model_block = {
-            "type": "BPE",
-            "dropout": None,
-            "unk_token": tokens[unk_id] if 0 <= unk_id < len(tokens) else None,
-            "continuing_subword_prefix": "",
-            "end_of_word_suffix": "",
-            "fuse_unk": False,
-            "byte_fallback": byte_fallback,
-            "vocab": vocab,
-            "merges": merges if merges else [],
-        }
-    elif normalized_model_type in ("llama", "spm", "sentencepiece", "unigram"):
-        if not 0 <= unk_id < len(tokens):
-            raise ValueError("Unigram reconstruction requires a valid unknown_token_id")
-        if len(scores) != len(tokens) or not np.isfinite(scores).all():
-            raise ValueError("Unigram reconstruction requires a finite score for every token")
-        vocab_scores = []
-        for i, token in enumerate(tokens):
-            score = scores[i] if i < len(scores) else 0.0
-            vocab_scores.append([token, score])
-        model_block = {
-            "type": "Unigram",
-            "unk_id": unk_id,
-            "vocab": vocab_scores,
-            "byte_fallback": has_byte_fallback,
-        }
-    elif normalized_model_type == "wordpiece":
-        if not 0 <= unk_id < len(tokens):
-            raise ValueError("WordPiece reconstruction requires a valid unknown_token_id")
-        model_block = {
-            "type": "WordPiece",
-            "unk_token": tokens[unk_id] if 0 <= unk_id < len(tokens) else "[UNK]",
-            "continuing_subword_prefix": "##",
-            "max_input_chars_per_word": 100,
-            "vocab": vocab,
-        }
-    else:
-        raise ValueError(f"Unsupported GGUF tokenizer model: {model_type}")
-
-    normalizer: dict[str, Any] | None = (
-        None if arch in QWEN_FAMILY_ARCHES or model_type == "t5"
-        else {"type": "NFC"}
-    )
-    if precompiled_charsmap:
-        normalizer = {"type": "Precompiled", "precompiled_charsmap": precompiled_charsmap}
-    pre_tokenizer: dict[str, Any] | None = {
-        "type": "Sequence",
-        "pretokenizers": [
-            {
-                "type": "Split",
-                "pattern": {
-                    "Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
-                },
-                "behavior": "Isolated",
-                "invert": False,
-            },
-            {
-                "type": "ByteLevel",
-                "add_prefix_space": False,
-                "trim_offsets": False,
-                "use_regex": False,
-            },
-        ],
-    }
-    post_processor: dict[str, Any] | None = {
-        "type": "ByteLevel",
-        "add_prefix_space": False,
-        "trim_offsets": False,
-        "use_regex": False,
-    }
-    decoder: dict[str, Any] = {
-        "type": "ByteLevel",
-        "add_prefix_space": False,
-        "trim_offsets": False,
-        "use_regex": False,
-    }
-    if normalized_model_type in ("bpe", "gpt2") and tokenizer_pre:
-        if tokenizer_pre in ("gpt-2", "gpt2"):
-            normalizer = None
-            pre_tokenizer = {
-                "type": "ByteLevel", "add_prefix_space": False,
-                "trim_offsets": False, "use_regex": True,
-            }
-        elif tokenizer_pre in ("llama-bpe", "llama3", "llama-v3"):
-            model_block["ignore_merges"] = True
-            normalizer = None
-            # Set immediately above, before any branch can replace it.
-            assert pre_tokenizer is not None
-            pre_tokenizer["pretokenizers"][0]["pattern"]["Regex"] = (
-                "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+"
-                "|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*"
-                "|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
-            )
-        elif tokenizer_pre in QWEN_PRE_TOKENIZERS | {
-            "deepseek-r1-qwen", "kormo", "f2llmv2"
-        }:
-            normalizer = None
-        else:
-            warnings.warn(
-                f"Unsupported tokenizer.ggml.pre={tokenizer_pre!r}; "
-                "using legacy BPE splitting, exact tokenization parity is not guaranteed",
-            )
-    if normalized_model_type in ("bpe", "gpt2") and has_byte_fallback:
-        decoder = {
-            "type": "Sequence",
-            "decoders": [
-                {"type": "ByteFallback"},
-                {
-                    "type": "ByteLevel",
-                    "add_prefix_space": False,
-                    "trim_offsets": False,
-                    "use_regex": False,
-                },
-            ],
-        }
-    if normalized_model_type in ("spm", "sentencepiece", "unigram", "llama"):
-        pre_tokenizer = {
-            "type": "Metaspace",
-            "replacement": "▁",
-            "prepend_scheme": "always" if add_space_prefix else "never",
-            "split": True,
-        }
-        post_processor = None
-        decoder = {
-            "type": "Sequence",
-            "decoders": [
-                {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
-                {"type": "ByteFallback"},
-                {"type": "Fuse"},
-                {"type": "Strip", "content": " ", "start": 1, "stop": 0},
-            ],
-        }
-        if not add_space_prefix:
-            decoder["decoders"].pop()
-        if remove_extra_whitespaces:
-            normalizer = {
-                "type": "Sequence",
-                "normalizers": [
-                    *([normalizer] if normalizer else []),
-                    {"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": " "},
-                    {"type": "Strip", "strip_left": True, "strip_right": True},
-                ],
-            }
-        if model_type == "t5":
-            normalizers: list[dict[str, Any]] = []
-            if precompiled_charsmap:
-                normalizers = [{
-                    "type": "Precompiled", "precompiled_charsmap": precompiled_charsmap,
-                }]
-            if remove_extra_whitespaces:
-                normalizers.extend([
-                    {"type": "Replace", "pattern": {"Regex": " +"}, "content": " "},
-                    {"type": "Replace", "pattern": {"Regex": "^ | $"}, "content": ""},
-                    {
-                        "type": "Replace", "pattern": {"Regex": "^(?=[\\s\\S])"},
-                        "content": "▁",
-                    },
-                ])
-            elif add_space_prefix:
-                normalizers.append({
-                    "type": "Replace", "pattern": {"Regex": "^(?=[\\s\\S]*[^ ])"},
-                    "content": "▁",
-                })
-            normalizers.append({
-                "type": "Replace", "pattern": {"String": " "}, "content": "▁",
-            })
-            normalizer = {"type": "Sequence", "normalizers": normalizers}
-            pre_tokenizer = None
-        if sentencepiece_bpe:
-            normalizers = []
-            if remove_extra_whitespaces:
-                normalizers.extend([
-                    {"type": "Replace", "pattern": {"Regex": "\\s+"}, "content": " "},
-                    {"type": "Strip", "strip_left": True, "strip_right": True},
-                ])
-            if add_space_prefix:
-                normalizers.append({"type": "Prepend", "prepend": "▁"})
-            normalizers.append({"type": "Replace", "pattern": {"String": " "}, "content": "▁"})
-            normalizer = {"type": "Sequence", "normalizers": normalizers}
-            pre_tokenizer = None
-    elif normalized_model_type == "wordpiece":
-        normalizer = {
-            "type": "BertNormalizer",
-            "clean_text": True,
-            "handle_chinese_chars": True,
-            "strip_accents": strip_accents,
-            "lowercase": True if do_lower_case is None else do_lower_case,
-        }
-        pre_tokenizer = {"type": "BertPreTokenizer"}
-        post_processor = None
-        decoder = {
-            "type": "WordPiece",
-            "prefix": "##",
-            "cleanup": True,
-        }
-
-    tokenizer_json = {
-        "version": "1.0",
-        "truncation": None,
-        "padding": None,
-        "added_tokens": added_tokens,
-        "normalizer": normalizer,
-        "pre_tokenizer": pre_tokenizer,
-        "post_processor": post_processor,
-        "decoder": decoder,
-        "model": model_block,
-    }
-
-    return tokenizer_json
+    The builder itself lives in :mod:`gguf2mlx.tokenizer`, one function per
+    format. This wrapper keeps the historical signature for callers and tests,
+    and is the only place the loose arguments are gathered into a validated
+    description of the tokenizer.
+    """
+    return tokenizer.TokenizerSource(
+        model=model_type,
+        tokens=list(tokens),
+        token_types=list(token_types or []),
+        merges=list(merges or []),
+        scores=list(scores or []),
+        bos_id=bos_id,
+        eos_id=eos_id,
+        pad_id=pad_id,
+        unk_id=unk_id,
+        pre=tokenizer_pre,
+        arch=arch,
+        add_space_prefix=add_space_prefix,
+        do_lower_case=do_lower_case,
+        remove_extra_whitespaces=remove_extra_whitespaces,
+        strip_accents=strip_accents,
+        precompiled_charsmap=precompiled_charsmap,
+        special_token_ids=tuple(special_token_ids or ()),
+    ).build()
 
 
 # ---------------------------------------------------------------------------
 # Weight extraction & conversion
 # ---------------------------------------------------------------------------
+
+
+class _ExpertStack:
+    """Reassemble a legacy per-expert export into the stacked MoE weights MLX needs.
+
+    Before llama.cpp's MoE refactor, an 8-expert Mixtral block was written as 24
+    separate tensors -- ``blk.0.ffn_gate.3.weight`` and friends. MLX's ``SwitchGLU``
+    takes one ``[n_experts, out, in]`` tensor per projection, so the per-expert
+    form has to be stacked.
+
+    Stacking is only safe in expert order and only once every expert is present:
+    a stack assembled from ``{0, 2, 5, 7}`` still has shape ``[4, out, in]`` and
+    still loads, but expert *k* now returns expert *k* of the subset, which is a
+    silently wrong model. So :meth:`add` returns the stacked array only when the
+    count matches the metadata, and :meth:`leftovers` refuses a run that ended
+    with an incomplete group.
+
+    A group key is ``(layer, projection)``; the same layer's gate and down
+    projections complete independently, so memory is bounded by one projection of
+    one layer (``8 x 4096 x 14336`` at fp16 is ~1.6 GB for 8x7B) rather than by
+    the whole model.
+    """
+
+    def __init__(self, expert_count: int) -> None:
+        if expert_count <= 0:
+            raise ValueError("Expert stacking requires a positive expert count")
+        self.expert_count = expert_count
+        self._pending: dict[tuple[str, str], dict[int, np.ndarray]] = {}
+
+    def add(
+        self, layer: str, projection: str, expert: int, array: np.ndarray,
+    ) -> np.ndarray | None:
+        """Record one expert's projection; return the stack once it is complete."""
+        if not 0 <= expert < self.expert_count:
+            raise ValueError(
+                f"Expert index {expert} is outside the declared expert count "
+                f"({self.expert_count})"
+            )
+        group = self._pending.setdefault((layer, projection), {})
+        if expert in group:
+            raise ValueError(
+                f"Duplicate tensor for expert {expert} of {projection} in layer {layer}"
+            )
+        group[expert] = array
+        if len(group) < self.expert_count:
+            return None
+        if sorted(group) != list(range(self.expert_count)):
+            return None
+        stacked = np.stack([group[index] for index in range(self.expert_count)], axis=0)
+        del self._pending[(layer, projection)]
+        return stacked
+
+    def leftovers(self) -> list[str]:
+        """Groups that never completed, for a fail-closed end-of-run check."""
+        return [
+            f"layer {layer} {projection}: {len(group)} of {self.expert_count} experts"
+            for (layer, projection), group in sorted(self._pending.items())
+        ]
 
 
 def _read_mla_dims(reader: GGUFReader, arch: str) -> dict[str, int]:
@@ -2356,7 +2286,7 @@ def _read_mla_dims(reader: GGUFReader, arch: str) -> dict[str, int]:
     qk_nope = _g("attention.qk_nope_head_dim") or 192
     v_head = _g("attention.value_length") or _g("attention.v_head_dim") or qk_nope
     dims = {"num_heads": n_heads, "qk_nope_head_dim": qk_nope, "v_head_dim": v_head}
-    if arch == "llama":
+    if arch in LLAMA_ATTENTION_ARCHES:
         dims["num_key_value_heads"] = _g("attention.head_count_kv") or n_heads
     if arch == "gemma4":
         dims["num_attention_heads"] = (
@@ -2392,13 +2322,15 @@ def _reconstruct_kv_b(k_b: np.ndarray, v_b: np.ndarray,
     k = k_b.reshape(n_heads, dk_nope, kv_lora)
     v = v_b.reshape(n_heads, dv, kv_lora)
     kv = np.concatenate([k, v], axis=1)  # [n_heads, dk_nope+dv, kv_lora]
-    return kv.reshape(n_heads * (dk_nope + dv), kv_lora).astype(k_b.dtype)
+    return cast(np.ndarray, kv.reshape(n_heads * (dk_nope + dv), kv_lora).astype(k_b.dtype))
 
 
 def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
                       mla_dims: dict[str, int],
                       pending_kv_b: dict[str, dict[str, np.ndarray]],
                       pending_qkv: dict[str, dict[str, np.ndarray]],
+                      *,
+                      expert_stack: _ExpertStack | None = None,
                       ) -> list[tuple[str, np.ndarray]]:
     """Decide output (hf_name, arr) pairs for one source GGUF tensor.
 
@@ -2407,11 +2339,15 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
         the combined attn_kv_b is absent) -> combined kv_b_proj via per-head
         interleave (_reconstruct_kv_b).
       * glm-dsa stacked ffn_*_exps -> per-expert mlp.experts.{e}.{kind}_proj.
+      * Legacy per-expert Mixtral (``ffn_gate.3.weight``) -> one stacked
+        ``block_sparse_moe.switch_mlp.gate_proj.weight`` once every expert has
+        arrived (``expert_stack``).
 
-    Returns [] when the tensor is buffered (waiting for its kv_b pair).
+    Returns [] when the tensor is buffered (waiting for its kv_b pair, or for the
+    rest of its experts).
     """
     arr = _restore_architecture_tensor(gguf_name, arr, arch)
-    if arch == "llama" and re.fullmatch(r"blk\.\d+\.attn_[qk]\.weight", gguf_name):
+    if arch in LLAMA_ATTENTION_ARCHES and re.fullmatch(r"blk\.\d+\.attn_[qk]\.weight", gguf_name):
         heads = (
             mla_dims["num_key_value_heads"] if ".attn_k." in gguf_name
             else mla_dims["num_heads"]
@@ -2487,6 +2423,24 @@ def _plan_tensor_emit(gguf_name: str, arr: np.ndarray, arch: str,
             del pending_kv_b[layer_idx]
             return [(f"model.layers.{layer_idx}.self_attn.kv_b_proj.weight", combined)]
         return []  # buffered until the pair arrives
+
+    # --- Mixtral legacy per-expert export: ffn_{gate,up,down}.{e}.weight ---
+    if arch == "mixtral" and (m := re.fullmatch(
+        r"blk\.(\d+)\.ffn_(gate|up|down)\.(\d+)\.weight", gguf_name
+    )):
+        layer_idx, projection, expert = m.group(1), m.group(2), int(m.group(3))
+        if expert_stack is None:
+            raise RuntimeError(
+                "Per-expert Mixtral tensors need an expert stacker; this is a "
+                "converter wiring error, not a property of the GGUF"
+            )
+        stacked = expert_stack.add(layer_idx, projection, expert, arr)
+        if stacked is None:
+            return []
+        return [(
+            f"model.layers.{layer_idx}.block_sparse_moe.switch_mlp.{projection}_proj.weight",
+            stacked,
+        )]
 
     # --- glm-dsa per-expert split: stacked ffn_*_exps [n_exp, out, in] ---
     if arch == "glm-dsa":
@@ -2670,6 +2624,10 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
     mla_dims = _read_mla_dims(reader, arch)
     pending_kv_b: dict[str, dict[str, np.ndarray]] = {}
     pending_qkv: dict[str, dict[str, np.ndarray]] = {}
+    expert_stack = (
+        _ExpertStack(_expert_metadata(reader, arch, "expert_count") or 0)
+        if arch == "mixtral" else None
+    )
     with tqdm(total=len(reader.tensors), desc="  Converting", unit="tensor") as pbar:
         for tensors in groups.values():
             for tensor in tensors:
@@ -2678,6 +2636,7 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
                     raise RuntimeError(f"Failed to convert tensor {tensor.name}")
                 pairs = _plan_tensor_emit(
                     tensor.name, arr, arch, mla_dims, pending_kv_b, pending_qkv,
+                    expert_stack=expert_stack,
                 )
                 for name, output in pairs:
                     # ``output is arr`` means the mapping passed the decoded
@@ -2691,6 +2650,15 @@ def _iter_weight_arrays(reader: GGUFReader, arch: str, dtype: str):
                 raise RuntimeError("Incomplete Phi-3 QKV tensor groups")
             if pending_kv_b:
                 raise RuntimeError("Incomplete split kv_b tensor groups")
+
+    # Expert groups span many source tensors, so they are checked once the whole
+    # file has been visited rather than at each group boundary. Failing here is
+    # what keeps a file with a missing expert from producing a smaller model
+    # whose expert indices no longer line up with the router's columns.
+    if expert_stack is not None and expert_stack.leftovers():
+        raise RuntimeError(
+            "Incomplete Mixtral expert groups: " + "; ".join(expert_stack.leftovers())
+        )
 
 
 def _source_tensors_without_output(
@@ -2902,7 +2870,7 @@ def _preserve_rotary_heads(
     gguf_name: str, arch: str, num_heads: int | None, kv_heads: int | None
 ) -> int | None:
     """Head count whose rotary row-interleave applies to this tensor, if any."""
-    if arch != "llama":
+    if arch not in LLAMA_ATTENTION_ARCHES:
         return None
     if re.fullmatch(r"blk\.\d+\.attn_q\.weight", gguf_name):
         return num_heads
@@ -2917,6 +2885,12 @@ def _preserve_skip_reason(
     """Why a tensor cannot keep its GGUF codes, or ``None`` if it can."""
     qname = gguf_codes.qtype_name(qtype)
     if qname is None:
+        # A known-but-unmappable type gets its own reason so the report tells a
+        # reader *why* (a 16-value sub-block scale, or a non-uniform codebook)
+        # instead of the generic "no re-expression" that hides the difference.
+        reason = gguf_codes.non_affine_reason(qtype)
+        if reason is not None:
+            return reason
         return f"{getattr(qtype, 'name', qtype)}_has_no_affine_reexpression"
     if len(shape) != 2:
         return "not_a_matrix"
@@ -2924,6 +2898,58 @@ def _preserve_skip_reason(
     if shape[1] % block:
         return "row_length_not_block_aligned"
     return None
+
+
+def _check_preserve_viability(reader: GGUFReader) -> None:
+    """Refuse a preserve run that cannot deliver what the mode promises.
+
+    ``preserve`` exists so a converted artifact stays near the size of the GGUF
+    it came from. When most of the source's quantized *bytes* have no affine
+    re-expression, every one of them decodes to float and the output ends up
+    roughly 2.4x the input -- which is the exact defect the mode was built to
+    avoid, wearing the mode's name. That is a silent degrade, so it fails here,
+    before anything is written, and names the block types and the alternative.
+
+    The rule is measured in bytes rather than tensor count because bytes are
+    what the promise is about: a real ``Qwen1.5-MoE-A2.7B`` ``Q2_K`` file has
+    one ``Q6_K`` tensor, so "is anything preservable?" would answer yes while
+    only 4.3% of its quantized bytes could actually be kept. A real ``Q4_0``
+    file is 100%, so the rule never touches a source preserve was meant for.
+    """
+    floats = {"F32", "F16", "F64", "BF16", "I8", "I16", "I32", "I64"}
+    preservable = 0
+    unexpressible: dict[str, int] = {}
+    for tensor in reader.tensors:
+        if str(tensor.name) == "rope_freqs.weight":
+            continue
+        qtype = tensor.tensor_type
+        type_name = str(getattr(qtype, "name", qtype))
+        if type_name in floats:
+            continue
+        shape = tuple(int(dim) for dim in reversed(tuple(tensor.shape)))
+        if _preserve_skip_reason(shape, qtype) is None:
+            preservable += int(tensor.n_bytes)
+        else:
+            unexpressible[type_name] = unexpressible.get(type_name, 0) + int(tensor.n_bytes)
+
+    quantized = preservable + sum(unexpressible.values())
+    if not unexpressible:
+        return
+    if quantized and preservable * 2 >= quantized:
+        return
+    share = preservable / quantized if quantized else 0.0
+    listed = ", ".join(
+        f"{name} ({size / max(quantized, 1):.0%})"
+        for name, size in sorted(unexpressible.items(), key=lambda kv: -kv[1])
+    )
+    raise RuntimeError(
+        f"preserve would keep only {share:.1%} of this source's quantized bytes: "
+        f"{listed} have no affine re-expression, so every one of them would be "
+        "stored as float and the artifact would be far larger than the GGUF. "
+        "Use `--quantize --direct-quant` for a uniform 4-bit artifact instead, "
+        "or convert without `--quant-source preserve`. "
+        "See docs/quality-gates.md for the reserved formats."
+    )
 
 
 def extract_and_convert_weights_preserve(
@@ -2965,6 +2991,8 @@ def extract_and_convert_weights_preserve(
         )
     if max_shard_bytes is None:
         max_shard_bytes = PRESERVE_DEFAULT_MAX_SHARD_BYTES
+
+    _check_preserve_viability(reader)
 
     float_layout: dict[str, dict[str, str]] = {}
     preserve_plan: dict[str, dict[str, Any]] = {}
@@ -3078,6 +3106,24 @@ def extract_and_convert_weights_preserve(
         for item in kept_float:
             reasons[item["reason"]] = reasons.get(item["reason"], 0) + 1
         print("    Float fallbacks: " + ", ".join(f"{k}={v}" for k, v in sorted(reasons.items())))
+        # A structural reason means preserve could not reuse those codes at all.
+        # Say so in one line naming the block types, because the size ratio
+        # alone ("1.9x the source") does not tell a reader what happened.
+        structural = sorted(
+            key for key in reasons if key in gguf_codes.NON_AFFINE_QTYPES.values()
+        )
+        if structural:
+            offending = sorted(
+                {
+                    item["qtype"] for item in kept_float
+                    if item["reason"] in gguf_codes.NON_AFFINE_QTYPES.values()
+                }
+            )
+            print(
+                f"    ⚠ {sum(reasons[k] for k in structural)} tensor(s) could not keep "
+                f"their codes ({', '.join(offending)}: {', '.join(structural)}) and are "
+                f"stored as {dtype}. This source does not benefit fully from preserve."
+            )
     source_bytes = sum(int(t.n_bytes) for t in reader.tensors)
     output_bytes = int(writer.total)
     size_ratio = (output_bytes / source_bytes) if source_bytes else 0.0
@@ -3136,10 +3182,17 @@ def extract_and_convert_weights_preserve(
     print(f"  {fidelity.summarize(report)}")
     preserved = report["preserve"]
     marker = "✓" if preserved["gate"] == "pass" else "❌"
+    # ``aggregate_relative_l2`` is None when the audit was skipped, so it must
+    # not be formatted as a float: an unaudited preserve run is a legitimate
+    # call, not an error.
+    aggregate = preserved["aggregate_relative_l2"]
+    detail = (
+        f"aggregate relative L2 {aggregate:.2e}" if aggregate is not None
+        else "not audited"
+    )
     print(
         f"  {marker} preserved weights: {preserved['gate']} "
-        f"({preserved['tensors_compared']}/{len(preserve_plan)} tensors, "
-        f"aggregate relative L2 {preserved['aggregate_relative_l2']:.2e})"
+        f"({preserved['tensors_compared']}/{len(preserve_plan)} tensors, {detail})"
     )
     for tier_name, tier in preserved.get("tiers", {}).items():
         if not tier.get("tensors_compared"):
@@ -3771,7 +3824,8 @@ def convert(
             if preserve and not (quantize and direct_quant):
                 print(
                     "❌ --quant-source preserve on a multimodal GGUF requires "
-                    "--quantize --direct-quant (multimodal preservation is Qwen2-VL only)"
+                    "--quantize --direct-quant (multimodal preservation covers "
+                    "Qwen2-VL, Qwen2.5-VL and Qwen3-VL)"
                 )
                 return False
             if mixed_precision or quantize != direct_quant:

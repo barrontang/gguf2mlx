@@ -2,6 +2,304 @@
 
 ## Unreleased
 
+### LLaVA-NeXT converts from a real `mmproj`, and the CLIP MLP role comes from shapes
+
+LLaVA-NeXT (anyres) was the largest hole in the VLM adapters: `model_type:
+llava_next` was rejected outright, so a 1.6 export had to fall back to the hybrid
+path with HF vision weights. `src/gguf2mlx/vision_llava.py` adds a direct adapter,
+and running it against a real 624 MB `mmproj` found four things that a name-based
+mapping gets silently wrong:
+
+- **`model.image_newline` is not in the tower.** It is a top-level `[hidden]`
+  parameter in mlx-vlm and neither `v.*` nor `mm.*`, so a prefix-routed converter
+  drops it and ships a model whose anyres tiles are joined by nothing.
+- **Real exports store 23 CLIP blocks for a 24-layer tower.** HF's
+  `vision_feature_layer = -2` with 24 blocks *is* block 22's output; block 23 only
+  feeds the pooler LLaVA discards. The stored count wins, and
+  `vision_feature_layer` moves to `-1` with it — keeping `-2` would select block 21
+  and produce finite, wrong features.
+- **`v.post_ln` is absent.** mlx-vlm loads strictly, so the parameter is written as
+  the identity and recorded in `vision_identity_fills`; a runtime test perturbs it
+  by +7/−3 and asserts the image features are bit-identical, which is the claim
+  that makes the fill legitimate rather than invented.
+- **`ffn_up`/`ffn_down` mean opposite things to the two exporters.** llama.cpp's
+  LLaVA-era loader reads `ffn_down` as the GELU input and `ffn_up` as the output
+  projection; the modern mtmd graph reads `ffn_up` as the expansion. The real file
+  is the legacy layout, so the previous mapping would have produced a directory
+  whose MLP is transposed in role — and the shapes prove which is which, because a
+  CLIP MLP is `width -> feed_forward -> width`. The adapter resolves the roles from
+  dimensions and records `clip_ffn_convention`. The generic `llava` path gets the
+  same treatment: a decoded tensor that fits the sibling target and not its own is
+  re-aimed instead of rejected, which fixes LLaVA-1.5 exports of the same vintage.
+
+Evidence, from `cjpais/llava-v1.6-vicuna-7b-gguf` (`mmproj-model-f16.gguf`, F16)
+against `llava-hf/llava-v1.6-vicuna-7b-hf`: all **378** mmproj tensors are
+consumed and none is left over; the **380** emitted names (378 plus the two
+identity parameters) each exist in the HF index with the same shape; the
+**375**-parameter tower loads into `mlx_vlm.models.llava_next.VisionModel` with
+`strict=True` and runs, returning 24 hidden states for 23 stored blocks so that
+layer `-1` is the block HF calls `-2`. `tests/test_vlm_real_mmproj.py` now pins
+those counts and the `llava-tools` convention against the real file.
+
+The text half cannot be reconciled, and is refused with a reason instead of a
+generic mismatch. `llava-hf`'s checkpoint declares 32064 rows with
+`image_token_index = 32000`; llama.cpp's LLaVA exports declare 32000 tokens with no
+`<image>` at all. mlx-vlm embeds the prompt before splicing image features, so the
+row has to exist. `_vocabulary_gap_message` now names both counts, the missing IDs
+and the image token, and says which checkpoint to supply.
+
+### MiniCPM's SigLIP ffn roles stay declared, and say so
+
+MiniCPM-V shares the tower family with LLaVA but not the problem: only
+`tools/mtmd` converts it, so `ffn_up` is unambiguously the expansion and the
+declared shapes in `_VISION_BLOCKS` are still asserted against the file. That is
+now stated where the mapping lives, because the shape resolution added for
+LLaVA-NeXT reads like the correct fix here too — and applying it to a tower that
+has no second convention would only invent ambiguity. A test puts the expansion
+in `ffn_down` and holds the adapter to the consequence: it stops on `mlp.fc1`'s
+shape instead of loading a swapped MLP.
+
+A transposed ffn tensor was the one mismatch whose message pointed the wrong way.
+`vlm._clip_mlp_role_hint` now recognises the exact transposition on `mlp.fc1` or
+`mlp.fc2` and says the file labels the two roles the other way round, since "got
+(4, 8), expected (8, 4)" otherwise reads as corruption.
+
+### Runtime-floor tests skip instead of failing, and the floors are pinned
+
+`tests/test_runtime_registry.py` asserted `mlx-vlm >= 0.7.10` *inside* eight
+parametrised tests, so the deliberately older `.venv` (0.7.6) reported eight
+failures that said nothing about the converter. The guards now skip with the
+installed and required versions named, and a new
+`test_runtime_floors_match_the_declared_extras` parses `pyproject.toml` and fails
+if the constants drift from the declared extras — so relaxing a floor can no
+longer quietly turn the resolution checks into skips.
+
+### One matrix covers every MoE layout's router, shared expert, and fused gate
+
+The MoE families were tested one file at a time, which is the wrong shape for
+the bug that actually bites: each family names the same three concepts
+differently, and a name borrowed from the wrong family produces an artifact that
+converts, lists plausible tensors, and loads without its MoE block. Three module
+paths are in use and they are not interchangeable:
+
+| Layout | Router | Routed experts | Shared expert |
+|---|---|---|---|
+| `qwen2moe` | `mlp.gate` | `mlp.switch_mlp.*` | `mlp.shared_expert` + `mlp.shared_expert_gate` |
+| `qwen3moe` | `mlp.gate` | `mlp.switch_mlp.*` | none |
+| `deepseek2/3`, `glm4moe`, `glm-dsa` | `mlp.gate` + `e_score_correction_bias` | `mlp.switch_mlp.*` | `mlp.shared_experts` |
+| `mixtral` | `block_sparse_moe.gate` | `block_sparse_moe.switch_mlp.*` | none |
+| `gemma4` | `router.proj` + `router.scale` | `experts.switch_glu.*` | none |
+
+`tests/test_moe_matrix.py` (99 cases) puts one row per layout in a table and
+checks the table three ways: against literals, so the mapping stays reviewable;
+against `mlx_lm.models.<family>` parameter trees built from tiny literal
+arguments, so a name the runtime does not have cannot pass; and against the set
+of layouts the converter classifies as MoE, so a new family has to decide where
+its experts live instead of inheriting another family's answer.
+
+Two of the differences are traps rather than cosmetics. The shared-expert module
+is spelled `shared_expert` for Qwen2-MoE and `shared_experts` for
+DeepSeek/GLM — one character, and the module that reads it is a different one.
+Qwen2-MoE's shared-expert *gate* is a separate `shared_expert_gate` linear layer
+rather than part of either, while Gemma4's equivalent is a per-layer
+`router.scale`; both are asserted at their own destinations. Qwen3-MoE and
+Mixtral have no shared expert, so the matrix records `None` and asserts that a
+stray `ffn_*_shexp.weight` keeps its GGUF name rather than being renamed into a
+module the runtime never reads.
+
+The matrix also refuses to be decorative: reversing a module path, pluralising
+`shared_expert`, or dropping a family from the runtime half each fail it, which
+was checked by mutating the table before committing it.
+
+### Mixtral converts in both of the layouts llama.cpp has shipped
+
+Mixtral had no adapter, and the failure was silent rather than loud. An 8x7B
+file carries `general.architecture = llama` plus `llama.expert_count = 8` —
+there is no `mixtral` architecture ID to key on — so `classify_architecture`
+called it **dense**, and the tensors were mapped by the Llama rules. Two
+different on-disk shapes exist and both were mangled:
+
+- 2023-era exports write **per-expert** tensors: `blk.0.ffn_gate.3.weight`,
+  `blk.0.ffn_up.3.weight`, `blk.0.ffn_down.3.weight`, one triple per expert.
+  These matched no rule, so they were passed through under their GGUF names —
+  `model.layers.0.ffn_gate.3.weight` and so on — leaving the layer with **no
+  MLP at all** in the output.
+- Since llama.cpp's MoE refactor the same weights arrive **stacked**:
+  `blk.0.ffn_gate_exps.weight` with shape `[8, 14336, 4096]`. Those inherited
+  the dense `mlp.gate_proj.weight` name, so an 8-expert stack was written where
+  a single 4096x4096 matrix belongs.
+
+Neither destination is where mlx-lm looks. `MixtralModel` reads
+`model.layers.N.block_sparse_moe.gate.weight` and
+`...block_sparse_moe.switch_mlp.{gate,up,down}_proj.weight`, so both layouts
+produced a directory that converted with exit code 0, listed plausible tensor
+names, and could not load. The evidence for what real files contain came from
+HTTP `Range` reads of the GGUF headers rather than from downloading 25 GB:
+`TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF` (995 tensors, per-expert) and
+`mradermacher/dolphin-2.5-mixtral-8x7b-GGUF` (323 tensors, stacked).
+
+What now happens:
+
+- **Architecture resolution is metadata-driven.** `_mixtral_or` upgrades
+  `llama`/`mistral` to `mixtral` when `expert_count > 0`, reading the key under
+  both the `mixtral.` and `llama.` prefixes, because exporters disagree about
+  which to write. `mixtral` is its own member of `CONVERTIBLE_ARCHES`,
+  `MOE_ARCHES`, `ROPE_SCALING_ARCHES` and the Llama attention set.
+- **Per-expert tensors are stacked, not passed through.** `_ExpertStack`
+  buffers each `(layer, projection)` group until all `expert_count` slices have
+  arrived, then emits one `[n_experts, out, in]` tensor. It rejects an expert
+  index outside the declared count and a duplicate slice, and after the last
+  tensor is consumed it names every group that never completed — so a truncated
+  GGUF fails with "layer 3 down: 5 of 8 experts" instead of stacking five.
+- **A per-expert file without `expert_count` is refused.** Stacking "as many as
+  arrived" would produce a loadable model whose expert indices no longer line
+  up with the router's output columns, which is worse than not converting.
+- **The config is a Mistral-family config.** `build_config` writes
+  `model_type: mixtral` with `num_local_experts` / `num_experts_per_tok`
+  (mlx-lm's spelling, not the GGUF's), while still reading the shared
+  dimensions through the `llama` keys.
+- **`--quant-source preserve` now refuses Mixtral explicitly.** Mixtral was
+  never a preserve architecture, but while an 8x7B file resolved to `llama` the
+  mode accepted it — and re-emitted its experts under names nothing loads. The
+  refusal names the architecture and points at `--quant-source requant`; it
+  fires before anything is written.
+
+`tests/test_mixtral.py` (24 tests) builds synthetic one-layer GGUFs in both
+layouts and asserts conformance against `mlx_lm.models.mixtral.MixtralModel`
+itself — every emitted name is checked to exist in the model's flattened
+parameter tree, and vice versa — so the target names are read from the runtime
+rather than from a copied convention. Expert `e` is filled with `e + 1`, which
+makes an ordering error a wrong number instead of an invisible one. Mixtral is
+listed in `DECLARED_COVERAGE_GAPS`: the smallest public quant is ~18 GB, over
+the per-runner budget, so there is no pinned real-GGUF load case yet.
+
+### The tokenizer is now built by three separate, validated builders
+
+`tokenizer.json` was assembled by one ~300-line `if/elif` ladder in
+`gguf2mlx.py` that decided the model block and the four policy blocks
+(normalizer, pre-tokenizer, decoder, post-processor) in the same pass, mutating
+shared locals as it went. The model block follows `tokenizer.ggml.model`, but
+the *policy* is inferred — from the architecture, from `tokenizer.ggml.pre`,
+from whether a charsmap is present — and that inference is where a rebuild goes
+wrong quietly: a wrong normalizer still loads and still tokenizes, it just
+disagrees with the model it came from, and the disagreement shows up later as
+degraded generations.
+
+Three things changed:
+
+- **One builder per format.** `src/gguf2mlx/tokenizer.py` now holds
+  `build_bpe` (GPT-2 byte-level, and the SentencePiece vocabulary exported as
+  merges), `build_unigram`, and `build_wordpiece`, each returning a complete
+  document from its own locals. The shared pieces are explicit helpers
+  (`_bytelevel_pipeline`, `_sentencepiece_pipeline`, `_wordpiece_pipeline`), not
+  branches of a shared ladder, so a decision made for one family cannot leak
+  into another. `TokenizerSource` carries the GGUF fields themselves, so a key
+  is read in exactly one place.
+- **The result is schema-validated.** `validate_document` checks the structure
+  `tokenizers` requires and rejects what would otherwise fail at load time or
+  not at all: non-contiguous token IDs, a merge naming a piece outside the
+  vocabulary, duplicate added-token IDs or contents, a missing block, a
+  `Sequence` without its list. `TokenizerSource.validate` checks the metadata
+  and names the offending key, so `TokenizerSchemaError.field` distinguishes a
+  truncated `tokenizer.ggml.scores` from a malformed `tokenizer.ggml.token_type`
+  without matching prose.
+- **The architecture sets moved to `families.py`.** The builders need
+  `QWEN_FAMILY_ARCHES` and the `tokenizer.ggml.pre` aliases, and importing the
+  converter to get them is a cycle; duplicating them would let the two copies
+  drift until a Qwen model silently acquired an NFC normalizer. The converter
+  re-binds the two names, so `core.QWEN_FAMILY_ARCHES` keeps working.
+
+The rewrite is behaviour-preserving, and that is measured rather than asserted:
+13,824 combinations of model, architecture, `tokenizer.ggml.pre`, byte fallback,
+space prefix, whitespace flags, charsmap, lowercase and strip-accents produce
+**byte-identical** documents before and after. `tests/test_tokenizer_builders.py`
+adds 48 tests that build one format at a time, check each format's policy
+blocks, prove the isolation (BERT does not inherit a SentencePiece charsmap;
+only non-Qwen architectures get NFC), and load every result with `tokenizers` so
+"valid" means "loadable", not merely "well-shaped".
+
+### `preserve` covers the legacy 32-value block types, and names what it refuses
+
+`Q4_0`, `Q4_1`, `Q5_0` and `Q5_1` are now re-expressed exactly. They were the
+obvious omission: each covers exactly 32 values — MLX's minimum group — so their
+codes copy unchanged and the result is **bit-exact**, not merely within
+tolerance. `Q4_0`/`Q5_0` need only `scale = d` and `bias = -8d` / `-16d`, which
+is a power-of-two scaling of an existing `fp16`; `Q4_1`/`Q5_1` need `bias = m`,
+which is already `fp16`. Measured relative L2 is 0 for all four against
+`gguf.quants.dequantize`, including on arbitrary code bits rather than only on
+quantizer output.
+
+The layout trap is the 5th bit of `Q5_0`/`Q5_1`: `qh` is **one little-endian
+`uint32`** with value `i` taking bit `i`, not four independent bytes. Reading it
+the second way still produces the right shape and plausible weights, so it is
+the kind of error only a decode comparison catches.
+
+Two things are now written down rather than implied:
+
+- **The exactness rule.** A format maps exactly only when its scale granularity
+  divides 32. `Q2_K` and `Q3_K` store a scale *and* min per 16 values, so they
+  hit the same wall as `Q6_K` — but with 2–3 code bits a least-squares refit
+  loses real precision instead of bounded precision, so they are decoded to
+  float rather than quietly re-fitted into something worse than the source at
+  the source's own byte budget.
+- **iMatrix.** An importance-matrix-guided quantization is a recipe, not a
+  layout; what a file contains is an `IQ` type, and every `IQ` type decodes as
+  `d * kvalues[code]` against a non-uniform table with no `scale*code + bias`
+  form. So such a model converts but cannot be preserved. The rejection is now
+  reported by *named* reason (`codebook_has_no_affine_form`,
+  `sub_block_scale_is_per_16_values`, …) instead of a generic label, an unknown
+  format keeps its own distinct label, and the run prints how many tensors were
+  affected and which block types caused it — otherwise a 1.9x size ratio reads
+  like a mapping bug.
+
+`tests/test_preserve_legacy.py` proves the writer never calls `dequantize` for
+these types by replacing the symbol in both modules that could reach it with one
+that raises, then requiring the conversion to succeed. The claim is scoped to
+the writer: the preserve *audit* decodes by design, because it is the oracle, so
+that test runs with the audit off. Doing so exposed a live crash — the summary
+line formatted `aggregate_relative_l2` with `.2e` even when the audit had been
+skipped and the value was `None` — which is now guarded.
+
+### Qwen2.5-VL and Qwen3-VL convert without any HF vision weights
+
+`ARCHITECTURE_REGISTRY` had three vision layouts, so a Qwen2.5-VL or Qwen3-VL
+`mmproj` could only be converted through `--hf-fallback-vision`, which downloads
+the original checkpoint's vision tower. Both now have explicit plan adapters and
+convert **directly** from the language GGUF plus `mmproj`: the reports record
+`vision_hf: 0` for Qwen2.5-VL-3B-Instruct and Qwen3-VL-2B-Instruct.
+
+They needed separate adapters rather than a name alias, because the Qwen2.5-VL
+and Qwen2-VL cases are indistinguishable by tensor name — llama.cpp drives both
+through one graph builder — while the maths differs:
+
+- Qwen2.5-VL's ViT blocks are RMSNorm with **no** norm bias, and its MLP is the
+  gated `ffn_gate`/`ffn_up`/`ffn_down` SiLU form. Declaring the biases Qwen2-VL
+  has would have left 65 sources permanently missing on every real export; the
+  first draft did exactly that and the real `mmproj` caught it.
+- Qwen3-VL fuses `attn_qkv` with bias, uses LayerNorm blocks *with* bias, a
+  GELU-tanh `linear_fc1`/`linear_fc2` MLP, a Conv3d patch embedding *with* bias,
+  and a learned `pos_embed`. Its deepstack mergers are numbered by **rank** in
+  `clip.vision.is_deepstack_layers` (5/11/17 → `deepstack_merger_list.0/1/2`),
+  not by layer index, and are normalized at the 4x merged width.
+
+The text halves also diverge: Qwen3-VL carries QK-norm instead of attention bias
+and nests its hyperparameters under `text_config`, where Qwen2.5-VL keeps flat
+top-level keys that the tested mlx-vlm loader reads. The config writer now
+follows `nested_text_config` per adapter instead of always flattening.
+
+Each plan is checked against the real file, not only against its own fixture:
+`tests/test_vlm_real_mmproj.py` reads the downloaded `mmproj` and requires the
+declared source set, source shapes and assembled target shapes to match, with the
+tensor count pinned. That test is opt-in (`GGUF2MLX_RUN_E2E=1`) because the
+fixtures are 2 GB. Separately, both converted artifacts were compared against the
+original HF checkpoints: 824/824 and 625/625 tensors agree by name and shape, and
+the fused QKV, stacked patch embedding and merger weights agree to float16
+resolution (max |diff| 3e-8; biases, norms and `ln_q` bit-identical).
+
+`--quant-source preserve` already required a plan adapter and now accepts all
+three Qwen-VL families; its size and parity numbers remain measured only on the
+Qwen2-VL-2B pair, and the docs say so.
+
 ### Emitted `model_type` values are checked against the runtime registry
 
 Conversion could emit a `model_type` the installed runtime has no module for,

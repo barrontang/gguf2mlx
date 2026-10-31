@@ -17,6 +17,13 @@ _VISION_ROOTS = {
     "v.post_ln.weight": "vision_tower.post_layernorm.weight",
     "v.post_ln.bias": "vision_tower.post_layernorm.bias",
 }
+#: ``v.blk.N.<fragment>`` -> HF SigLIP block member. Unlike the LLaVA/CLIP
+#: adapter, the ffn roles here are *not* resolved from tensor shapes, and that is
+#: deliberate: MiniCPM-V is only ever converted by ``tools/mtmd``, whose
+#: ``ffn_up`` is the GELU expansion, so no legacy ``examples/llava`` export of
+#: this tower exists to be ambiguous. The declared shapes below are still asserted
+#: against the file, so a hypothetical legacy export would fail loudly on
+#: ``mlp.fc1``'s shape rather than load a silently swapped MLP.
 _VISION_BLOCKS = {
     "attn_q": "self_attn.q_proj",
     "attn_k": "self_attn.k_proj",

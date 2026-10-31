@@ -61,10 +61,36 @@ cannot hide behind a matching bug in the oracle.
 
 ## Preserve tier
 
-`--quant-source preserve` re-expresses the Q4_K / Q5_K / Q6_K / Q8_0 blocks as
-MLX affine groups (`w = scale * code + bias`, fp16 scale and bias, 32-value
-groups). Where the block layout is expressible it copies the *same integer
-codes* and only rounds the scale and bias to fp16.
+`--quant-source preserve` re-expresses the Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q4_K /
+Q5_K / Q6_K / Q8_0 blocks as MLX affine groups (`w = scale * code + bias`, fp16
+scale and bias, 32-value groups). Where the block layout is expressible it
+copies the *same integer codes* and only rounds the scale and bias to fp16.
+
+The governing rule is one line: **a block format maps exactly only when its
+scale granularity divides 32.** `Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_0` cover exactly
+32 values, and `Q4_K`/`Q5_K` cover 256 with 32-value sub-blocks, so all of them
+qualify. `Q2_K`/`Q3_K`/`Q6_K` store a scale (and for the first two, a min) per
+**16** values and cannot.
+
+The legacy 32-value types are the easiest exact mappings, not the hardest:
+
+| Type | Stored | Decode | MLX `scale` | MLX `bias` | Rel. L2 |
+|---|---|---|---|---|---|
+| `Q4_0` | `d` | `d*(q-8)` | `d` | `-8*d` | 0 |
+| `Q4_1` | `d`, `m` | `d*q+m` | `d` | `m` | 0 |
+| `Q5_0` | `d`, `qh`, `qs` | `d*(q-16)` | `d` | `-16*d` | 0 |
+| `Q5_1` | `d`, `m`, `qh`, `qs` | `d*q+m` | `d` | `m` | 0 |
+
+All four are bit-exact, including on arbitrary code bits (checked against
+`gguf.quants.dequantize`). The one layout detail worth naming: the 5th bit of
+`Q5_0`/`Q5_1` lives in `qh`, and `qh` is read as a **single little-endian
+`uint32`** with value `i` taking bit `i` — not as four independent bytes.
+
+`tests/test_preserve_legacy.py` also proves that the writer never calls
+`dequantize` for these types, by replacing the symbol in both modules that could
+reach it with a function that raises and requiring the conversion to succeed.
+That is scoped to the writer: the `preserve` *audit* decodes on purpose, because
+it is the independent oracle, so the test runs with the audit off.
 
 `Q5_K` is preserved exactly, like `Q4_K`: it keeps a 6-bit scale and min per 32
 values — exactly MLX's group — and its 5-bit code is the low nibble of `qs` plus
@@ -131,6 +157,29 @@ scales do agree keep their codes untouched.
 Note that the top-level `tolerance` bounds the `exact` tier only; `inexact`
 tensors are bounded by `tiers.inexact.tolerance`. A tensor is never compared
 against a ceiling its format cannot meet.
+
+### What `preserve` refuses, and why it says so
+
+Two families cannot be re-expressed, and both are rejected by name rather than
+falling through to a generic label:
+
+| Source | Reason reported | Cause |
+|---|---|---|
+| `Q2_K`, `Q3_K` | `sub_block_scale_is_per_16_values` | same 16-versus-32 wall as `Q6_K`, but with 2-3 code bits a refit loses real precision instead of bounded precision |
+| `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS` | `codebook_has_no_affine_form` | `w = d * kvalues[code]` against a fixed non-uniform table, so there is no `scale*code + bias` form |
+| `TQ1_0`, `TQ2_0` | `ternary_not_an_integer_grid` | ternary levels, not an affine integer grid |
+| `MXFP4` | `block_float_has_no_affine_form` | per-block exponent, no shared scale |
+| `Q8_1`, `Q8_K` | `intermediate_type_never_stored_in_a_file` | ggml kernel-internal types |
+
+**This is the practical answer for iMatrix.** An importance-matrix-guided
+quantization is a *recipe*, not a layout: it selects which tensors get which
+`IQ` type. Those `IQ` types are what a conversion sees, and none of them is
+affine, so an iMatrix model **converts but does not preserve**. The conversion
+still succeeds — the tensors are written as float — and the run prints how many
+tensors were affected and which block types caused it, so the size ratio is not
+mistaken for a mapping bug. A `qtype_name` of `None` for an *unknown* type is
+reported differently (`Q9_FAKE_has_no_affine_reexpression`), so a genuinely new
+format is never disguised as a known rejection.
 
 Per-tensor relative L2 against `gguf.quants.dequantize`:
 

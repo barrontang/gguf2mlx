@@ -118,6 +118,7 @@ DECLARED_COVERAGE_GAPS: dict[str, str] = {
     "glm-dsa": "MoE with a full-indexer path; needs a dedicated router-protect case",
     "glm4moe": "MoE; same download budget as the other expert models",
     "mistral": "shares llama's tensor map, which is pinned; no pinned mistral GGUF yet",
+    "mixtral": "8x7B MoE; the smallest public quant is ~18 GB, over the per-runner budget",
     "phi4": "phi3 pins the same sliding-window adapter; phi4 is fixture-tested",
     "qwen2_vl": "needs the matching HF repo beside the GGUF; vision.yml owns that path",
     "qwen2moe": "MoE; weekly-moe.yml exercises two families, not this matrix",

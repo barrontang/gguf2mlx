@@ -16,6 +16,10 @@ Q4_K_BYTES = 144
 Q5_K_BYTES = 176
 Q6_K_BYTES = 210
 Q8_0_BYTES = 34
+Q4_0_BYTES = 18
+Q4_1_BYTES = 20
+Q5_0_BYTES = 22
+Q5_1_BYTES = 24
 
 
 def _pack_q4_k_scales(scales: np.ndarray, mins: np.ndarray) -> np.ndarray:
@@ -208,7 +212,59 @@ def encode_q8_0(array: np.ndarray) -> np.ndarray:
     return raw.reshape(array.shape[0], array.shape[1] // 32 * Q8_0_BYTES)
 
 
+LEGACY_BYTES = {
+    "Q4_0": Q4_0_BYTES,
+    "Q4_1": Q4_1_BYTES,
+    "Q5_0": Q5_0_BYTES,
+    "Q5_1": Q5_1_BYTES,
+}
+
+
+def encode_legacy(array: np.ndarray, kind: str) -> np.ndarray:
+    """Encode a 32-value legacy block type with ggml's own quantizer.
+
+    The ``_K`` fixtures above hand-roll their encoders because the packing is
+    the thing under test. These four are different: the interesting assertion is
+    that our *decoder* agrees with ggml's, so re-implementing the encoder would
+    add a second chance to make the same mistake twice. ``gguf.quants.quantize``
+    is the reference, and ``gguf.quants.dequantize`` stays the oracle.
+    """
+    from gguf.quants import quantize
+
+    values = np.ascontiguousarray(array, dtype=np.float32)
+    qtype = GGMLQuantizationType[kind]
+    packed = quantize(values.reshape(-1), qtype)
+    return packed.reshape(values.shape[0], -1)
+
+
+def encode_declaration_only(array: np.ndarray, kind: str) -> np.ndarray:
+    """Right-sized placeholder payload for a type ``gguf.quants`` cannot encode.
+
+    ``gguf.quants.quantize`` implements the encoders for Q4_0/Q4_1/Q5_0/Q5_1 and
+    Q8_0 only -- Q2_K/Q3_K are decode-only. The single test that needs those
+    types asserts on the *refusal*, which reads the declared type and shape
+    before any payload is touched, so zeros of the correct length are honest
+    here. They would be worthless anywhere else, hence the explicit name.
+    """
+    block_elements, block_bytes = {
+        "Q2_K": (256, 84),
+        "Q3_K": (256, 110),
+    }[kind]
+    values = np.ascontiguousarray(array)
+    return np.zeros(
+        (values.shape[0], values.shape[1] // block_elements * block_bytes), np.uint8
+    )
+
+
 ENCODERS = {
+    "Q4_0": (lambda a: encode_legacy(a, "Q4_0"), GGMLQuantizationType.Q4_0),
+    "Q4_1": (lambda a: encode_legacy(a, "Q4_1"), GGMLQuantizationType.Q4_1),
+    "Q5_0": (lambda a: encode_legacy(a, "Q5_0"), GGMLQuantizationType.Q5_0),
+    "Q5_1": (lambda a: encode_legacy(a, "Q5_1"), GGMLQuantizationType.Q5_1),
+    # Rejected by preserve; present only so a test can build a file whose
+    # declared types are all un-preservable.
+    "Q2_K": (lambda a: encode_declaration_only(a, "Q2_K"), GGMLQuantizationType.Q2_K),
+    "Q3_K": (lambda a: encode_declaration_only(a, "Q3_K"), GGMLQuantizationType.Q3_K),
     "Q4_K": (encode_q4_k, GGMLQuantizationType.Q4_K),
     "Q6_K": (encode_q6_k, GGMLQuantizationType.Q6_K),
     "Q8_0": (encode_q8_0, GGMLQuantizationType.Q8_0),

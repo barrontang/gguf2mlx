@@ -202,6 +202,34 @@ def test_minicpm_v47_rejects_moe_text_tensors(model):
         convert(model)
 
 
+def test_minicpm_rejects_a_legacy_clip_mlp_instead_of_swapping_it(model):
+    """The SigLIP ffn roles are declared here, not resolved from the shapes.
+
+    ``_VISION_BLOCKS`` documents why: only ``tools/mtmd`` converts this tower, so
+    there is no legacy export to be ambiguous about. This test holds that
+    reasoning to its consequence — put the expansion in ``ffn_down`` (the
+    pre-mtmd ``clip.cpp`` role) and the conversion must stop on the declared
+    shape rather than load a silently swapped MLP.
+    """
+    vision = model.readers["mmproj.gguf"]
+    # Exact names: the merger's ds_ffn_up/ds_ffn_down also end with these suffixes.
+    targets = {"v.blk.0.ffn_up.weight", "v.blk.0.ffn_down.weight"}
+    swapped = 0
+    for item in vision.tensors:
+        if item.name in targets:
+            item.data = np.ascontiguousarray(item.data.T)
+            item.shape = np.array(item.data.shape[::-1])
+            swapped += 1
+    assert swapped == 2, "the fixture no longer carries both ffn tensors"
+
+    with pytest.raises(ValueError) as caught:
+        convert(model)
+    message = str(caught.value)
+    assert "v.blk.0.ffn_up.weight" in message or "mlp.fc1.weight" in message
+    assert "got (4, 8), expected (8, 4)" in message
+    assert "opposite ffn_up/ffn_down roles" in message
+
+
 def test_minicpm_v47_4x_omits_window_merger():
     config = model_config()
     config["downsample_mode"] = "4x"

@@ -289,9 +289,10 @@ def test_affine_decode_matches_mlx_for_scaled_groups():
 
 
 def test_map_tensor_rejects_a_block_type_without_a_mapping():
-    with pytest.raises(gguf_codes.UnsupportedQuantType, match="Q4_1"):
+    """Codebook formats have no ``scale*code + bias`` form at all."""
+    with pytest.raises(gguf_codes.UnsupportedQuantType, match="IQ4_XS"):
         gguf_codes.map_tensor(
-            np.zeros(160, dtype=np.uint8), GGMLQuantizationType.Q4_1, (1, 256)
+            np.zeros(160, dtype=np.uint8), GGMLQuantizationType.IQ4_XS, (1, 256)
         )
 
 
@@ -339,10 +340,39 @@ def test_qtype_helpers_agree_on_the_supported_set():
     assert gguf_codes.qtype_name(GGMLQuantizationType.Q5_K) == "Q5_K"
     assert gguf_codes.mlx_bits("Q5_K") == 5
     assert gguf_codes.block_elements("Q5_K") == 256
-    assert gguf_codes.qtype_name(GGMLQuantizationType.Q4_1) is None
+    # The legacy 32-value types are mapped; the 16-value sub-block types and the
+    # codebook formats are not. Both halves are asserted so a future table edit
+    # cannot widen or narrow the contract by accident.
+    for legacy, bits in (("Q4_0", 4), ("Q4_1", 4), ("Q5_0", 5), ("Q5_1", 5)):
+        assert gguf_codes.qtype_name(legacy) == legacy
+        assert gguf_codes.mlx_bits(legacy) == bits
+        assert gguf_codes.block_elements(legacy) == 32
+    assert gguf_codes.qtype_name(GGMLQuantizationType.IQ4_XS) is None
+    assert gguf_codes.qtype_name(GGMLQuantizationType.Q2_K) is None
+    assert gguf_codes.qtype_name(GGMLQuantizationType.Q3_K) is None
     assert gguf_codes.mlx_bits("Q8_0") == 8
     assert gguf_codes.block_elements("Q6_K") == 256
     assert gguf_codes.block_elements("nope") is None
+
+
+def test_supported_set_is_exactly_the_32_aligned_types():
+    """The exactness rule, asserted as a property rather than as prose.
+
+    A format maps exactly onto MLX's affine grid only when its scale
+    granularity divides 32. ``Q4_0``/``Q4_1``/``Q5_0``/``Q5_1``/``Q8_0`` have a
+    scale per 32; ``Q4_K``/``Q5_K``/``Q6_K`` have one per 256 with 32-value
+    sub-blocks. ``Q6_K`` is the exception that proves it: it is mapped, but its
+    *sub*-block scale is per 16, so it lands in the inexact tier.
+    """
+    supported = set(gguf_codes.QTYPE_IDS)
+    assert supported == {
+        "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q4_K", "Q5_K", "Q6_K",
+    }
+    assert set(gguf_codes._MAPPERS) == supported
+    assert supported >= gguf_codes.INEVITABLY_INEXACT
+    # Every mapped type covers a whole number of 32-value affine groups.
+    for name in supported:
+        assert gguf_codes.block_elements(name) % gguf_codes.AFFINE_GROUP_SIZE == 0
 
 
 def test_rotary_row_permutation_commutes_with_decoding():

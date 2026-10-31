@@ -38,10 +38,26 @@ tokenizer download is needed for this step.
   Explicit GGUF special-token IDs are preserved; absent roles are inferred only
   from known token names/types, not arbitrary vocabulary positions.
 
+Each format is built by its own function in `src/gguf2mlx/tokenizer.py`
+(`build_bpe`, `build_unigram`, `build_wordpiece`), not by one shared branch
+ladder, and the document is validated before it is written. The separation
+matters because the four pipeline blocks — normalizer, pre-tokenizer, decoder,
+post-processor — are *inferred* rather than read from the file: a branch added
+for one family used to be able to change what a later family received, and the
+order of the branches became part of the contract by accident. The rebuild is
+output-identical to the previous implementation across 13,824 combinations of
+model, architecture, `tokenizer.ggml.pre`, byte fallback, space prefix,
+whitespace flags and precompiled charsmap.
+
 Token strings, scores and token types are **header metadata arrays**, not the
 embedding tensor: weights alone cannot recover a vocabulary. Missing vocabulary,
 invalid IDs, duplicate entries, invalid merges, or missing/nonfinite scores for
-score-based models fail rather than creating a misleading minimal tokenizer.
+score-based models fail rather than creating a misleading minimal tokenizer, and
+each failure names the GGUF key that is wrong (`tokenizer.ggml.scores: requires
+a finite score for every token`). The emitted document is then checked for the
+defects that would otherwise surface at load time or not at all: non-contiguous
+token IDs, merges naming a piece outside the vocabulary, duplicate added-token
+IDs or contents, and pipeline blocks without a type.
 Unknown BPE pre-tokenizers emit a parity warning and retain legacy splitting.
 GGUF may omit original normalization or added-token options, so reconstruction
 does not guarantee exact native/original tokenizer parity for every model.
